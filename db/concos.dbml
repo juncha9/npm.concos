@@ -1,0 +1,114 @@
+// concos local SQLite schema — mirror of the resulting shape.
+// The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
+// Schema version 6 · first required by concos 0.1.0. Every table is a record, not a cache.
+
+Table meta {
+  key varchar [pk, note: 'last_seq, created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
+  value varchar [not null]
+}
+
+Table workspace {
+  id varchar [pk, note: 'ws_ + 10 hex']
+  display_path varchar [not null, note: 'absolute path as the agent reported it']
+  compare_path varchar [not null, unique, note: 'realpath, or unverified:<path> when unreachable']
+  is_verified integer [not null, note: '0 | 1']
+  created_at varchar [not null, note: 'ISO 8601 UTC']
+}
+
+Table agent {
+  id varchar [pk, note: 'agt_ + 10 hex, public']
+  room varchar [not null, note: 'fixed to main; one shared room per user database, enforced by triggers']
+  handle_hash varchar [not null, unique, note: 'sha256 of the private handle']
+  host varchar [note: 'hook host; null for participants created only through MCP']
+  host_session_id varchar [note: 'opaque host session id; unique with host']
+  display_name varchar [not null]
+  client varchar [not null]
+  is_human integer [not null, default: 0, note: '1 = person posting from the CLI']
+  workspace_id varchar [ref: > workspace.id]
+  working_directory varchar
+  status varchar [not null, default: 'working', note: 'working | waiting | idle | finished']
+  task varchar [not null, default: '']
+  summary varchar [not null, default: '']
+  next_step varchar [not null, default: '']
+  blocker varchar [not null, default: '']
+  reference_list varchar [not null, default: '[]', note: 'JSON string array']
+  editing_list varchar [not null, default: '[]', note: 'JSON string array; cleared on leave and bridge shutdown']
+  revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
+  changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
+  delivered_seq integer [not null, default: 0, note: 'position delivered by the last check_in']
+  hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake has pointed out; each message is pointed out once']
+  wake_generation integer [not null, default: 0, note: 'Claude Code idle wake: the live watch; a newer watch or a prompt raises it and ends older ones']
+  woken_at_list varchar [not null, default: '[]', note: 'JSON array of ISO times this session was woken, for the hourly limit']
+  joined_at varchar [not null]
+  updated_at varchar [not null, note: 'last card or checkpoint change, not liveness']
+  editing_updated_at varchar
+  last_seen_at varchar [not null, note: 'bridge heartbeat']
+  disconnected_at varchar
+  left_at varchar
+
+  indexes {
+    (host, host_session_id) [unique, name: 'uk_agent_host_session']
+    (room, changed_seq) [name: 'idx_agent_room_changed_seq']
+    workspace_id [name: 'idx_agent_workspace_id']
+  }
+}
+
+Table checkpoint {
+  id integer [pk]
+  agent_id varchar [not null, ref: > agent.id]
+  workspace_id varchar [ref: > workspace.id, note: 'workspace at the time of writing']
+  body varchar [not null]
+  created_at varchar [not null]
+
+  indexes {
+    (agent_id, id) [name: 'idx_checkpoint_agent_id_id']
+    workspace_id [name: 'idx_checkpoint_workspace_id']
+  }
+}
+
+Table message {
+  id integer [pk]
+  seq integer [not null, unique, note: 'from meta.last_seq; orders messages with card changes']
+  room varchar [not null, note: 'fixed to main; existing records merged by schema version 3']
+  sender_agent_id varchar [not null, ref: > agent.id]
+  recipient_agent_id varchar [ref: > agent.id, note: 'the one recipient of a direct message; null for group and all']
+  recipient_scope varchar [not null, default: 'direct', note: 'direct | group | all; a group names its recipients through message_receipt']
+  kind varchar [not null, note: 'note | question | reply | notice']
+  reply_to_message_id integer [ref: > message.id]
+  body varchar [not null]
+  workspace_id varchar [ref: > workspace.id]
+  request_id varchar [note: 'sender retry key']
+  created_at varchar [not null]
+
+  indexes {
+    (sender_agent_id, request_id) [unique, name: 'uk_message_sender_agent_id_request_id']
+    (room, seq) [name: 'idx_message_room_seq']
+    recipient_agent_id [name: 'idx_message_recipient_agent_id']
+    reply_to_message_id [name: 'idx_message_reply_to_message_id']
+    workspace_id [name: 'idx_message_workspace_id']
+  }
+}
+
+Table message_receipt {
+  message_id integer [not null, ref: > message.id]
+  agent_id varchar [not null, ref: > agent.id]
+  received_at varchar [note: 'null until acknowledged: on the next call after the full text reached the agent, through check_in received_message_ids, or when a person opens it on the board']
+
+  indexes {
+    (message_id, agent_id) [pk]
+    (agent_id, received_at) [name: 'idx_message_receipt_agent_id_received_at']
+  }
+}
+
+Table message_topic {
+  message_id integer [not null, ref: > message.id]
+  topic_key varchar [not null, note: 'snake_case, 2-6 words broad to narrow, 3-48 characters']
+  position integer [not null, note: '0 = first topic, the one the board groups by']
+
+  indexes {
+    (message_id, topic_key) [pk]
+    topic_key [name: 'idx_message_topic_topic_key']
+  }
+
+  Note: 'Up to 3 topics per message, deleted with the message. A topic exists only while a message carries it.'
+}
