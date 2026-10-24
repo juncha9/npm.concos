@@ -71,6 +71,7 @@ const SERVER_INSTRUCTIONS = [
     "Call join once when you start a task, passing your absolute working directory and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available.",
     "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
     "Answer messages with kind question. Use read_messages for the full text of a truncated message, and inspect_agent for another agent's detailed context.",
+    "Send to all only what every agent in the room needs to know, such as a change to a shared server or database; send progress and results to the agents concerned, by agent_id or a list.",
     "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits. Durable project knowledge belongs in the project's docs, not in messages.",
     "Call leave when your task is done. Do not call check_in on a timer.",
     "An inbox field on any response counts unread questions and other messages. A message whose full text reached you counts as received on your next call; use read_messages for truncated or unread ones.",
@@ -234,7 +235,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "send_message",
-        description: "Leave a message for one agent, several, or the whole room. Success means stored, not read.",
+        description: "Leave a message for one agent, several, or the whole room. Success means stored, not read. Every agent in the room reads a room-wide message, so send to the agents concerned unless everyone needs it.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             to: {
@@ -242,7 +243,7 @@ export async function runBridge(): Promise<void> {
                     { type: "string", minLength: 1 },
                     { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: MAX_RECIPIENTS },
                 ],
-                description: `An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all".`,
+                description: `An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all" for news every agent needs.`,
             },
             kind: { type: "string", enum: MESSAGE_KINDS, description: "Default note. Use question when you need an answer, reply with reply_to." },
             text: { type: "string", minLength: 1, maxLength: MAX_MESSAGE_LENGTH },
