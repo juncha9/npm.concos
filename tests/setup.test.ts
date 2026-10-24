@@ -31,7 +31,9 @@ describe("user-wide setup", () => {
         fs.mkdirSync(path.dirname(hooksPath));
         const original = '\uFEFF{\n// important comment\n"permissions": {"allow": ["Read"]},\n"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo custom"}]}]}\n}\n';
         fs.writeFileSync(hooksPath, original);
-        fs.writeFileSync(path.join(directory, ".claude.json"), '{"mcpServers":{"existing":{"command":"local-server"}}}');
+        const configPath = path.join(directory, ".claude.json");
+        const configOriginal = '\uFEFF{\r\n  // keep preferences and project registrations\r\n  "theme": "dark",\r\n  "projects": {"D:/existing": {"allowedTools": ["Read"], "mcpServers": {"local": {"command": "project-server"}}}},\r\n  "mcpServers": {"existing": {"command": "local-server", "env": {"KEEP": "fixture"}}},\r\n}\r\n';
+        fs.writeFileSync(configPath, configOriginal);
         const input = { host: "claude", home: directory };
         applySetup(planSetup(input));
         const result = fs.readFileSync(hooksPath, "utf8");
@@ -42,20 +44,31 @@ describe("user-wide setup", () => {
         expect(result).toBe(original);
         expect(data.hooks.Stop).toHaveLength(1);
         expect(data.hooks.Stop[0].hooks[0].command).toBe("echo custom");
-        expect(parseJson(fs.readFileSync(path.join(directory, ".claude.json"), "utf8")).mcpServers.existing.command).toBe("local-server");
+        const configAfter = fs.readFileSync(configPath, "utf8");
+        const configData = parseJson(configAfter.slice(1));
+        const configBefore = parseJson(configOriginal.slice(1));
+        expect(configData).toEqual({ ...configBefore, mcpServers: { ...configBefore.mcpServers, concos: { command: "concos", args: ["mcp"] } } });
+        expect(configAfter.startsWith("\uFEFF")).toBe(true);
+        expect(configAfter).toContain("// keep preferences and project registrations\r\n");
         const backup = fs.readdirSync(directory).find((file) => file.startsWith(".claude.json.concos-backup-"))!;
-        expect(parseJson(fs.readFileSync(path.join(directory, backup), "utf8"))).toEqual({ mcpServers: { existing: { command: "local-server" } } });
+        expect(fs.readFileSync(path.join(directory, backup), "utf8")).toBe(configOriginal);
         expect(planSetup(input)).toEqual([]);
     });
 
     it("appends a user TOML server without rewriting existing tables or comments", () => {
         const config = path.join(directory, ".codex", "config.toml");
         fs.mkdirSync(path.dirname(config));
-        const original = '# keep this\nmodel = "my-model"\n[mcp_servers.existing]\ncommand = "my-server"\n';
+        const original = '# keep this\r\nmodel = "my-model"\r\n[features]\r\nhooks = true\r\n[profiles.custom]\r\nmodel = "another-model"\r\n[mcp_servers.existing]\r\ncommand = "my-server"\r\nargs = ["--custom"]\r\n[mcp_servers.existing.env]\r\nKEEP = "fixture"\r\n[hooks.state.saved]\r\ntrusted_hash = "keep-trust-record"\r\n';
         fs.writeFileSync(config, original);
-        const result = planSetup({ host: "codex", home: directory }).find((change) => change.path == config)!.after;
+        const changes = planSetup({ host: "codex", home: directory });
+        const result = changes.find((change) => change.path == config)!.after;
         expect(result.startsWith(original)).toBe(true);
-        expect(parseToml(result)).toMatchObject({ model: "my-model", mcp_servers: { existing: { command: "my-server" }, concos: { command: "concos", args: ["mcp"] } } });
+        const before = parseToml(original);
+        expect(parseToml(result)).toEqual({ ...before, mcp_servers: { ...before.mcp_servers as object, concos: { command: "concos", args: ["mcp"] } } });
+        applySetup(changes);
+        expect(fs.readFileSync(config, "utf8")).toBe(result);
+        const backup = fs.readdirSync(path.dirname(config)).find((file) => file.startsWith("config.toml.concos-backup-"))!;
+        expect(fs.readFileSync(path.join(path.dirname(config), backup), "utf8")).toBe(original);
     });
 
     it("rejects a foreign server before writing and detects changes since preview", () => {
@@ -67,6 +80,108 @@ describe("user-wide setup", () => {
         fs.writeFileSync(changes[0].path, '{"newSetting":true}');
         expect(() => applySetup(changes)).toThrow(/changed since preview/);
         expect(fs.readFileSync(changes[0].path, "utf8")).toBe('{"newSetting":true}');
+    });
+
+    it.each([
+        ["claude", '{"mcpServers":'],
+        ["claude", '{"mcpServers":null}'],
+        ["claude", '{"mcpServers":{"concos":null}}'],
+        ["claude", '{"mcpServers":{"first":{"command":"first"}},"mcpServers":{"last":{"command":"last"}}}'],
+        ["claude", '{"mcpServers":{"concos":{"command":"foreign"},"concos":{"command":"concos","args":["mcp"]}}}'],
+        ["claude", '{"mcpServers":{"concos":{"type":"http","url":"https://example.test/mcp","command":"concos","args":["mcp"]}}}'],
+        ["codex", 'mcp_servers = "keep this value"\n'],
+        ["codex", '[mcp_servers\n'],
+        ["codex", '[mcp_servers.concos]\ncommand = "foreign"\nargs = ["mcp"]\n'],
+    ])("refuses ambiguous or conflicting %s registration without changing the original", (host, original) => {
+        const file = path.join(directory, host == "claude" ? ".claude.json" : ".codex/config.toml");
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, original);
+        const input = { host, home: directory };
+        expect(() => planSetup(input)).toThrow();
+        expect(() => inspectSetup(input)).toThrow();
+        expect(fs.readFileSync(file, "utf8")).toBe(original);
+        expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+    });
+
+    it("does not overwrite a new file created just before publishing the registration", () => {
+        const input = { host: "claude", home: directory };
+        const changes = planSetup(input);
+        const file = changes[0].path;
+        const concurrent = '{"theme":"created by Claude"}';
+        const link = fs.linkSync.bind(fs);
+        const spy = vi.spyOn(fs, "linkSync").mockImplementation((source, target) => {
+            fs.writeFileSync(file, concurrent);
+            link(source, target);
+        });
+        try {
+            expect(() => applySetup(changes)).toThrow(/changed since preview/);
+        }
+        finally { spy.mockRestore(); }
+        expect(fs.readFileSync(file, "utf8")).toBe(concurrent);
+        expect(fs.readdirSync(directory)).toEqual([path.basename(file)]);
+    });
+
+    it.each(["claude", "codex"])("retains all options on an existing %s concos registration", (host) => {
+        const file = path.join(directory, host == "claude" ? ".claude.json" : ".codex/config.toml");
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        const original = host == "claude"
+            ? '{"mcpServers":{"concos":{"type":"stdio","command":"concos","args":["mcp"],"env":{"KEEP":"fixture"},"customSetting":true}}}'
+            : '[mcp_servers.concos]\ncommand = "concos"\nargs = ["mcp"]\nenabled = false\nstartup_timeout_sec = 45\n[mcp_servers.concos.env]\nKEEP = "fixture"\n';
+        fs.writeFileSync(file, original);
+        const input = { host, home: directory };
+        expect(inspectSetup(input).registered).toBe(true);
+        expect(planSetup(input)).toEqual([]);
+        expect(fs.readFileSync(file, "utf8")).toBe(original);
+        expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+    });
+
+    it.each([null, '{"theme":"original"}'])("preserves a concurrent update made while preparing the replacement (%s)", (original) => {
+        const input = { host: "claude", home: directory };
+        const file = path.join(directory, ".claude.json");
+        if(original != null) fs.writeFileSync(file, original);
+        const changes = planSetup(input);
+        const concurrent = '{"theme":"updated by Claude","projects":{"keep":true}}';
+        const write = fs.writeFileSync.bind(fs);
+        const spy = vi.spyOn(fs, "writeFileSync").mockImplementation((target, data, options) => {
+            write(target, data, options);
+            if(String(target).includes(".concos-tmp-")) write(file, concurrent);
+        });
+        try {
+            expect(() => applySetup(changes)).toThrow(/changed since preview/);
+        }
+        finally { spy.mockRestore(); }
+        expect(fs.readFileSync(file, "utf8")).toBe(concurrent);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-tmp-"))).toBe(false);
+        if(original != null) {
+            const backup = fs.readdirSync(directory).find((name) => name.includes(".concos-backup-"))!;
+            expect(fs.readFileSync(path.join(directory, backup), "utf8")).toBe(original);
+        }
+    });
+
+    it.each([false, true])("rolls back a failed apply while preserving a newer user edit (%s)", (concurrentEdit) => {
+        const first = path.join(directory, ".claude.json");
+        const original = '{"theme":"original"}';
+        const concurrent = '{"theme":"newer user edit"}';
+        fs.writeFileSync(first, original);
+        const second = path.join(directory, ".codex", "config.toml");
+        const secondOriginal = 'model = "keep-my-model"\n';
+        fs.mkdirSync(path.dirname(second));
+        fs.writeFileSync(second, secondOriginal);
+        const changes = [...planSetup({ host: "claude", home: directory }), ...planSetup({ host: "codex", home: directory })];
+        const rename = fs.renameSync.bind(fs);
+        const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+            if(String(target) == second) {
+                if(concurrentEdit) fs.writeFileSync(first, concurrent);
+                throw new Error("simulated replacement failure");
+            }
+            rename(source, target);
+        });
+        try {
+            expect(() => applySetup(changes)).toThrow(/simulated replacement failure/);
+        }
+        finally { spy.mockRestore(); }
+        expect(fs.readFileSync(first, "utf8")).toBe(concurrentEdit ? concurrent : original);
+        expect(fs.readFileSync(second, "utf8")).toBe(secondOriginal);
     });
 
     it("rejects project scope and ignores former room names and working folders", () => {

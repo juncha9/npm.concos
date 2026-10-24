@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
-import { applyEdits, modify, parse as parseJson } from "jsonc-parser";
+import { applyEdits, getNodeValue, modify, parseTree } from "jsonc-parser";
 import type { ParseError } from "jsonc-parser";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { SHARED_ROOM, WAKE_HOURLY_LIMIT, WAKE_IDLE_MS, WAKE_WATCH_MS } from "../../_defs";
@@ -81,9 +81,22 @@ function readFile(file: string): string | null {
 
 function json(change: SetupChange): Record<string, any> {
     const errors: ParseError[] = [];
-    const result = parseJson(change.after.replace(/^\uFEFF/, ""), errors, { allowTrailingComma: true });
-    if(errors.length > 0) throw new RoomError(`${change.path}: invalid JSON; settings were not changed`);
-    return record(result, change.path);
+    const tree = parseTree(change.after.replace(/^\uFEFF/, ""), errors, { allowTrailingComma: true });
+    if(errors.length > 0 || tree == null) throw new RoomError(`${change.path}: invalid JSON; settings were not changed`);
+    const nodes = [tree];
+    while(nodes.length > 0) {
+        const node = nodes.pop()!;
+        if(node.type == "object") {
+            const keys = new Set<string>();
+            for(const property of node.children ?? []) {
+                const key: string = property.children![0].value;
+                if(keys.has(key)) throw new RoomError(`${change.path}: duplicate JSON key ${JSON.stringify(key)}; settings were not changed`);
+                keys.add(key);
+            }
+        }
+        nodes.push(...(node.children ?? []));
+    }
+    return record(getNodeValue(tree), change.path);
 }
 
 /** Edits one value in place, keeping comments and layout; `insert` adds an array element at that index. */
@@ -111,14 +124,31 @@ function removeJson(change: SetupChange, keys: (string | number)[], value: unkno
 export function inspectSetup(input: SetupTarget): { registered: boolean; room: string | null } {
     const adapter = getMcpClient(input.host);
     const file = loadChange(resolveMcpPath(input));
-    const servers = adapter.mcpFormat == "toml" ? parseToml(file.after).mcp_servers : json(file).mcpServers;
-    const entry = servers == null ? undefined : record(servers, "MCP servers").concos;
-    return { registered: entry != null, room: entry == null ? null : SHARED_ROOM };
+    const registered = hasRegistration(file, adapter.mcpFormat);
+    return { registered, room: registered ? SHARED_ROOM : null };
 }
 
-function compatibleServer(entry: Record<string, any>): boolean {
-    if(entry.command != "concos" || !Array.isArray(entry.args) || entry.args[0] != "mcp") return false;
-    return entry.args.length == 1 || (entry.args.length == 3 && entry.args[1] == "--room" && typeof entry.args[2] == "string");
+function compatibleServer(entry: unknown): boolean {
+    if(entry == null || typeof entry != "object" || Array.isArray(entry)) return false;
+    const server = entry as Record<string, unknown>;
+    if(Object.hasOwn(server, "url") || (Object.hasOwn(server, "type") && server.type != "stdio")) return false;
+    if(server.command != "concos" || !Array.isArray(server.args) || server.args[0] != "mcp") return false;
+    return server.args.length == 1 || (server.args.length == 3 && server.args[1] == "--room" && typeof server.args[2] == "string");
+}
+
+/** Inspection and registration must agree about conflicts, including null or malformed entries. */
+function hasRegistration(file: SetupChange, format: "json" | "toml"): boolean {
+    let data: Record<string, any>;
+    if(format == "toml") {
+        try { data = parseToml(file.after); }
+        catch { throw new RoomError(`${file.path}: invalid TOML; settings were not changed`); }
+    }
+    else data = json(file);
+    const key = format == "toml" ? "mcp_servers" : "mcpServers";
+    const servers = data[key] === undefined ? {} : record(data[key], `${file.path}: ${key}`);
+    if(!Object.hasOwn(servers, "concos")) return false;
+    if(!compatibleServer(servers.concos)) throw new RoomError(`${file.path}: ${key}.concos already exists with different settings`);
+    return true;
 }
 
 /** Builds the complete change without writing. Existing commands and comments are retained. */
@@ -126,6 +156,7 @@ export function planSetup(input: SetupTarget & { room?: string }): SetupChange[]
     const adapter = getMcpClient(input.host);
     const config = adapter;
     const mcpFile = loadChange(resolveMcpPath(input));
+    if(hasRegistration(mcpFile, config.mcpFormat)) return [];
     const server: Record<string, unknown> = { command: "concos", args: ["mcp"] };
     // Codex does not pass CONCOS_HOME to MCP servers, while its hooks receive it: a moved data
     // folder has to be named here, or MCP and hooks would use different databases
@@ -133,32 +164,14 @@ export function planSetup(input: SetupTarget & { room?: string }): SetupChange[]
         server.env = { CONCOS_HOME: path.resolve(process.env.CONCOS_HOME) };
     }
     if(config.mcpFormat == "toml") {
-        let parsed: Record<string, any>;
-        try { parsed = parseToml(mcpFile.after); }
-        catch { throw new RoomError(`${mcpFile.path}: invalid TOML; settings were not changed`); }
-        const servers = parsed.mcp_servers == null ? {} : record(parsed.mcp_servers, "mcp_servers");
-        if(servers.concos != null) {
-            if(!compatibleServer(servers.concos)) {
-                throw new RoomError(`${mcpFile.path}: mcp_servers.concos already exists with different settings`);
-            }
-        }
-        else {
-            mcpFile.after += `${mcpFile.after.endsWith("\n") || mcpFile.after == "" ? "" : "\n"}\n${stringifyToml({ mcp_servers: { concos: server } })}`;
-            // Inline tables and dotted keys can make an appended table invalid; fail before any writes.
-            try { parseToml(mcpFile.after); }
-            catch { throw new RoomError(`${mcpFile.path}: cannot append concos to this TOML layout; add the server table manually`); }
-            mcpFile.additions.push({ key: "mcp_servers.concos", value: server });
-        }
+        mcpFile.after += `${mcpFile.after.endsWith("\n") || mcpFile.after == "" ? "" : "\n"}\n${stringifyToml({ mcp_servers: { concos: server } })}`;
+        // Inline tables and dotted keys can make an appended table invalid; fail before any writes.
+        try { parseToml(mcpFile.after); }
+        catch { throw new RoomError(`${mcpFile.path}: cannot append concos to this TOML layout; add the server table manually`); }
+        mcpFile.additions.push({ key: "mcp_servers.concos", value: server });
     }
     else {
-        const data = json(mcpFile);
-        const servers = data.mcpServers == null ? {} : record(data.mcpServers, "mcpServers");
-        if(servers.concos != null) {
-            if(!compatibleServer(servers.concos)) {
-                throw new RoomError(`${mcpFile.path}: mcpServers.concos already exists with different settings`);
-            }
-        }
-        else setJson(mcpFile, ["mcpServers", "concos"], adapter.id == "copilot" ? { ...server, tools: ["*"] }
+        setJson(mcpFile, ["mcpServers", "concos"], adapter.id == "copilot" ? { ...server, tools: ["*"] }
             : adapter.id == "cursor" ? { type: "stdio", ...server } : server);
     }
     return mcpFile.additions.length > 0 ? [mcpFile] : [];
@@ -396,31 +409,58 @@ export function planWake(input: SetupTarget, mode: "on" | "off"): SetupChange[] 
     return change.additions.length + change.removals.length > 0 ? [change] : [];
 }
 
+function verifyUnchanged(file: string, expected: string | null): void {
+    if(readFile(file) !== expected) throw new RoomError(`${file} changed since preview; run setup again`);
+}
+
+/** Publishes complete contents, checking again after writing the temporary file. */
+function replaceSettings(file: string, before: string | null, after: string, replaced?: () => void): void {
+    const temporary = `${file}.concos-tmp-${randomUUID()}`;
+    try {
+        fs.writeFileSync(temporary, after, { encoding: "utf8", flag: "wx", mode: before == null ? 0o600 : fs.statSync(file).mode });
+        verifyUnchanged(file, before);
+        if(before == null) {
+            // Unlike rename, linking a new file cannot overwrite a file created after the check.
+            try { fs.linkSync(temporary, file); }
+            catch(ex) {
+                if((ex as NodeJS.ErrnoException).code == "EEXIST") throw new RoomError(`${file} changed since preview; run setup again`);
+                throw ex;
+            }
+        }
+        else fs.renameSync(temporary, file);
+        replaced?.();
+    }
+    finally { fs.rmSync(temporary, { force: true }); }
+}
+
 /** Verifies the preview, backs up originals, and replaces each file atomically. */
 export function applySetup(changes: SetupChange[]): void {
     for(const change of changes) {
-        if(readFile(change.path) !== change.before) throw new RoomError(`${change.path} changed since preview; run setup again`);
+        verifyUnchanged(change.path, change.before);
     }
     const applied: SetupChange[] = [];
     try {
         for(const change of changes) {
+            verifyUnchanged(change.path, change.before);
             fs.mkdirSync(path.dirname(change.path), { recursive: true });
-            const suffix = randomUUID();
-            if(change.before != null) fs.copyFileSync(change.path, `${change.path}.concos-backup-${suffix}`, fs.constants.COPYFILE_EXCL);
-            const temporary = `${change.path}.concos-tmp-${suffix}`;
-            try {
-                fs.writeFileSync(temporary, change.after, { encoding: "utf8", flag: "wx", mode: change.before == null ? 0o600 : fs.statSync(change.path).mode });
-                fs.renameSync(temporary, change.path);
-                applied.push(change);
-            }
-            finally { fs.rmSync(temporary, { force: true }); }
+            if(change.before != null) fs.copyFileSync(change.path, `${change.path}.concos-backup-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
+            replaceSettings(change.path, change.before, change.after, () => applied.push(change));
         }
     }
     catch(ex) {
+        const recovery: string[] = [];
         for(const change of applied.reverse()) {
-            if(change.before == null) fs.rmSync(change.path);
-            else fs.writeFileSync(change.path, change.before, "utf8");
+            try {
+                if(readFile(change.path) !== change.after) {
+                    recovery.push(`${change.path}: newer settings kept`);
+                    continue;
+                }
+                if(change.before == null) fs.rmSync(change.path);
+                else replaceSettings(change.path, change.after, change.before);
+            }
+            catch(error) { recovery.push(`${change.path}: ${error instanceof Error ? error.message : String(error)}`); }
         }
+        if(recovery.length > 0) throw new RoomError(`${ex instanceof Error ? ex.message : String(ex)}\nSome files could not be restored; original backups were kept:\n${recovery.join("\n")}`);
         throw ex;
     }
 }
