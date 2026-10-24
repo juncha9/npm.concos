@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import {
     CARD_FIELD_PREVIEW_LENGTH,
     CHECK_IN_MAX_AGENTS,
@@ -479,14 +479,32 @@ function applyCardUpdate(current: AgentRow, update: CardUpdate): {
  */
 export class RoomStore {
     private readonly database: DatabaseSync;
+    /*
+     * SQL text → its statement, prepared once on this connection. The SQL in this class binds every
+     * value, so this holds a few dozen entries; SQL built with a value inside would grow it forever.
+     */
+    private readonly statements = new Map<string, StatementSync>();
 
     constructor(database: DatabaseSync) {
         this.database = database;
     }
 
+    /**
+     * A statement prepared anew on every call stays in native memory until garbage collection, which
+     * node:sqlite does not hurry because V8 cannot see that memory. Reusing one keeps it flat.
+     */
+    private prepare(sql: string): StatementSync {
+        let statement = this.statements.get(sql);
+        if(statement == null) {
+            statement = this.database.prepare(sql);
+            this.statements.set(sql, statement);
+        }
+        return statement;
+    }
+
     /** One counter orders card changes and messages together, so a single cursor covers both. */
     private nextSeq(): number {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             UPDATE meta SET value = CAST(value AS INTEGER) + 1
             WHERE key = 'last_seq'
             RETURNING CAST(value AS INTEGER) AS seq
@@ -495,14 +513,14 @@ export class RoomStore {
     }
 
     private readLastSeq(): number {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             SELECT CAST(value AS INTEGER) AS seq FROM meta WHERE key = 'last_seq'
         `).get() as { seq: number };
         return row.seq;
     }
 
     private selectAgent(agentId: string): AgentRow | null {
-        const row = this.database.prepare(`SELECT ${AGENT_COLUMNS} FROM agent WHERE id = :id`).get({ id: agentId });
+        const row = this.prepare(`SELECT ${AGENT_COLUMNS} FROM agent WHERE id = :id`).get({ id: agentId });
         if(row == null) {
             return null;
         }
@@ -518,7 +536,7 @@ export class RoomStore {
     }
 
     private selectLatestCheckpoint(agentId: string): string | null {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             SELECT body FROM checkpoint WHERE agent_id = :agent_id ORDER BY id DESC LIMIT 1
         `).get({ agent_id: agentId }) as { body: string } | undefined;
         if(row == null) {
@@ -528,7 +546,7 @@ export class RoomStore {
     }
 
     private countPending(agentId: string): number {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             SELECT COUNT(*) AS pending_count
             FROM message_receipt
             WHERE agent_id = :agent_id AND received_at IS NULL
@@ -539,7 +557,7 @@ export class RoomStore {
     /** Counts only; looking at an inbox never acknowledges or advances its cursor. */
     /** `excludeMessageIds`: delivered in full in the response being built, so not "waiting" any more. */
     getInbox(agentId: string, excludeMessageIds: number[] = []): InboxCounts | undefined {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             SELECT SUM(M.kind = 'question') AS questions, SUM(M.kind <> 'question') AS notes
             FROM message_receipt AS R JOIN message AS M ON M.id = R.message_id
             WHERE R.agent_id = :id
@@ -553,12 +571,12 @@ export class RoomStore {
     }
 
     private hookHandle(host: string, sessionId: string): string {
-        const row = this.database.prepare("SELECT value FROM meta WHERE key = 'hook_handle_secret'").get() as { value: string };
+        const row = this.prepare("SELECT value FROM meta WHERE key = 'hook_handle_secret'").get() as { value: string };
         return createHmac("sha256", row.value).update(JSON.stringify([host, sessionId])).digest("base64url");
     }
 
     requireAgentIdByHandle(handle: string): string {
-        const row = this.database.prepare(`
+        const row = this.prepare(`
             SELECT id FROM agent WHERE handle_hash = :handle_hash
         `).get({ handle_hash: hashHandle(handle) }) as { id: string } | undefined;
         if(row == null) {
@@ -587,14 +605,14 @@ export class RoomStore {
 
         return runInTransaction(this.database, () => {
             const session = input.hookSession;
-            const existingSession = session == null ? undefined : this.database.prepare(`
+            const existingSession = session == null ? undefined : this.prepare(`
                 SELECT id, room FROM agent WHERE host = :host AND host_session_id = :session_id
             `).get({ host: session.host, session_id: session.sessionId }) as { id: string; room: string } | undefined;
             if(existingSession != null && existingSession.room != room) {
                 throw new RoomError("host session belongs to another room");
             }
             let workspaceId: string;
-            const existingWorkspace = this.database.prepare(`
+            const existingWorkspace = this.prepare(`
                 SELECT id FROM workspace WHERE compare_path = :compare_path
             `).get({ compare_path: workspacePath.comparePath }) as { id: string } | undefined;
             if(existingWorkspace != null) {
@@ -602,7 +620,7 @@ export class RoomStore {
             }
             else {
                 workspaceId = newIdentifier("ws");
-                this.database.prepare(`
+                this.prepare(`
                     INSERT INTO workspace (id, display_path, compare_path, is_verified, created_at)
                     VALUES (:id, :display_path, :compare_path, :is_verified, :created_at)
                 `).run({
@@ -623,7 +641,7 @@ export class RoomStore {
                 if(resumed.room != room) {
                     throw new RoomError("resume_handle belongs to another room");
                 }
-                this.database.prepare(`
+                this.prepare(`
                     UPDATE agent
                     SET display_name = :display_name,
                         client = :client,
@@ -649,7 +667,7 @@ export class RoomStore {
 
             const agentId = newIdentifier("agt");
             const handle = session == null ? randomBytes(24).toString("base64url") : this.hookHandle(session.host, session.sessionId);
-            this.database.prepare(`
+            this.prepare(`
                 INSERT INTO agent (
                     id, room, handle_hash, display_name, client, is_human, workspace_id, working_directory,
                     changed_seq, joined_at, updated_at, last_seen_at, host, host_session_id
@@ -682,7 +700,7 @@ export class RoomStore {
      * counts. Reading this list acknowledges nothing.
      */
     hookNotices(agentId: string, afterSeq = 0): HookNotice[] {
-        return this.database.prepare(`
+        return this.prepare(`
             SELECT
                 M.id,
                 M.seq,
@@ -749,7 +767,7 @@ export class RoomStore {
         }
         return runInTransaction(this.database, () => {
             // (2) Participant
-            const row = this.database.prepare(`
+            const row = this.prepare(`
                 SELECT id, hook_nudged_seq FROM agent WHERE host = :host AND host_session_id = :session_id AND room = :room
             `).get({ host: event.host, session_id: event.sessionId, room }) as { id: string; hook_nudged_seq: number } | undefined;
             // A missing start or an explicit leave must not create a phantom participant.
@@ -762,7 +780,7 @@ export class RoomStore {
             if(event.kind == "turn-end" && event.canContinue == true) {
                 const continueFor = this.hookNotices(row.id, row.hook_nudged_seq);
                 if(continueFor.length > 0) {
-                    this.database.prepare(`
+                    this.prepare(`
                         UPDATE agent
                         SET hook_nudged_seq = :nudged_seq, last_seen_at = :now, disconnected_at = NULL
                         WHERE id = :id
@@ -776,7 +794,7 @@ export class RoomStore {
             if(event.kind == "file-edited") {
                 const files = event.files.map((file) => {
                     const absolute = path.resolve(event.cwd, file);
-                    const workspace = this.database.prepare("SELECT display_path FROM workspace WHERE id = :id")
+                    const workspace = this.prepare("SELECT display_path FROM workspace WHERE id = :id")
                         .get({ id: current.workspace_id }) as { display_path: string };
                     return path.relative(workspace.display_path, absolute).replaceAll(path.sep, "/") || ".";
                 }).filter((file) => file.length <= MAX_LIST_ITEM_LENGTH);
@@ -786,7 +804,7 @@ export class RoomStore {
             const status = event.kind == "prompt" ? "working" : event.kind == "turn-end" ? "waiting" : current.status;
             const { values, cardChanged, editingChanged } = applyCardUpdate(current, { status, editing });
             // a prompt means the session is in use: an idle-wake watch from the previous turn ends
-            this.database.prepare(`
+            this.prepare(`
                 UPDATE agent SET status = :status, editing_list = :editing,
                     revision = revision + :changed, changed_seq = :seq,
                     updated_at = CASE WHEN :changed THEN :now ELSE updated_at END,
@@ -816,13 +834,13 @@ export class RoomStore {
      */
     startWakeWatch(event: HookEvent): WakeWatch | null {
         return runInTransaction(this.database, () => {
-            const row = this.database.prepare(`
+            const row = this.prepare(`
                 SELECT id, left_at FROM agent WHERE host = :host AND host_session_id = :session_id
             `).get({ host: event.host, session_id: event.sessionId }) as { id: string; left_at: string | null } | undefined;
             if(row == null || row.left_at != null) {
                 return null;
             }
-            const started = this.database.prepare(`
+            const started = this.prepare(`
                 UPDATE agent SET wake_generation = wake_generation + 1 WHERE id = :id RETURNING wake_generation
             `).get({ id: row.id }) as { wake_generation: number };
             return { agentId: row.id, generation: started.wake_generation };
@@ -843,7 +861,7 @@ export class RoomStore {
     checkWakeWatch(watch: WakeWatch, quietEnough: boolean, nowMs: number = Date.now()): WakeCheck {
         // the check, and for a wake the wake times within the last hour
         const look = (): { check: WakeCheck; woken: string[] } => {
-            const row = this.database.prepare(`
+            const row = this.prepare(`
                 SELECT wake_generation, hook_nudged_seq, woken_at_list, left_at, disconnected_at
                 FROM agent
                 WHERE id = :id
@@ -876,7 +894,7 @@ export class RoomStore {
                 return confirmed.check;
             }
             const notices = confirmed.check.notices;
-            this.database.prepare(`
+            this.prepare(`
                 UPDATE agent
                 SET wake_generation = wake_generation + 1, hook_nudged_seq = :nudged_seq, woken_at_list = :woken_at_list
                 WHERE id = :id
@@ -922,7 +940,7 @@ export class RoomStore {
                 throw new RoomError(`revision conflict: your card is at revision ${current.revision}; inspect it and retry`);
             }
 
-            const acknowledge = this.database.prepare(`
+            const acknowledge = this.prepare(`
                 UPDATE message_receipt SET received_at = :now
                 WHERE message_id = :message_id AND agent_id = :agent_id AND received_at IS NULL
             `);
@@ -938,7 +956,7 @@ export class RoomStore {
             }
             const cardChanged = fieldsChanged == true || displayName != current.display_name;
             if(cardChanged == false && checkpoint == "") {
-                this.database.prepare(`
+                this.prepare(`
                     UPDATE agent SET last_seen_at = :now, disconnected_at = NULL WHERE id = :id
                 `).run({ now: nowText, id: agentId });
                 return this.requireAgent(agentId);
@@ -952,7 +970,7 @@ export class RoomStore {
             if(editingChanged == true) {
                 editingUpdatedAt = nowText;
             }
-            this.database.prepare(`
+            this.prepare(`
                 UPDATE agent
                 SET display_name = :display_name,
                     status = :status,
@@ -979,7 +997,7 @@ export class RoomStore {
                 id: agentId,
             });
             if(checkpoint != "") {
-                this.database.prepare(`
+                this.prepare(`
                     INSERT INTO checkpoint (agent_id, workspace_id, body, created_at)
                     VALUES (:agent_id, :workspace_id, :body, :created_at)
                 `).run({ agent_id: agentId, workspace_id: current.workspace_id, body: checkpoint, created_at: nowText });
@@ -992,7 +1010,7 @@ export class RoomStore {
         const boundSeq = this.readLastSeq();
         // a session that ended or left before this agent joined never reaches it; one that ended
         // later (or in the same millisecond) was seen alive, so its final card is delivered once
-        const changedAgents = this.database.prepare(`
+        const changedAgents = this.prepare(`
             SELECT ${AGENT_COLUMNS}
             FROM agent AS A
             WHERE A.room = :room
@@ -1011,7 +1029,7 @@ export class RoomStore {
             viewer_joined_at: agent.joined_at,
             limit: CHECK_IN_MAX_AGENTS + 1,
         }) as unknown as AgentRow[];
-        const newMessages = this.database.prepare(`
+        const newMessages = this.prepare(`
             SELECT
                 M.id,
                 M.seq,
@@ -1100,7 +1118,7 @@ export class RoomStore {
         }
 
         // (4) Remember the position
-        this.database.prepare(`
+        this.prepare(`
             UPDATE agent SET delivered_seq = :delivered_seq WHERE id = :id
         `).run({ delivered_seq: deliveredSeq, id: agentId });
 
@@ -1197,14 +1215,14 @@ export class RoomStore {
 
         let workspace: FullCard["workspace"] = null;
         if(target.workspace_id != null) {
-            const workspaceRow = this.database.prepare(`
+            const workspaceRow = this.prepare(`
                 SELECT id, display_path, is_verified FROM workspace WHERE id = :id
             `).get({ id: target.workspace_id }) as { id: string; display_path: string; is_verified: number };
             workspace = { id: workspaceRow.id, path: workspaceRow.display_path, verified: workspaceRow.is_verified == 1 };
         }
 
         const limit = input.checkpointLimit ?? INSPECT_CHECKPOINT_DEFAULT_LIMIT;
-        const checkpointRows = this.database.prepare(`
+        const checkpointRows = this.prepare(`
             SELECT id, body, created_at
             FROM checkpoint
             WHERE agent_id = :agent_id AND (:before_id IS NULL OR id < :before_id)
@@ -1284,7 +1302,7 @@ export class RoomStore {
 
             // (2) Retry
             if(input.requestId != null) {
-                const existing = this.database.prepare(`
+                const existing = this.prepare(`
                     SELECT
                         M.id,
                         (SELECT COUNT(*) FROM message_receipt AS MR WHERE MR.message_id = M.id) AS recipient_count
@@ -1335,7 +1353,7 @@ export class RoomStore {
             let replyTo = input.replyTo;
             let replyTargetRemoved = false;
             if(replyTo != null) {
-                const target = this.database.prepare(`SELECT id FROM message WHERE id = :id`).get({ id: replyTo });
+                const target = this.prepare(`SELECT id FROM message WHERE id = :id`).get({ id: replyTo });
                 if(target == null) {
                     // cleaned up after it was resolved: the answer still goes out, without the link
                     replyTo = null;
@@ -1343,7 +1361,7 @@ export class RoomStore {
                 }
             }
             if(replyTo != null) {
-                const visible = this.database.prepare(`
+                const visible = this.prepare(`
                     SELECT 1 AS found
                     FROM message AS M
                     WHERE M.id = :message_id
@@ -1362,7 +1380,7 @@ export class RoomStore {
             }
 
             // topics already in use, read before this message adds its own
-            const knownTopics = (this.database.prepare(`SELECT DISTINCT topic_key FROM message_topic`).all() as { topic_key: string }[])
+            const knownTopics = (this.prepare(`SELECT DISTINCT topic_key FROM message_topic`).all() as { topic_key: string }[])
                 .map((row) => row.topic_key);
 
             // (5) Insert
@@ -1370,7 +1388,7 @@ export class RoomStore {
             if(scope == "direct") {
                 directRecipient = recipientIds[0];
             }
-            const inserted = this.database.prepare(`
+            const inserted = this.prepare(`
                 INSERT INTO message (
                     seq, room, sender_agent_id, recipient_agent_id, recipient_scope, kind, reply_to_message_id,
                     body, workspace_id, request_id, created_at
@@ -1394,7 +1412,7 @@ export class RoomStore {
                 created_at: new Date(nowMs).toISOString(),
             }) as { id: number };
 
-            const insertTopic = this.database.prepare(`
+            const insertTopic = this.prepare(`
                 INSERT INTO message_topic (message_id, topic_key, position) VALUES (:message_id, :topic_key, :position)
             `);
             topics.forEach((topic, position) => {
@@ -1406,7 +1424,7 @@ export class RoomStore {
              * sessions and people at the CLI get none: a receipt they can never acknowledge only
              * piles up. Named recipients keep their receipt unless they left.
              */
-            const receipts = this.database.prepare(`
+            const receipts = this.prepare(`
                 INSERT INTO message_receipt (message_id, agent_id)
                 SELECT :message_id, A.id
                 FROM agent AS A
@@ -1486,7 +1504,7 @@ export class RoomStore {
         let pageRows: MessageRow[];
         let hasMore: boolean;
         if(input.messageIds != null && input.messageIds.length > 0) {
-            const rows = this.database.prepare(`
+            const rows = this.prepare(`
                 ${selectColumns}
                 WHERE M.id IN (SELECT value FROM json_each(:message_ids))
                     AND M.room = :room
@@ -1505,7 +1523,7 @@ export class RoomStore {
         else if(input.topic != null && input.topic.trim() != "") {
             const topic = normalizeTopicPrefix(input.topic);
             // newest first to cut the page, then back to reading order
-            const rows = this.database.prepare(`
+            const rows = this.prepare(`
                 ${selectColumns}
                 WHERE M.room = :room
                     AND (MR.agent_id IS NOT NULL OR M.sender_agent_id = :agent_id)
@@ -1521,7 +1539,7 @@ export class RoomStore {
             hasMore = rows.length > limit;
         }
         else {
-            const rows = this.database.prepare(`
+            const rows = this.prepare(`
                 ${selectColumns}
                 WHERE MR.agent_id IS NOT NULL AND MR.received_at IS NULL
                 ORDER BY M.seq
@@ -1572,7 +1590,7 @@ export class RoomStore {
                 nextStep: input.nextStep ?? undefined,
                 editing: [],
             });
-            this.database.prepare(`
+            this.prepare(`
                 UPDATE agent
                 SET status = :status,
                     task = :task,
@@ -1591,7 +1609,7 @@ export class RoomStore {
             `).run({ ...values, changed_seq: this.nextSeq(), now: nowText, id: agentId });
             const checkpoint = input.checkpoint?.trim() ?? "";
             if(checkpoint != "") {
-                this.database.prepare(`
+                this.prepare(`
                     INSERT INTO checkpoint (agent_id, workspace_id, body, created_at)
                     VALUES (:agent_id, :workspace_id, :body, :created_at)
                 `).run({ agent_id: agentId, workspace_id: current.workspace_id, body: checkpoint, created_at: nowText });
@@ -1615,7 +1633,7 @@ export class RoomStore {
     purgeMessages(nowMs: number = Date.now()): number {
         return runInTransaction(this.database, () => {
             // (1) Candidates
-            const candidates = this.database.prepare(`
+            const candidates = this.prepare(`
                 SELECT M.id
                 FROM message AS M
                 WHERE NOT EXISTS (
@@ -1652,7 +1670,7 @@ export class RoomStore {
 
             // (2) Reply chains: a reply that stays keeps what it answers, repeated until nothing changes
             const deletable = new Set(candidates.map((row) => row.id));
-            const replies = this.database.prepare(`
+            const replies = this.prepare(`
                 SELECT id, reply_to_message_id FROM message WHERE reply_to_message_id IS NOT NULL
             `).all() as { id: number; reply_to_message_id: number }[];
             let changed = true;
@@ -1672,13 +1690,13 @@ export class RoomStore {
             // (3) Delete. ON DELETE RESTRICT is checked row by row, not at the end of the statement,
             // so a reply must go before what it answers: newest first, since a reply is always newer
             const ids = [...deletable].sort((left, right) => right - left);
-            this.database.prepare(`
+            this.prepare(`
                 DELETE FROM message_receipt WHERE message_id IN (SELECT value FROM json_each(:ids))
             `).run({ ids: JSON.stringify(ids) });
-            this.database.prepare(`
+            this.prepare(`
                 DELETE FROM message_topic WHERE message_id IN (SELECT value FROM json_each(:ids))
             `).run({ ids: JSON.stringify(ids) });
-            const deleteMessage = this.database.prepare(`DELETE FROM message WHERE id = :id`);
+            const deleteMessage = this.prepare(`DELETE FROM message WHERE id = :id`);
             for(const id of ids) {
                 deleteMessage.run({ id: id });
             }
@@ -1703,7 +1721,7 @@ export class RoomStore {
 
         return runInTransaction(this.database, () => {
             // (2) Agents
-            const retired = this.database.prepare(`
+            const retired = this.prepare(`
                 SELECT A.id
                 FROM agent AS A
                 WHERE A.is_human = 0
@@ -1716,14 +1734,14 @@ export class RoomStore {
             let checkpoints = 0;
             if(retired.length > 0) {
                 const ids = JSON.stringify(retired.map((row) => row.id));
-                this.database.prepare(`DELETE FROM message_receipt WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
-                const removedCheckpoints = this.database.prepare(`DELETE FROM checkpoint WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+                this.prepare(`DELETE FROM message_receipt WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+                const removedCheckpoints = this.prepare(`DELETE FROM checkpoint WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
                 checkpoints += Number(removedCheckpoints.changes);
-                this.database.prepare(`DELETE FROM agent WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+                this.prepare(`DELETE FROM agent WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
             }
 
             // (3) Checkpoints over the per-agent cap
-            const capped = this.database.prepare(`
+            const capped = this.prepare(`
                 DELETE FROM checkpoint
                 WHERE id IN (
                     SELECT id FROM (
@@ -1736,7 +1754,7 @@ export class RoomStore {
             checkpoints += Number(capped.changes);
 
             // (4) Workspaces
-            const workspaces = this.database.prepare(`
+            const workspaces = this.prepare(`
                 DELETE FROM workspace
                 WHERE NOT EXISTS (SELECT 1 FROM agent AS A WHERE A.workspace_id = workspace.id)
                     AND NOT EXISTS (SELECT 1 FROM checkpoint AS C WHERE C.workspace_id = workspace.id)
@@ -1757,7 +1775,7 @@ export class RoomStore {
         if(messageIds.length == 0) {
             return;
         }
-        this.database.prepare(`
+        this.prepare(`
             UPDATE message_receipt SET received_at = :now
             WHERE agent_id = :agent_id
                 AND received_at IS NULL
@@ -1770,7 +1788,7 @@ export class RoomStore {
      * message named them alone or in a group. Nothing happens when it did not name them.
      */
     acknowledgeForPerson(displayName: string, messageId: number): void {
-        this.database.prepare(`
+        this.prepare(`
             UPDATE message_receipt SET received_at = :now
             WHERE message_id = :message_id
                 AND received_at IS NULL
@@ -1785,7 +1803,7 @@ export class RoomStore {
      */
     recordCall(agentId: string, deliveredMessageIds: number[]): void {
         runInTransaction(this.database, () => {
-            this.database.prepare(`
+            this.prepare(`
                 UPDATE agent SET last_seen_at = :now, disconnected_at = NULL
                 WHERE id = :id AND left_at IS NULL
             `).run({ now: new Date().toISOString(), id: agentId });
@@ -1798,7 +1816,7 @@ export class RoomStore {
         if(agentIds.length == 0) {
             return;
         }
-        this.database.prepare(`
+        this.prepare(`
             UPDATE agent SET last_seen_at = :now
             WHERE id IN (SELECT value FROM json_each(:agent_ids)) AND left_at IS NULL AND disconnected_at IS NULL
         `).run({ now: new Date().toISOString(), agent_ids: JSON.stringify(agentIds) });
@@ -1817,7 +1835,7 @@ export class RoomStore {
                     continue;
                 }
                 if(current.editing_list != "[]") {
-                    this.database.prepare(`
+                    this.prepare(`
                         UPDATE agent
                         SET editing_list = '[]',
                             editing_updated_at = :now,
@@ -1826,7 +1844,7 @@ export class RoomStore {
                         WHERE id = :id
                     `).run({ now: nowText, changed_seq: this.nextSeq(), id: agentId });
                 }
-                this.database.prepare(`
+                this.prepare(`
                     UPDATE agent SET disconnected_at = :now WHERE id = :id
                 `).run({ now: nowText, id: agentId });
             }
@@ -1837,7 +1855,7 @@ export class RoomStore {
     ensureHumanParticipant(room: string, displayName: string): string {
         room = SHARED_ROOM;
         return runInTransaction(this.database, () => {
-            const existing = this.database.prepare(`
+            const existing = this.prepare(`
                 SELECT id FROM agent WHERE room = :room AND is_human = 1 AND display_name = :display_name
             `).get({ room: room, display_name: displayName }) as { id: string } | undefined;
             if(existing != null) {
@@ -1845,7 +1863,7 @@ export class RoomStore {
             }
             const agentId = newIdentifier("agt");
             const nowText = new Date().toISOString();
-            this.database.prepare(`
+            this.prepare(`
                 INSERT INTO agent (
                     id, room, handle_hash, display_name, client, is_human, status,
                     changed_seq, joined_at, updated_at, last_seen_at
@@ -1867,7 +1885,7 @@ export class RoomStore {
     }
 
     listRooms(): string[] {
-        const rows = this.database.prepare(`SELECT DISTINCT room FROM agent ORDER BY room`).all() as { room: string }[];
+        const rows = this.prepare(`SELECT DISTINCT room FROM agent ORDER BY room`).all() as { room: string }[];
         return rows.map((row) => row.room);
     }
 
@@ -1878,7 +1896,7 @@ export class RoomStore {
         if(byId != null && byId.room == room) {
             return byId.id;
         }
-        let byName = this.database.prepare(`
+        let byName = this.prepare(`
             SELECT id FROM agent WHERE room = :room AND lower(display_name) = lower(:name) AND left_at IS NULL
         `).all({ room: room, name: idOrName }) as { id: string }[];
         if(byName.length > 1) {
@@ -1901,13 +1919,13 @@ export class RoomStore {
     getRoomOverview(room: string, messageLimit: number): { agents: RoomOverviewAgent[]; messages: RoomOverviewMessage[] } {
         room = SHARED_ROOM;
         const nowMs = Date.now();
-        const agentRows = this.database.prepare(`
+        const agentRows = this.prepare(`
             SELECT ${AGENT_COLUMNS} FROM agent WHERE room = :room ORDER BY left_at IS NOT NULL, joined_at
         `).all({ room: room }) as unknown as AgentRow[];
         const agents = agentRows.map((row) => {
             let workspacePath: string | null = null;
             if(row.workspace_id != null) {
-                const workspaceRow = this.database.prepare(`
+                const workspaceRow = this.prepare(`
                     SELECT display_path FROM workspace WHERE id = :id
                 `).get({ id: row.workspace_id }) as { display_path: string };
                 workspacePath = workspaceRow.display_path;
@@ -1932,7 +1950,7 @@ export class RoomStore {
             };
         });
 
-        const messageRows = this.database.prepare(`
+        const messageRows = this.prepare(`
             SELECT
                 M.id,
                 M.created_at,
