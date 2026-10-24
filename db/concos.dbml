@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 6 · first required by concos 0.1.0. Every table is a record, not a cache.
+// Schema version 6 · first required by concos 0.1.1. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']

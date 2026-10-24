@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [0.1.0] - 2026-10-25
+## [0.1.1] - 2026-10-25
 
 First release.
 
@@ -21,4 +21,6 @@ First release.
 ### Notes
 - Licensed under the GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
 - Requires Node.js 22.13 or newer; Node.js 24 or newer is recommended.
+- The MCP bridge speaks the MCP stdio protocol itself (revisions 2024-10-07 to 2025-11-25), so concos installs with two small dependencies. On Windows, an idle session's bridge uses about 25 MB of private memory.
 - Hooks and idle wake were checked on Windows with Claude Code 2.1.310 and Codex 0.164.0.
+- 0.1.0 was tagged in the repository but never published.
