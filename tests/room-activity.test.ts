@@ -3,7 +3,7 @@ import { RoomActivity } from "../src/modules/cli/room-activity";
 import type { RoomOverviewAgent, RoomOverviewMessage } from "../src/modules/store/room-store";
 import type { Style } from "../src/modules/cli/prompter";
 
-const style: Style = { accent: (text) => text, success: (text) => text, warning: (text) => text, danger: (text) => text, dim: (text) => text, bold: (text) => text };
+const style: Style = { accent: (text) => text, success: (text) => text, warning: (text) => text, danger: (text) => text, dim: (text) => text, bold: (text) => text, inverse: (text) => text };
 const agent: RoomOverviewAgent = {
     agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting",
     task: "storage", next_step: "review", blocker: "", editing: [], workspace_path: "/project",
@@ -11,7 +11,7 @@ const agent: RoomOverviewAgent = {
 };
 const message: RoomOverviewMessage = {
     id: 1, at: agent.updated_at, from_name: "Server", from_client: "Codex", from_human: false,
-    to_name: null, recipients: [], to_agent_id: null, to_human: false, topics: [], resolved: false,
+    to_name: null, recipients: [], to_agent_id: null, to_human: false, topics: [], posted: false, edited_at: null, resolved: false,
     waiting_on: ["Reviewer"], waiting_on_participants: [{ name: "Reviewer", client: "Claude Code", human: false }],
     kind: "question", reply_to: null, text: "Please review",
 };
@@ -48,6 +48,16 @@ describe("waiting room activity", () => {
         expect(badge(activity, "message:1")).toContain("NEW");
         expect(activity.tabs(tabs).items[1].label).not.toContain("+1");
         expect(message).toMatchObject({ resolved: false, waiting_on: ["Reviewer"] });
+    });
+
+    it("treats a message that arrives already received as new, since the board lists it too", () => {
+        const activity = new RoomActivity(true, true, true, true);
+        activity.update([agent], [], "tab:agents", 0);
+        const received = { ...message, resolved: true, waiting_on: [], waiting_on_participants: [] };
+        activity.update([agent], [received], "tab:agents", 100);
+        expect(activity.tabs(tabs).items[1].label).toContain("+1");
+        activity.update([agent], [received], "tab:messages", 5000);
+        expect(badge(activity, "message:1")).toContain("NEW");
     });
 
     it("distinguishes status, inbox and receipt changes and does not leave a counter for resolved messages", () => {

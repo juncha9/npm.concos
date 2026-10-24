@@ -98,6 +98,28 @@ describe("concos mcp over stdio", () => {
         expect(overview[0].agents.find((agent: any) => agent.agent_id == peer.agent_id).pending_count).toBe(2);
     }, E2E_TIMEOUT_MS);
 
+    it("posts to the room and lets only its sender rewrite or remove the post", async () => {
+        const first = await connectBridge();
+        const second = await connectBridge();
+        await callTool(first, "join", { display_name: "Poster", client: "Claude Code", working_directory: workDirectory });
+        const reader = await callTool(second, "join", { display_name: "Reader", client: "Codex", working_directory: workDirectory });
+        await callTool(second, "check_in", {});
+        const posted = await callTool(first, "send_message", { to: "all", kind: "notice", text: "Server restarts at 15:00" });
+        expect(posted).toMatchObject({ posted: true, recipient_count: 0 });
+        await expect(callTool(first, "send_message", { to: reader.agent_id, text: "edited", edit: posted.message_id })).rejects.toThrow(/set to "all"/);
+        await expect(callTool(second, "send_message", { to: "all", text: "mine", edit: posted.message_id })).rejects.toThrow(/only those can be edited/);
+        await callTool(first, "send_message", { to: "all", text: "Server is back", edit: posted.message_id });
+        const seen = await callTool(second, "check_in", {});
+        expect(seen.room.messages).toEqual([expect.objectContaining({ id: posted.message_id, to: "all", kind: "notice", text: "Server is back", edited_at: expect.any(String) })]);
+        expect(seen.inbox).toBeUndefined();
+
+        await expect(callTool(second, "remove_posts", { message_ids: [posted.message_id] })).rejects.toThrow(/not your posts to all/);
+        expect(await callTool(first, "remove_posts", { message_ids: [posted.message_id] })).toEqual({ removed: [posted.message_id] });
+        await expect(callTool(second, "read_messages", { message_ids: [posted.message_id] })).resolves.toEqual({
+            messages: [], unavailable: [{ id: posted.message_id, reason: expect.stringMatching(/^not found: deleted/) }],
+        });
+    }, E2E_TIMEOUT_MS);
+
     it("answers the scripted commands in English", () => {
         const run = (...args: string[]) => spawnSync(process.execPath, [CLI_PATH, ...args], {
             cwd: workDirectory, env: childEnvironment(), encoding: "utf8",
@@ -106,7 +128,7 @@ describe("concos mcp over stdio", () => {
         expect(run("say").stderr).toContain("concos: say: name a recipient");
         expect(run("say", "all", "Hello", "--kind", "shout").stderr).toContain("concos: --kind must be one of");
         expect(run("say", "all").stderr).toContain("concos: say: add the message text after the recipient");
-        expect(run("say", "all", "Schema is frozen").stdout).toContain("stored · Room main");
+        expect(run("say", "all", "Schema is frozen").stdout).toContain("posted · Room main");
     }, E2E_TIMEOUT_MS);
 
     it("shows the copyright notice in the help text and under the hashbang of every built file", () => {
@@ -120,7 +142,7 @@ describe("concos mcp over stdio", () => {
         }
     });
 
-    it("adds caller-specific inbox counts to all six tools and keeps hook events from consuming messages", async () => {
+    it("adds caller-specific inbox counts to every tool and keeps hook events from consuming messages", async () => {
         const hook = (kind: string, extra: Record<string, unknown> = {}) => JSON.parse(execFileSync(process.execPath,
             [CLI_PATH, "hook", kind, "--host", "claude", "--room", "e2e"], {
                 env: childEnvironment(), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
@@ -251,7 +273,7 @@ describe("concos mcp over stdio", () => {
 
         const tools = await claude.listTools();
         expect(tools.tools.map((tool) => tool.name).sort()).toEqual(
-            ["check_in", "inspect_agent", "join", "leave", "read_messages", "send_message"]
+            ["check_in", "inspect_agent", "join", "leave", "read_messages", "remove_posts", "send_message"]
         );
         expect(claude.getInstructions()).toContain("check_in");
 
@@ -399,7 +421,7 @@ describe("concos mcp over stdio", () => {
 
         sendLine(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }));
         const tools = (await answerTo(2)).result.tools;
-        expect(tools.map((tool: any) => tool.name)).toEqual(["join", "check_in", "inspect_agent", "send_message", "read_messages", "leave"]);
+        expect(tools.map((tool: any) => tool.name)).toEqual(["join", "check_in", "inspect_agent", "send_message", "read_messages", "remove_posts", "leave"]);
         expect(tools.every((tool: any) => tool.inputSchema.type == "object" && tool.execution.taskSupport == "forbidden")).toBe(true);
 
         sendLine(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/list", params: {} }));

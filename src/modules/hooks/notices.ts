@@ -4,7 +4,7 @@ import type { HookNotice } from "../store/room-store";
 /** One line naming unread messages by number, sender and first topic; never their text. */
 export function describeNotices(notices: HookNotice[]): string {
     const named = notices.slice(0, HOOK_NOTICES_SHOWN).map((notice) => {
-        let text = `${notice.kind == "question" ? "question" : "answer"} #${notice.id} from ${notice.from_name}`;
+        let text = `${notice.kind == "reply" ? "answer" : notice.kind} #${notice.id} from ${notice.from_name}`;
         if(notice.topic != null) {
             text += ` [${notice.topic}]`;
         }

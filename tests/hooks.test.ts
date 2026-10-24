@@ -88,21 +88,22 @@ describe("hook lifecycle", () => {
         expect(card(joined.agent_id).left).toBe(true);
     });
 
-    it("points at an unread question by number only, without acknowledging messages or moving the MCP cursor", () => {
+    it("points at unread messages by number only, without acknowledging them or moving the MCP cursor", () => {
         const joined = start();
         const sender = store.ensureHumanParticipant("dev", "human");
         const question = store.sendMessage(sender, { to: joined.agent_id, text: "private question body", kind: "question", replyTo: null, requestId: null });
-        for(const kind of ["note", "notice", "reply"] as const) {
-            store.sendMessage(sender, { to: joined.agent_id, text: "body", kind, replyTo: kind == "reply" ? question.message_id : null, requestId: null });
-        }
+        const sent = (["note", "notice", "reply"] as const).map((kind) => store.sendMessage(sender, {
+            to: joined.agent_id, text: "body", kind, replyTo: kind == "reply" ? question.message_id : null, requestId: null,
+        }).message_id);
         const before = database.prepare("SELECT delivered_seq FROM agent WHERE id = ?").get(joined.agent_id);
         const output = processHook(store, event("prompt"), "dev");
-        expect(output?.context).toBe(`concos: unread for you — question #${question.message_id} from human. Read them with read_messages.`);
+        // notes and notices are named too; an answer to another's question is not
+        expect(output?.context).toBe(`concos: unread for you — question #${question.message_id} from human; note #${sent[0]} from human; notice #${sent[1]} from human. Read them with read_messages.`);
         expect(database.prepare("SELECT delivered_seq FROM agent WHERE id = ?").get(joined.agent_id)).toEqual(before);
         expect(store.getInbox(joined.agent_id)).toEqual({ questions: 1, notes: 3 });
-        store.checkIn(joined.agent_id, { update: {}, receivedMessageIds: [question.message_id], cursor: null, expectedRevision: null, checkpoint: null });
+        store.checkIn(joined.agent_id, { update: {}, receivedMessageIds: [question.message_id, sent[0], sent[1]], cursor: null, expectedRevision: null, checkpoint: null });
         expect(processHook(store, event("prompt"), "dev")).toBeUndefined();
-        expect(store.getInbox(joined.agent_id)).toEqual({ questions: 0, notes: 3 });
+        expect(store.getInbox(joined.agent_id)).toEqual({ questions: 0, notes: 1 });
     });
 
     it("names a new hook participant after its client and folder, and tells the model how to keep it", () => {
@@ -154,7 +155,7 @@ describe("turn end", () => {
         const direct = send(asker.agent_id, joined.agent_id);
         const group = send(asker.agent_id, [joined.agent_id, other.agent_id]);
         send(asker.agent_id, "all");
-        send(asker.agent_id, joined.agent_id, "note");
+        const note = send(asker.agent_id, joined.agent_id, "note");
         const mine = send(joined.agent_id, asker.agent_id);
         const answer = send(asker.agent_id, joined.agent_id, "reply", mine);
         // an answer to the asker's own question, and an answer to an answer
@@ -162,6 +163,10 @@ describe("turn end", () => {
         const myAnswer = send(joined.agent_id, asker.agent_id, "reply", direct);
         send(asker.agent_id, joined.agent_id, "reply", myAnswer);
         expect(store.hookNotices(joined.agent_id).map((notice) => notice.id)).toEqual([direct, group, answer]);
+        // a prompt's line names notes too; a turn end still continues only for the others
+        expect(store.applyHookEvent(event("prompt"), "dev")?.notices?.map((notice) => notice.id)).toEqual([direct, group, note, answer]);
+        expect(processHook(store, event("prompt"), "dev")?.context).toContain(`note #${note} from Asker`);
+        expect(turnEnd(true)?.continueFor?.map((notice) => notice.id)).toEqual([direct, group, answer]);
     });
 
     it("names up to three messages with sender and first topic, counts the rest, and leaves the text out", () => {
@@ -349,6 +354,41 @@ describe("schema migration", () => {
             finally { backup.close(); }
         }
         finally { upgraded.close(); old.close(); }
+    });
+
+    it("turns version 7 room-wide messages into posts without receipts, including ones older bridges stored as direct", async () => {
+        const oldDirectory = path.join(directory, "version7");
+        fs.mkdirSync(oldDirectory);
+        const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
+        for(const step of SCHEMA_STEPS.slice(0, 7)) old.exec(step);
+        old.exec("PRAGMA user_version = 7");
+        const now = new Date().toISOString();
+        const insertAgent = old.prepare(`
+            INSERT INTO agent (id, room, handle_hash, display_name, client, changed_seq, joined_at, updated_at, last_seen_at, last_call_at)
+            VALUES (?, 'main', ?, ?, 'test', 1, ?, ?, ?, ?)
+        `);
+        for(const name of ["sender", "reader"]) insertAgent.run(name, `hash-${name}`, name, now, now, now, now);
+        const insertMessage = old.prepare(`
+            INSERT INTO message (seq, room, sender_agent_id, recipient_agent_id, recipient_scope, kind, body, created_at)
+            VALUES (?, 'main', 'sender', ?, ?, 'notice', ?, ?)
+            RETURNING id
+        `);
+        const posted = (insertMessage.get(1, null, "all", "posted", now) as { id: number }).id;
+        const mislabeled = (insertMessage.get(2, null, "direct", "from an old bridge", now) as { id: number }).id;
+        const direct = (insertMessage.get(3, "reader", "direct", "to the reader", now) as { id: number }).id;
+        const insertReceipt = old.prepare("INSERT INTO message_receipt (message_id, agent_id) VALUES (?, 'reader')");
+        for(const id of [posted, mislabeled, direct]) insertReceipt.run(id);
+        old.close();
+
+        const upgraded = await openDatabase(oldDirectory);
+        try {
+            const messages = new RoomStore(upgraded).getRoomOverview("main", 10).messages;
+            expect(messages.map((message) => [message.id, message.posted])).toEqual([[posted, true], [mislabeled, true], [direct, false]]);
+            expect(upgraded.prepare("SELECT message_id FROM message_receipt").all()).toEqual([{ message_id: direct }]);
+            // version 9 counts message numbers on from the highest kept
+            expect(upgraded.prepare("SELECT value FROM meta WHERE key = 'last_message_id'").get()).toEqual({ value: String(direct) });
+        }
+        finally { upgraded.close(); }
     });
 
     it("does not change version 1 when its migration backup cannot be completed", async () => {

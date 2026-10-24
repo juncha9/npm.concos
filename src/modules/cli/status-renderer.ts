@@ -249,6 +249,7 @@ export function renderRoomStatus(overview: {
             const recipient = messageRecipientNames(message, english);
             const sender = participantName(message.from_name, message.from_client, message.from_human);
             let heading = `#${message.id} ${sender} ${unicode ? "→" : "->"} ${recipient} [${message.kind}] · ${age(message.at, nowMs, english)}`;
+            if(message.edited_at != null) heading += english ? ` · edited ${age(message.edited_at, nowMs, english)}` : ` · ${age(message.edited_at, nowMs, english)} 수정`;
             if(message.reply_to != null) heading += english ? ` · reply to #${message.reply_to}` : ` · #${message.reply_to}에 답신`;
             add(heading, "  ", dim);
             const [firstLine, ...rest] = plain(message.text).split("\n");
@@ -374,8 +375,13 @@ export function renderMessageDetail(message: RoomOverviewMessage, options: Statu
         });
     };
     field(english ? "From" : "발신", participantName(message.from_name, message.from_client, message.from_human));
-    field(english ? "To" : "수신", messageRecipientNames(message, english));
+    let recipients = messageRecipientNames(message, english);
+    if(message.posted == true) {
+        recipients = english ? "All agents, posted for reference" : "전체 에이전트, 참고용 게시";
+    }
+    field(english ? "To" : "수신", recipients);
     field(english ? "Sent" : "발송", age(message.at, nowMs, english));
+    if(message.edited_at != null) field(english ? "Edited" : "수정", age(message.edited_at, nowMs, english));
     if(message.reply_to != null) field(english ? "Reply to" : "원문", `#${message.reply_to}`);
     if(message.waiting_on.length > 0) {
         field(english ? "Awaiting" : "확인 대기", message.waiting_on_participants.map((participant) => participantName(participant.name, participant.client, participant.human)).join(", "), 33);

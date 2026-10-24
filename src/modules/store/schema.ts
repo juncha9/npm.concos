@@ -195,4 +195,17 @@ export const SCHEMA_STEPS: readonly string[] = [
     ALTER TABLE agent ADD COLUMN last_call_at TEXT;
     UPDATE agent SET last_call_at = updated_at;
     `,
+    `
+    -- A message to the whole room is a post on its sender's board: nobody receives it, and the
+    -- sender may rewrite it; when it was last rewritten. Bridges older than this step stored some
+    -- room-wide messages as direct ones without a recipient.
+    ALTER TABLE message ADD COLUMN edited_at TEXT;
+    UPDATE message SET recipient_scope = 'all' WHERE recipient_scope = 'direct' AND recipient_agent_id IS NULL;
+    DELETE FROM message_receipt WHERE message_id IN (SELECT id FROM message WHERE recipient_scope = 'all');
+    `,
+    `
+    -- The last message number handed out, so a deleted number is never given again: agents refer
+    -- to messages by number. Starts from the highest number still kept.
+    INSERT INTO meta (key, value) SELECT 'last_message_id', CAST(COALESCE(MAX(id), 0) AS TEXT) FROM message;
+    `,
 ];

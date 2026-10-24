@@ -45,24 +45,24 @@ export const OFFLINE_AFTER_MS = 3 * 60 * 1000;
 /**
  * A session counts as ended once its bridge or host session has closed, or after this long
  * without a tool call, hook event or heartbeat. Ended sessions stay on record but drop out of
- * room-wide messages, other agents' check_in and the board; any later call brings them back.
+ * other agents' check_in and the board; any later call brings them back.
  */
 export const ENDED_AFTER_MS = 30 * 60 * 1000;
 /**
- * A message stays this long after it was sent, read or not, so a session that closed for the
- * night and comes back still gets it; afterwards it is deleted once no active agent still has to
- * receive it. A day was where returning sessions stopped losing messages in a simulation.
+ * A message stays at most this long after it was sent (a post: after its last edit), read or not,
+ * so a session that closed for the night and comes back still gets it. A day was where returning
+ * sessions stopped losing messages in a simulation.
  */
 export const MESSAGE_LIFETIME_MS = 24 * 60 * 60 * 1000;
+/** A message to agents goes this long after its last recipient read it; a question waits for its answer to be read too. */
+export const READ_MESSAGE_GRACE_MS = 60 * 60 * 1000;
+/** Posts to the whole room kept per sender: the newest ones. */
+export const POSTS_PER_AGENT = 3;
 /**
  * A message waits only on agents that called a concos tool or ran a hook this recently. A session
  * left open but idle keeps its bridge heartbeat, so it would otherwise be waited on forever.
  */
 export const AWAIT_AFTER_MS = 30 * 60 * 1000;
-/** A session that joins anew gets the room-wide messages sent this recently, up to LATE_BROADCAST_LIMIT. */
-export const LATE_BROADCAST_NEW_WINDOW_MS = 4 * 60 * 60 * 1000;
-/** Room-wide messages a session receives at most when it joins or returns late: the newest ones. */
-export const LATE_BROADCAST_LIMIT = 5;
 /**
  * An agent card with no activity for this long is deleted with its checkpoints: its last
  * summary stays available for handoff that long, then it is residue.

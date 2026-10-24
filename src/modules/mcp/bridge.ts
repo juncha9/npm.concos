@@ -18,7 +18,9 @@ import {
     MAX_TASK_LENGTH,
     MAX_TOPICS_PER_MESSAGE,
     MESSAGE_KINDS,
+    POSTS_PER_AGENT,
     READ_MESSAGES_MAX_LIMIT,
+    RECIPIENT_ALL,
 } from "../../_defs";
 import type { AgentStatus, MessageKind } from "../../_defs";
 import { $logger } from "../../_libs/logger";
@@ -48,6 +50,9 @@ function shapeCheckIn(result: CheckInResult): { you: { revision: number }; room:
     if(result.messages != null) {
         room.messages = result.messages;
     }
+    if(result.read_in_full != null) {
+        room.read_in_full = result.read_in_full;
+    }
     if(result.has_more != null) {
         room.has_more = result.has_more;
     }
@@ -69,9 +74,9 @@ function fullyDeliveredMessageIds(toolName: string, result: unknown): number[] {
 const SERVER_INSTRUCTIONS = [
     "concos is one shared local waiting room for this user. Agents across projects leave their status and messages here; working_directory identifies each agent's project.",
     "Call join once when you start a task, passing your absolute working directory and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available.",
-    "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
+    "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Messages reach you only through concos calls, so in long work check_in after each finished step as well. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
     "Answer messages with kind question. Use read_messages for the full text of a truncated message, and inspect_agent for another agent's detailed context.",
-    "Send to all only what every agent in the room needs to know, such as a change to a shared server or database; send progress and results to the agents concerned, by agent_id or a list.",
+    "A message to all is a post on your board in the room: others read it for reference and nobody is waited on. Post only what every agent needs to know, such as a change to a shared server or database; rewrite that post with edit when it changes, and take it down with remove_posts once it no longer applies. Send progress and results to the agents concerned, by agent_id or a list. Start a message with its content: the room already shows its sender and recipients.",
     "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits. Durable project knowledge belongs in the project's docs, not in messages.",
     "Call leave when your task is done. Do not call check_in on a timer.",
     "An inbox field on any response counts unread questions and other messages. A message whose full text reached you counts as received on your next call; use read_messages for truncated or unread ones.",
@@ -169,7 +174,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "check_in",
-        description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes and new messages since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing [].",
+        description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes, messages to you, and new or edited posts since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing [].",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },
@@ -235,7 +240,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "send_message",
-        description: "Leave a message for one agent, several, or the whole room. Success means stored, not read. Every agent in the room reads a room-wide message, so send to the agents concerned unless everyone needs it.",
+        description: `Leave a message for one agent or several, or post one to the whole room. Success means stored, not read. A post to all is there for reference: nobody receives it or is waited on, the room keeps your newest ${POSTS_PER_AGENT}, edit rewrites one when it changes, and remove_posts takes it down. Send to the agents concerned unless everyone needs it.`,
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             to: {
@@ -243,17 +248,27 @@ export async function runBridge(): Promise<void> {
                     { type: "string", minLength: 1 },
                     { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: MAX_RECIPIENTS },
                 ],
-                description: `An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all" for news every agent needs.`,
+                description: `An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all" to post news every agent needs.`,
             },
             kind: { type: "string", enum: MESSAGE_KINDS, description: "Default note. Use question when you need an answer, reply with reply_to." },
             text: { type: "string", minLength: 1, maxLength: MAX_MESSAGE_LENGTH },
             topics: { type: "array", items: { type: "string" }, maxItems: MAX_TOPICS_PER_MESSAGE, description: `Up to ${MAX_TOPICS_PER_MESSAGE} snake_case topic keys, broad to narrow, e.g. webapp_login_redirect. Reuse one from similar_topics when it fits.` },
             reply_to: ANY_INTEGER,
+            edit: { ...POSITIVE_INTEGER, description: "Id of one of your posts to all: rewrite it with this text, and kind and topics when given, instead of posting anew. to stays \"all\"." },
             request_id: { type: "string", maxLength: MAX_REQUEST_ID_LENGTH, description: "Reuse on retry to avoid storing the message twice." },
         }, ["to", "text"]),
     }, (values) => runTool("send_message", () => {
-        const args = values as { handle?: string; to: string | string[]; kind?: MessageKind; text: string; topics?: string[]; reply_to?: number; request_id?: string };
+        const args = values as { handle?: string; to: string | string[]; kind?: MessageKind; text: string; topics?: string[]; reply_to?: number; edit?: number; request_id?: string };
         const agentId = resolveAgentId(args.handle);
+        if(args.edit != null) {
+            if(args.to !== RECIPIENT_ALL) {
+                throw new RoomError("edit rewrites a post to all; set to \"all\"");
+            }
+            if(args.reply_to != null) {
+                throw new RoomError("edit keeps the post's reply_to; leave reply_to out");
+            }
+            return store.editPost(agentId, { messageId: args.edit, text: args.text, kind: args.kind, topics: args.topics });
+        }
         return store.sendMessage(agentId, {
             to: args.to,
             kind: args.kind ?? "note",
@@ -266,11 +281,11 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "read_messages",
-        description: "Read full message text: the ids given, the newest under a topic, or by default your messages not yet received. Returned messages count as received on your next call.",
+        description: "Read full message text: the ids given, the newest under a topic, or by default your messages not yet received. Returned messages count as received on your next call; ids that cannot be shown come back under unavailable, with why.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Up to ${MAX_RECEIVED_IDS} ids; at most ${READ_MESSAGES_MAX_LIMIT} messages come back per call, with has_more.` },
-            topic: { type: "string", description: "A topic key or its leading words, e.g. webapp: your messages under it and narrower topics." },
+            topic: { type: "string", description: "A topic key or its leading words, e.g. webapp: your messages and posts to the room under it and narrower topics." },
             limit: { ...POSITIVE_INTEGER, description: `Messages per call, at most ${READ_MESSAGES_MAX_LIMIT}; a larger value returns ${READ_MESSAGES_MAX_LIMIT} with has_more.` },
         }),
     }, (values) => runTool("read_messages", () => {
@@ -282,6 +297,19 @@ export async function runBridge(): Promise<void> {
             limit = Math.min(args.limit, READ_MESSAGES_MAX_LIMIT);
         }
         return store.readMessages(agentId, { messageIds: args.message_ids ?? null, limit: limit, topic: args.topic ?? null });
+    }));
+
+    registerTool({
+        name: "remove_posts",
+        description: "Take your own posts to all off the room once they no longer apply. To tell agents that something changed, edit the post instead.",
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            message_ids: { type: "array", items: ANY_INTEGER, minItems: 1, maxItems: MAX_RECEIVED_IDS, description: "Ids of your posts to all; all are removed, or none when one is not yours." },
+        }, ["message_ids"]),
+    }, (values) => runTool("remove_posts", () => {
+        const args = values as { handle?: string; message_ids: number[] };
+        const agentId = resolveAgentId(args.handle);
+        return store.removePosts(agentId, args.message_ids);
     }));
 
     registerTool({

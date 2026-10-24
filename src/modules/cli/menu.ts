@@ -8,7 +8,7 @@ import { participantName } from "./status-renderer";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
-import { applySetup, hasWake, HOST_LABELS, inspectHooks, inspectSetup, inspectWake, planHooks, planSetup, planWake } from "./setup";
+import { applySetup, hasWake, HOST_LABELS, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planWake, resolveHooksPath } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 
 export interface MenuOptions {
@@ -127,7 +127,12 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
             ], { defaultValue: draft.host, cancelValue: "back" });
             if(host == "back") return;
             draft.host = host;
-            const changes = planSetup(draft);
+            // a first registration brings the hooks, and Claude Code's idle wake, in the same preview;
+            // a registered client changes them from its hooks menu, so hooks turned off stay off
+            let changes = planSetup(draft);
+            if(changes.length > 0 && hasHooks(draft.host)) {
+                changes = planRegistration(draft, { wake: hasWake(draft.host), skipBrokenHooks: true });
+            }
             if(changes.length == 0) {
                 prompter.write("\nThis client already has the same registration.\n");
                 if(hasHooks(draft.host)) {
@@ -141,7 +146,11 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
             previewChanges(prompter, changes);
             if(!await prompter.askYesNo("Register these settings?", false)) continue;
             applySetup(changes);
-            prompter.write(`\nMCP registered for ${HOST_LABELS[draft.host]}.\n`);
+            let registered = "MCP";
+            if(hasHooks(draft.host) && changes.some((change) => change.path == resolveHooksPath(draft))) {
+                registered = hasWake(draft.host) && inspectWake(draft) ? "MCP, hooks and idle wake" : "MCP and hooks";
+            }
+            prompter.write(`\n${registered} registered for ${HOST_LABELS[draft.host]}.\n`);
             prompter.write("Available across your projects. Enable concos MCP in your client, then start a task in a new session.\n");
             await prompter.pause();
         }
@@ -193,7 +202,7 @@ async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void
         to = [presetTo];
     }
     else {
-        const recipients: SelectItem<string>[] = [{ value: "all", label: "All agents" }];
+        const recipients: SelectItem<string>[] = [{ value: "all", label: "All agents", hint: "Posted for reference" }];
         if(activeAgents.length > 1) {
             recipients.push({ value: "several", label: "Several agents", hint: "Pick them one by one" });
         }

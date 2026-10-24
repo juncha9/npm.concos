@@ -22,9 +22,9 @@ import {
     MIN_TOPIC_KEY_LENGTH,
     OFFLINE_AFTER_MS,
     AWAIT_AFTER_MS,
-    LATE_BROADCAST_LIMIT,
-    LATE_BROADCAST_NEW_WINDOW_MS,
     MESSAGE_LIFETIME_MS,
+    POSTS_PER_AGENT,
+    READ_MESSAGE_GRACE_MS,
     READ_MESSAGES_DEFAULT_LIMIT,
     RECIPIENT_ALL,
     SHARED_ROOM,
@@ -74,6 +74,7 @@ interface MessageRow {
     reply_to_message_id: number | null;
     body: string;
     created_at: string;
+    edited_at: string | null;
     received_at: string | null;
     /** JSON array of topic keys in the sender's order (`MESSAGE_TOPICS_COLUMN`). */
     topics: string;
@@ -88,12 +89,22 @@ const MESSAGE_TOPICS_COLUMN = `(
 
 export interface SendResult {
     message_id: number;
+    /** Agents that receive it; a post to the whole room is received by nobody. */
     recipient_count: number;
+    /** A post to the whole room: others read it for reference, nobody is waited on. */
+    posted?: true;
     duplicate?: true;
     /** Named recipients whose session ended or left: stored for them, but nobody reads it until they return. */
     inactive_recipients?: string[];
     reply_target_removed?: true;
     /** Topics already in use that look like a new topic this message introduced. */
+    similar_topics?: string[];
+}
+
+export interface EditResult {
+    message_id: number;
+    edited_at: string;
+    /** Topics already in use that look like a new topic the edit introduced. */
     similar_topics?: string[];
 }
 
@@ -129,7 +140,7 @@ export interface InboxCounts {
     notes: number;
 }
 
-/** An unread message a hook points the model at: a question to it, or an answer to its own question. */
+/** An unread message a hook points the model at: a question to it, an answer to its own question, or on a prompt a note to it. */
 export interface HookNotice {
     id: number;
     seq: number;
@@ -186,12 +197,16 @@ export interface MessagePreview {
     topics?: string[];
     text: string;
     truncated?: true;
+    /** A post its sender rewrote: when. */
+    edited_at?: string;
 }
 
 export interface CheckInResult {
     changed: boolean;
     agents?: CompactCard[];
     messages?: MessagePreview[];
+    /** Ids of the messages above that were cut: read them with read_messages before acting on them. */
+    read_in_full?: number[];
     pending_count: number;
     cursor: string;
     has_more?: true;
@@ -238,6 +253,8 @@ export interface FullMessage {
     topics?: string[];
     text: string;
     at: string;
+    /** A post its sender rewrote: when. */
+    edited_at?: string;
     received: boolean;
 }
 
@@ -278,12 +295,16 @@ export interface RoomOverviewMessage {
     to_agent_id: string | null;
     /** The recipient is a person at the CLI, who acknowledges by opening the message on the board. */
     to_human: boolean;
-    /** Topic keys in the sender's order; the first is the one the board groups by. */
+    /** Topic keys in the sender's order. */
     topics: string[];
+    /** A post to the whole room: nobody receives it, so it never waits on anyone. */
+    posted: boolean;
+    /** A post its sender rewrote: when; otherwise null. */
+    edited_at: string | null;
     /**
-     * No recipient it waits on still has to acknowledge it, so the board hides it until it is
-     * deleted. Only agents that acted within AWAIT_AFTER_MS, and people, are waited on: a closed or
-     * idle session would otherwise keep it open forever; one that acts again reopens it.
+     * No recipient it waits on still has to acknowledge it. Only agents that acted within
+     * AWAIT_AFTER_MS, and people, are waited on: a closed or idle session would otherwise keep it
+     * open forever; one that acts again reopens it.
      */
     resolved: boolean;
     /** Names of recipients it waits on who have not acknowledged it yet. */
@@ -430,6 +451,20 @@ function similarTopics(topic: string, existing: string[]): string[] {
     });
 }
 
+/** Topics in use that look like the ones in `topics` new to `known`, at most MAX_SIMILAR_TOPICS. */
+function topicsSimilarToNew(topics: string[], known: string[]): string[] {
+    const similar = new Set<string>();
+    for(const topic of topics) {
+        if(known.includes(topic) == true) {
+            continue;
+        }
+        for(const other of similarTopics(topic, known)) {
+            similar.add(other);
+        }
+    }
+    return [...similar].sort().slice(0, MAX_SIMILAR_TOPICS);
+}
+
 /** How a message is addressed, as seen by `viewerId`. */
 function addressedTo(row: { recipient_agent_id: string | null; recipient_scope: string }, viewerId: string): string {
     if(row.recipient_scope == "all") {
@@ -528,6 +563,20 @@ export class RoomStore {
             RETURNING CAST(value AS INTEGER) AS seq
         `).get() as { seq: number };
         return row.seq;
+    }
+
+    /**
+     * The next message number. SQLite would hand out a deleted number again once the newest
+     * messages go, and agents refer to messages by number, so `#44` could come to mean another
+     * message (2026-10-25). Also above any number a bridge older than schema 9 has inserted.
+     */
+    private nextMessageId(): number {
+        const row = this.prepare(`
+            UPDATE meta SET value = MAX(CAST(value AS INTEGER), (SELECT COALESCE(MAX(id), 0) FROM message)) + 1
+            WHERE key = 'last_message_id'
+            RETURNING CAST(value AS INTEGER) AS id
+        `).get() as { id: number };
+        return row.id;
     }
 
     private readLastSeq(): number {
@@ -682,12 +731,13 @@ export class RoomStore {
                     changed_seq: seq,
                     now: nowText,
                 });
-                // what it missed while away: sent after the card first joined and still alive
-                let missedSince = new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString();
-                if(resumed.joined_at > missedSince) {
-                    missedSince = resumed.joined_at;
+                // the model naming the card its session-start hook made
+                if(session == null) {
+                    const earlier = this.mergeIntoEarlierCard(resumed.id, input.displayName, workspaceId, nowText);
+                    if(earlier != null) {
+                        return { agent_id: earlier, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
+                    }
                 }
-                this.receiveLateBroadcasts(resumed.id, room, missedSince);
                 return { agent_id: resumed.id, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
             }
 
@@ -715,40 +765,103 @@ export class RoomStore {
                 host_session_id: session?.sessionId ?? null,
                 now: nowText,
             });
-            this.receiveLateBroadcasts(agentId, room, new Date(nowMs - LATE_BROADCAST_NEW_WINDOW_MS).toISOString());
             return { agent_id: agentId, handle: handle, room: room, workspace_id: workspaceId, resumed: false };
         });
     }
 
     /**
-     * Gives a session that joined or came back late the room-wide messages it has no receipt for:
-     * sent by others since `since`, newest first, at most LATE_BROADCAST_LIMIT. They then count as
-     * unread like any other message.
+     * One session, one card. When the model names the card its session-start hook made, an
+     * earlier card it joined by itself under that name (before the hooks were on, or without the
+     * hook's handle) would otherwise stay apart, and messages to it go unread (2026-10-25 report).
+     * The earlier card, whose id other agents use, takes over the hook card's handle, host session
+     * and hook state, and what reached the hook card; the hook card goes.
+     *
+     * Only a card of that name in the same workspace qualifies, not left, not a person and not
+     * bound to a host session itself; the most recently seen one when several do. Returns its id,
+     * or null when there is none or `hookCardId` is not a hook card.
      */
-    private receiveLateBroadcasts(agentId: string, room: string, since: string): void {
+    private mergeIntoEarlierCard(hookCardId: string, displayName: string, workspaceId: string, nowText: string): string | null {
+        const hook = this.prepare(`
+            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, status
+            FROM agent
+            WHERE id = :id
+        `).get({ id: hookCardId }) as {
+            handle_hash: string; host: string | null; host_session_id: string | null; hook_nudged_seq: number; wake_generation: number;
+            woken_at_list: string; client: string; working_directory: string | null; status: AgentStatus;
+        };
+        if(hook.host_session_id == null) {
+            return null;
+        }
+        const earlier = this.prepare(`
+            SELECT id FROM agent
+            WHERE room = :room
+                AND id <> :id
+                AND is_human = 0
+                AND left_at IS NULL
+                AND host_session_id IS NULL
+                AND display_name = :display_name
+                AND workspace_id = :workspace_id
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+        `).get({ room: SHARED_ROOM, id: hookCardId, display_name: displayName, workspace_id: workspaceId }) as { id: string } | undefined;
+        if(earlier == null) {
+            return null;
+        }
+
+        // what reached the hook card moves to the earlier one
+        const ids = { from: hookCardId, to: earlier.id };
         this.prepare(`
-            INSERT INTO message_receipt (message_id, agent_id)
-            SELECT M.id, :agent_id
-            FROM message AS M
-            WHERE M.room = :room
-                AND M.recipient_scope = 'all'
-                AND M.sender_agent_id <> :agent_id
-                AND M.created_at >= :since
-                AND NOT EXISTS (
-                    SELECT 1 FROM message_receipt AS MR WHERE MR.message_id = M.id AND MR.agent_id = :agent_id
-                )
-            ORDER BY M.seq DESC
-            LIMIT :limit
-        `).run({ agent_id: agentId, room: room, since: since, limit: LATE_BROADCAST_LIMIT });
+            UPDATE message_receipt SET agent_id = :to
+            WHERE agent_id = :from AND message_id NOT IN (SELECT message_id FROM message_receipt WHERE agent_id = :to)
+        `).run(ids);
+        this.prepare(`DELETE FROM message_receipt WHERE agent_id = :from`).run({ from: hookCardId });
+        this.prepare(`UPDATE message SET sender_agent_id = :to WHERE sender_agent_id = :from`).run(ids);
+        this.prepare(`UPDATE message SET recipient_agent_id = :to WHERE recipient_agent_id = :from`).run(ids);
+        this.prepare(`UPDATE checkpoint SET agent_id = :to WHERE agent_id = :from`).run(ids);
+        // the hook card frees its unique handle and session key before the earlier card takes them
+        this.prepare(`DELETE FROM agent WHERE id = :from`).run({ from: hookCardId });
+        this.prepare(`
+            UPDATE agent
+            SET handle_hash = :handle_hash,
+                host = :host,
+                host_session_id = :host_session_id,
+                hook_nudged_seq = MAX(hook_nudged_seq, :hook_nudged_seq),
+                wake_generation = :wake_generation,
+                woken_at_list = :woken_at_list,
+                client = :client,
+                working_directory = :working_directory,
+                status = :status,
+                changed_seq = :changed_seq,
+                last_seen_at = :now,
+                last_call_at = :now,
+                disconnected_at = NULL
+            WHERE id = :to
+        `).run({
+            handle_hash: hook.handle_hash,
+            host: hook.host,
+            host_session_id: hook.host_session_id,
+            hook_nudged_seq: hook.hook_nudged_seq,
+            wake_generation: hook.wake_generation,
+            woken_at_list: hook.woken_at_list,
+            client: hook.client,
+            working_directory: hook.working_directory,
+            status: hook.status,
+            changed_seq: this.nextSeq(),
+            now: nowText,
+            to: earlier.id,
+        });
+        return earlier.id;
     }
 
     /**
      * Unread messages a hook may point out, newer than `afterSeq`: questions named to this agent,
      * alone or in a group, and answers to its own questions. Room-wide messages would continue
      * every session in the room, and answers to answers would bounce between agents, so neither
-     * counts. Reading this list acknowledges nothing.
+     * counts. `includeNotes` adds notes and notices named to it, for the line a prompt or session
+     * start shows; they never continue a turn or wake a session. Reading this list acknowledges
+     * nothing.
      */
-    hookNotices(agentId: string, afterSeq = 0): HookNotice[] {
+    hookNotices(agentId: string, afterSeq = 0, includeNotes = false): HookNotice[] {
         return this.prepare(`
             SELECT
                 M.id,
@@ -774,6 +887,7 @@ export class RoomStore {
                 AND (M.recipient_scope = 'group' OR (M.recipient_scope = 'direct' AND M.recipient_agent_id IS NOT NULL))
                 AND (
                     M.kind = 'question'
+                    OR (:include_notes = 1 AND M.kind IN ('note', 'notice'))
                     OR (
                         M.kind = 'reply'
                         AND EXISTS (
@@ -786,7 +900,7 @@ export class RoomStore {
                     )
                 )
             ORDER BY M.seq
-        `).all({ agent_id: agentId, after_seq: afterSeq }) as unknown as HookNotice[];
+        `).all({ agent_id: agentId, after_seq: afterSeq, include_notes: Number(includeNotes) }) as unknown as HookNotice[];
     }
 
     /**
@@ -812,7 +926,7 @@ export class RoomStore {
                 workingDirectory: event.cwd, workspaceRoot: null, resumeHandle: null,
                 hookSession: { host: event.host, sessionId: event.sessionId },
             });
-            return { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id) };
+            return { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id, 0, true) };
         }
         return runInTransaction(this.database, () => {
             // (2) Participant
@@ -870,7 +984,7 @@ export class RoomStore {
             });
             const outcome: HookOutcome = { agentId: row.id };
             if(event.kind == "prompt") {
-                outcome.notices = this.hookNotices(row.id);
+                outcome.notices = this.hookNotices(row.id, 0, true);
             }
             return outcome;
         });
@@ -1091,15 +1205,18 @@ export class RoomStore {
                 M.reply_to_message_id,
                 M.body,
                 M.created_at,
+                M.edited_at,
                 MR.received_at,
                 ${MESSAGE_TOPICS_COLUMN}
             FROM message AS M
-            JOIN message_receipt AS MR
+            LEFT JOIN message_receipt AS MR
                 ON MR.message_id = M.id
                 AND MR.agent_id = :agent_id
             JOIN agent AS S
                 ON S.id = M.sender_agent_id
             WHERE M.seq > :start_seq AND M.seq <= :bound_seq
+                -- messages to this agent, and others' posts to the room, again after each edit
+                AND (MR.agent_id IS NOT NULL OR (M.recipient_scope = 'all' AND M.sender_agent_id <> :agent_id))
             ORDER BY M.seq
             LIMIT :limit
         `).all({
@@ -1125,6 +1242,7 @@ export class RoomStore {
             changed: true,
             agents: [],
             messages: [],
+            read_in_full: Array.from({ length: CHECK_IN_MAX_MESSAGES }, () => Number.MAX_SAFE_INTEGER),
             pending_count: pendingCount,
             cursor: formatCursor(boundSeq),
             has_more: true,
@@ -1183,6 +1301,11 @@ export class RoomStore {
         }
         if(previews.length > 0) {
             result.messages = previews;
+            // a cut preview was taken for the whole message and acknowledged unread (2026-10-25 report)
+            const cut = previews.filter((preview) => preview.truncated == true).map((preview) => preview.id);
+            if(cut.length > 0) {
+                result.read_in_full = cut;
+            }
         }
         if(hasMore == true) {
             result.has_more = true;
@@ -1247,6 +1370,9 @@ export class RoomStore {
         }
         if(row.body.length > MESSAGE_PREVIEW_LENGTH) {
             item.truncated = true;
+        }
+        if(row.edited_at != null) {
+            item.edited_at = row.edited_at;
         }
         return item;
     }
@@ -1316,14 +1442,15 @@ export class RoomStore {
     }
 
     /**
-     * Stores a message for one agent, several, or the whole room, tagged with up to three topics.
+     * Stores a message for one agent or several, or posts one to the whole room, tagged with up to
+     * three topics. A post has no receipts: others read it for reference and nobody is waited on.
      *
      * Flow:
      *  1) Check the text, the reply kind and the topic keys before taking the write lock
      *  2) Repeat of a request id: return the stored message
-     *  3) Resolve recipients into a scope: `direct` (one), `group` (several) or `all`
+     *  3) Resolve recipients into a scope: `direct` (one), `group` (several) or `all` (a post)
      *  4) Check reply_to; a reply to a message already cleaned up keeps its text and loses the link
-     *  5) Insert the message, its topics and its receipts
+     *  5) Insert the message, its topics and, for named recipients, their receipts
      *  6) Report inactive recipients, a removed reply target, and existing topics similar to new ones
      */
     sendMessage(senderId: string, input: {
@@ -1355,12 +1482,17 @@ export class RoomStore {
                 const existing = this.prepare(`
                     SELECT
                         M.id,
+                        M.recipient_scope,
                         (SELECT COUNT(*) FROM message_receipt AS MR WHERE MR.message_id = M.id) AS recipient_count
                     FROM message AS M
                     WHERE M.sender_agent_id = :sender_agent_id AND M.request_id = :request_id
-                `).get({ sender_agent_id: senderId, request_id: input.requestId }) as { id: number; recipient_count: number } | undefined;
+                `).get({ sender_agent_id: senderId, request_id: input.requestId }) as { id: number; recipient_count: number; recipient_scope: string } | undefined;
                 if(existing != null) {
-                    return { message_id: existing.id, recipient_count: existing.recipient_count, duplicate: true as const };
+                    const repeated: SendResult = { message_id: existing.id, recipient_count: existing.recipient_count, duplicate: true };
+                    if(existing.recipient_scope == "all") {
+                        repeated.posted = true;
+                    }
+                    return repeated;
                 }
             }
 
@@ -1418,6 +1550,7 @@ export class RoomStore {
                         AND M.room = :room
                         AND (
                             M.sender_agent_id = :agent_id
+                            OR M.recipient_scope = 'all'
                             OR EXISTS (
                                 SELECT 1 FROM message_receipt AS MR
                                 WHERE MR.message_id = M.id AND MR.agent_id = :agent_id
@@ -1425,7 +1558,7 @@ export class RoomStore {
                         )
                 `).get({ message_id: replyTo, room: sender.room, agent_id: senderId });
                 if(visible == null) {
-                    throw new RoomError(`message ${replyTo} is not one you sent or received`);
+                    throw new RoomError(`message ${replyTo} is not one you sent or received, nor a post to the room`);
                 }
             }
 
@@ -1440,15 +1573,16 @@ export class RoomStore {
             }
             const inserted = this.prepare(`
                 INSERT INTO message (
-                    seq, room, sender_agent_id, recipient_agent_id, recipient_scope, kind, reply_to_message_id,
+                    id, seq, room, sender_agent_id, recipient_agent_id, recipient_scope, kind, reply_to_message_id,
                     body, workspace_id, request_id, created_at
                 )
                 VALUES (
-                    :seq, :room, :sender_agent_id, :recipient_agent_id, :recipient_scope, :kind, :reply_to_message_id,
+                    :id, :seq, :room, :sender_agent_id, :recipient_agent_id, :recipient_scope, :kind, :reply_to_message_id,
                     :body, :workspace_id, :request_id, :created_at
                 )
                 RETURNING id
             `).get({
+                id: this.nextMessageId(),
                 seq: this.nextSeq(),
                 room: sender.room,
                 sender_agent_id: senderId,
@@ -1469,63 +1603,186 @@ export class RoomStore {
                 insertTopic.run({ message_id: inserted.id, topic_key: topic, position: position });
             });
 
-            /*
-             * A room-wide message gets one receipt per agent active now. Later joiners, ended
-             * sessions and people at the CLI get none: a receipt they can never acknowledge only
-             * piles up. Named recipients keep their receipt unless they left.
-             */
+            // named recipients keep their receipt unless they left; a post has none
             const receipts = this.prepare(`
                 INSERT INTO message_receipt (message_id, agent_id)
                 SELECT :message_id, A.id
                 FROM agent AS A
                 WHERE A.room = :room
-                    AND A.id <> :sender_agent_id
                     AND A.left_at IS NULL
-                    AND (
-                        (:scope = 'all' AND A.is_human = 0 AND ${ACTIVE_AGENT_CONDITION})
-                        OR (:scope <> 'all' AND A.id IN (SELECT value FROM json_each(:recipients)))
-                    )
+                    AND A.id IN (SELECT value FROM json_each(:recipients))
             `).run({
                 message_id: inserted.id,
                 room: sender.room,
-                sender_agent_id: senderId,
-                scope: scope,
                 recipients: JSON.stringify(recipientIds),
-                active_since: activeSince(nowMs),
             });
 
             // (6) Report
             const result: SendResult = { message_id: inserted.id, recipient_count: Number(receipts.changes) };
+            if(scope == "all") {
+                result.posted = true;
+            }
             if(inactiveRecipients.length > 0) {
                 result.inactive_recipients = inactiveRecipients;
             }
             if(replyTargetRemoved == true) {
                 result.reply_target_removed = true;
             }
-            const similar = new Set<string>();
-            for(const topic of topics) {
-                if(knownTopics.includes(topic) == true) {
-                    continue;
-                }
-                for(const other of similarTopics(topic, knownTopics)) {
-                    similar.add(other);
-                }
-            }
-            if(similar.size > 0) {
-                result.similar_topics = [...similar].sort().slice(0, MAX_SIMILAR_TOPICS);
+            const similar = topicsSimilarToNew(topics, knownTopics);
+            if(similar.length > 0) {
+                result.similar_topics = similar;
             }
             return result;
         });
     }
 
     /**
-     * Full message text. With ids: those messages. With a topic: the newest messages under that
-     * topic or its narrower topics. Otherwise: the caller's messages not yet received. Only
-     * messages the caller sent or received are visible.
+     * Rewrites one of the sender's own posts to the room in place: its text, and its kind and
+     * topics when given. It takes the next seq, so other agents' check_in brings it again, marked
+     * with `edited_at`, and it counts as the sender's newest post.
+     *
+     * Flow:
+     *  1) Check the text, the kind and the topic keys before taking the write lock
+     *  2) The post must exist and be the sender's own
+     *  3) Update the row and replace its topics when given
+     *  4) Report existing topics similar to new ones
+     */
+    editPost(senderId: string, input: { messageId: number; text: string; kind?: MessageKind; topics?: string[] }): EditResult {
+        // (1) Input
+        const text = input.text.trim();
+        if(text == "") {
+            throw new RoomError("text is empty");
+        }
+        let topics: string[] | null = null;
+        if(input.topics != null) {
+            topics = normalizeTopics(input.topics);
+        }
+
+        return runInTransaction(this.database, () => {
+            const sender = this.requireAgent(senderId);
+            if(sender.left_at != null) {
+                throw new RoomError("this participant has left; join again before editing");
+            }
+
+            // (2) Post
+            const post = this.prepare(`
+                SELECT kind, reply_to_message_id FROM message
+                WHERE id = :id AND room = :room AND sender_agent_id = :sender_agent_id AND recipient_scope = 'all'
+            `).get({ id: input.messageId, room: sender.room, sender_agent_id: senderId }) as { kind: MessageKind; reply_to_message_id: number | null } | undefined;
+            if(post == null) {
+                throw new RoomError(`message ${input.messageId} is not one of your posts to all; only those can be edited`);
+            }
+            const kind = input.kind ?? post.kind;
+            if(kind == "reply" && post.reply_to_message_id == null) {
+                throw new RoomError("kind reply needs reply_to, which an edit cannot add");
+            }
+
+            // (3) Update
+            const editedAt = new Date().toISOString();
+            this.prepare(`
+                UPDATE message SET body = :body, kind = :kind, seq = :seq, edited_at = :edited_at WHERE id = :id
+            `).run({ body: text, kind: kind, seq: this.nextSeq(), edited_at: editedAt, id: input.messageId });
+            let similar: string[] = [];
+            if(topics != null) {
+                const knownTopics = (this.prepare(`
+                    SELECT DISTINCT topic_key FROM message_topic WHERE message_id <> :id
+                `).all({ id: input.messageId }) as { topic_key: string }[]).map((row) => row.topic_key);
+                this.prepare(`DELETE FROM message_topic WHERE message_id = :id`).run({ id: input.messageId });
+                const insertTopic = this.prepare(`
+                    INSERT INTO message_topic (message_id, topic_key, position) VALUES (:message_id, :topic_key, :position)
+                `);
+                topics.forEach((topic, position) => {
+                    insertTopic.run({ message_id: input.messageId, topic_key: topic, position: position });
+                });
+                similar = topicsSimilarToNew(topics, knownTopics);
+            }
+
+            // (4) Report
+            const result: EditResult = { message_id: input.messageId, edited_at: editedAt };
+            if(similar.length > 0) {
+                result.similar_topics = similar;
+            }
+            return result;
+        });
+    }
+
+    /**
+     * Takes posts to the room off the board, all or none: a sender's own, or with `senderId` null
+     * any post, for the person at the board. Answers to a removed post stay, without the link, as
+     * when cleanup removed what they answer.
+     *
+     * Flow:
+     *  1) Every id must be a post the caller may remove
+     *  2) Unlink answers, then delete receipts, topics and the posts in one transaction
+     */
+    removePosts(senderId: string | null, messageIds: number[]): { removed: number[] } {
+        const ids = [...new Set(messageIds)];
+        if(ids.length == 0) {
+            throw new RoomError("name at least one post to remove");
+        }
+
+        return runInTransaction(this.database, () => {
+            // (1) Posts
+            let room = SHARED_ROOM;
+            if(senderId != null) {
+                room = this.requireAgent(senderId).room;
+            }
+            const found = (this.prepare(`
+                SELECT id FROM message
+                WHERE id IN (SELECT value FROM json_each(:ids))
+                    AND room = :room
+                    AND recipient_scope = 'all'
+                    AND (:sender_agent_id IS NULL OR sender_agent_id = :sender_agent_id)
+            `).all({ ids: JSON.stringify(ids), room: room, sender_agent_id: senderId }) as { id: number }[]).map((row) => row.id);
+            const missing = ids.filter((id) => found.includes(id) == false);
+            if(missing.length > 0) {
+                const what = senderId == null ? "not posts to all" : "not your posts to all";
+                throw new RoomError(`${what}: ${missing.join(", ")}; nothing was removed`);
+            }
+
+            // (2) Delete
+            const json = JSON.stringify(ids);
+            this.prepare(`
+                UPDATE message SET reply_to_message_id = NULL WHERE reply_to_message_id IN (SELECT value FROM json_each(:ids))
+            `).run({ ids: json });
+            this.prepare(`DELETE FROM message_receipt WHERE message_id IN (SELECT value FROM json_each(:ids))`).run({ ids: json });
+            this.prepare(`DELETE FROM message_topic WHERE message_id IN (SELECT value FROM json_each(:ids))`).run({ ids: json });
+            this.prepare(`DELETE FROM message WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: json });
+            return { removed: ids.sort((left, right) => left - right) };
+        });
+    }
+
+    /** Agents with posts to the room whose sessions are live (not people, left or ended), by name, each with its posts newest first. */
+    livePosters(nowMs: number = Date.now()): { agent_id: string; name: string; client: string; posts: { id: number; text: string }[] }[] {
+        const rows = this.prepare(`
+            SELECT A.id AS agent_id, A.display_name AS name, A.client, M.id, M.body
+            FROM message AS M
+            JOIN agent AS A
+                ON A.id = M.sender_agent_id
+            WHERE M.recipient_scope = 'all'
+                AND A.is_human = 0
+                AND ${ACTIVE_AGENT_CONDITION}
+            ORDER BY A.display_name, A.id, M.seq DESC
+        `).all({ active_since: activeSince(nowMs) }) as { agent_id: string; name: string; client: string; id: number; body: string }[];
+        const posters = new Map<string, { agent_id: string; name: string; client: string; posts: { id: number; text: string }[] }>();
+        for(const row of rows) {
+            const poster = posters.get(row.agent_id) ?? { agent_id: row.agent_id, name: row.name, client: row.client, posts: [] };
+            poster.posts.push({ id: row.id, text: row.body });
+            posters.set(row.agent_id, poster);
+        }
+        return [...posters.values()];
+    }
+
+    /**
+     * Full message text. With ids: those messages, and for each id that cannot be shown, why.
+     * With a topic: the newest messages under that topic or its narrower topics. Otherwise: the
+     * caller's messages not yet received. Only messages the caller sent or received, and posts to
+     * the room, are visible.
      */
     readMessages(viewerId: string, input: { messageIds: number[] | null; limit: number | null; topic?: string | null }): {
         messages: FullMessage[];
         has_more?: true;
+        unavailable?: { id: number; reason: string }[];
     } {
         const viewer = this.requireAgent(viewerId);
         const limit = input.limit ?? READ_MESSAGES_DEFAULT_LIMIT;
@@ -1541,6 +1798,7 @@ export class RoomStore {
                 M.reply_to_message_id,
                 M.body,
                 M.created_at,
+                M.edited_at,
                 MR.received_at,
                 ${MESSAGE_TOPICS_COLUMN}
             FROM message AS M
@@ -1550,25 +1808,28 @@ export class RoomStore {
                 ON MR.message_id = M.id
                 AND MR.agent_id = :agent_id
         `;
+        const visible = `(MR.agent_id IS NOT NULL OR M.sender_agent_id = :agent_id OR M.recipient_scope = 'all')`;
 
         let pageRows: MessageRow[];
         let hasMore: boolean;
+        let unavailable: { id: number; reason: string }[] = [];
         if(input.messageIds != null && input.messageIds.length > 0) {
             const rows = this.prepare(`
                 ${selectColumns}
                 WHERE M.id IN (SELECT value FROM json_each(:message_ids))
                     AND M.room = :room
-                    AND (MR.agent_id IS NOT NULL OR M.sender_agent_id = :agent_id)
+                    AND ${visible}
                 ORDER BY M.seq
-                LIMIT :limit
             `).all({
                 agent_id: viewerId,
                 message_ids: JSON.stringify(input.messageIds),
                 room: viewer.room,
-                limit: limit + 1,
             }) as unknown as MessageRow[];
             pageRows = rows.slice(0, limit);
             hasMore = rows.length > limit;
+            // an empty answer read as "deleted" when the message had gone to another card (2026-10-25 report)
+            const shown = new Set(rows.map((row) => row.id));
+            unavailable = [...new Set(input.messageIds)].filter((id) => shown.has(id) == false).map((id) => ({ id: id, reason: this.unavailableReason(id) }));
         }
         else if(input.topic != null && input.topic.trim() != "") {
             const topic = normalizeTopicPrefix(input.topic);
@@ -1576,7 +1837,7 @@ export class RoomStore {
             const rows = this.prepare(`
                 ${selectColumns}
                 WHERE M.room = :room
-                    AND (MR.agent_id IS NOT NULL OR M.sender_agent_id = :agent_id)
+                    AND ${visible}
                     AND EXISTS (
                         SELECT 1 FROM message_topic AS T
                         WHERE T.message_id = M.id
@@ -1610,6 +1871,9 @@ export class RoomStore {
                 at: row.created_at,
                 received: row.received_at != null,
             };
+            if(row.edited_at != null) {
+                message.edited_at = row.edited_at;
+            }
             if(row.reply_to_message_id != null) {
                 message.reply_to = row.reply_to_message_id;
             }
@@ -1619,11 +1883,33 @@ export class RoomStore {
             }
             return message;
         });
-        const result: { messages: FullMessage[]; has_more?: true } = { messages: messages };
+        const result: { messages: FullMessage[]; has_more?: true; unavailable?: { id: number; reason: string }[] } = { messages: messages };
         if(hasMore == true) {
             result.has_more = true;
         }
+        if(unavailable.length > 0) {
+            result.unavailable = unavailable;
+        }
         return result;
+    }
+
+    /** Why a message the caller asked for by id is not shown: gone, or for whom it is. */
+    private unavailableReason(messageId: number): string {
+        const row = this.prepare(`
+            SELECT
+                (
+                    SELECT json_group_array(A.display_name || ' (' || A.id || ')')
+                    FROM agent AS A
+                    WHERE A.id = M.recipient_agent_id
+                        OR (M.recipient_scope = 'group' AND A.id IN (SELECT MR.agent_id FROM message_receipt AS MR WHERE MR.message_id = M.id))
+                ) AS recipients
+            FROM message AS M
+            WHERE M.id = :id
+        `).get({ id: messageId }) as { recipients: string } | undefined;
+        if(row == null) {
+            return "not found: deleted (an hour after it was read, after a day, or taken down) or never sent";
+        }
+        return `sent to ${parseList(row.recipients).join(", ")}, not to you`;
     }
 
     /** Leaves the final context on the card, clears the editing claim and marks the participant left. */
@@ -1670,11 +1956,15 @@ export class RoomStore {
     }
 
     /**
-     * Deletes messages, with their receipts and topics, once they outlived MESSAGE_LIFETIME_MS,
-     * read or not: the store holds the last day of messages and no more.
+     * Deletes messages, with their receipts and topics, that are no longer current: the store
+     * holds at most the last day of messages.
      *
      * Flow:
-     *  1) Candidates: sent before the lifetime began
+     *  1) Candidates:
+     *     - any message past MESSAGE_LIFETIME_MS, a post counted from its last edit
+     *     - posts beyond the newest POSTS_PER_AGENT of their sender
+     *     - messages to agents whose recipients all read them READ_MESSAGE_GRACE_MS ago; a
+     *       question only once an answer to it was read that long ago as well
      *  2) Keep any candidate that a remaining message replies to, until that reply goes as well
      *  3) Delete receipts, topics, then messages, in one transaction
      *
@@ -1682,10 +1972,39 @@ export class RoomStore {
      */
     purgeMessages(nowMs: number = Date.now()): number {
         return runInTransaction(this.database, () => {
-            // (1) Candidates
+            // (1) Candidates; `read_before(X)`: X has receipts and every one was read before the grace began
+            const readBefore = (alias: string) => `(
+                EXISTS (SELECT 1 FROM message_receipt AS RR WHERE RR.message_id = ${alias}.id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM message_receipt AS RR
+                    WHERE RR.message_id = ${alias}.id AND (RR.received_at IS NULL OR RR.received_at >= :read_grace_start)
+                )
+            )`;
             const candidates = this.prepare(`
-                SELECT M.id FROM message AS M WHERE M.created_at < :lifetime_start
-            `).all({ lifetime_start: new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString() }) as { id: number }[];
+                WITH post_rank AS (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY sender_agent_id ORDER BY seq DESC) AS newest_first
+                    FROM message
+                    WHERE recipient_scope = 'all'
+                )
+                SELECT M.id
+                FROM message AS M
+                LEFT JOIN post_rank AS P
+                    ON P.id = M.id
+                WHERE COALESCE(M.edited_at, M.created_at) < :lifetime_start
+                    OR P.newest_first > :posts_kept
+                    OR (
+                        M.recipient_scope <> 'all'
+                        AND ${readBefore("M")}
+                        AND (
+                            M.kind <> 'question'
+                            OR EXISTS (SELECT 1 FROM message AS A WHERE A.reply_to_message_id = M.id AND ${readBefore("A")})
+                        )
+                    )
+            `).all({
+                lifetime_start: new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString(),
+                posts_kept: POSTS_PER_AGENT,
+                read_grace_start: new Date(nowMs - READ_MESSAGE_GRACE_MS).toISOString(),
+            }) as { id: number }[];
             if(candidates.length == 0) {
                 return 0;
             }
@@ -1731,13 +2050,25 @@ export class RoomStore {
      * still in use. Safe to call often: each step only touches rows past its retention.
      *
      * Flow:
-     *  1) Messages past their lifetime (`purgeMessages`)
+     *  0) Posts that bridges older than schema version 8 still write: a room-wide message stored
+     *     as a direct one without a recipient, and receipts for a post
+     *  1) Messages no longer current (`purgeMessages`)
      *  2) Agent cards silent past AGENT_RETENTION_MS, with their checkpoints and receipts, once no
      *     message still names them; people at the CLI are kept
      *  3) Checkpoints beyond the newest CHECKPOINT_KEEP_PER_AGENT of each agent
      *  4) Workspaces nothing refers to any more
      */
     cleanUp(nowMs: number = Date.now()): { messages: number; agents: number; checkpoints: number; workspaces: number } {
+        // (0) Older bridges
+        runInTransaction(this.database, () => {
+            this.prepare(`
+                UPDATE message SET recipient_scope = 'all' WHERE recipient_scope = 'direct' AND recipient_agent_id IS NULL
+            `).run();
+            this.prepare(`
+                DELETE FROM message_receipt WHERE message_id IN (SELECT id FROM message WHERE recipient_scope = 'all')
+            `).run();
+        });
+
         // (1) Messages
         const messages = this.purgeMessages(nowMs);
 
@@ -1976,6 +2307,7 @@ export class RoomStore {
             SELECT
                 M.id,
                 M.created_at,
+                M.edited_at,
                 S.display_name AS from_name,
                 S.client AS from_client,
                 S.is_human AS from_is_human,
@@ -2018,6 +2350,7 @@ export class RoomStore {
         `).all({ room: room, limit: messageLimit, awaited_since: awaitedSince(nowMs) }) as {
             id: number;
             created_at: string;
+            edited_at: string | null;
             from_name: string;
             from_client: string;
             from_is_human: number;
@@ -2062,6 +2395,8 @@ export class RoomStore {
                 reply_to: row.reply_to_message_id,
                 text: row.body,
                 topics: parseList(row.topics),
+                posted: row.recipient_scope == "all",
+                edited_at: row.edited_at,
                 resolved: waitingOn.length == 0,
                 waiting_on: waitingOn.map((participant) => participant.name),
                 waiting_on_participants: waitingOn,

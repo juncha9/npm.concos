@@ -326,38 +326,12 @@ export function inspectHooks(input: SetupTarget): HookStatus {
  * removes concos handlers and the groups and event lists that become empty.
  */
 export function planHooks(input: SetupTarget, mode: "on" | "off"): SetupChange[] {
-    const expected = expectedHooks(input.host);
     const change = loadChange(resolveHooksPath(input));
     if(mode == "on") {
         if(inspectSetup(input).registered == false) {
             throw new RoomError("Register concos MCP for this client before turning on hooks.");
         }
-        if(input.host == "codex" && concosHooksInCodexConfig(input)) {
-            throw new RoomError(`${resolveMcpPath(input)} already has concos hooks; keep those, or remove them before turning hooks on here.`);
-        }
-        for(const item of expected) {
-            const groups = hookLists(json(change), change.path)[item.event];
-            if(groups == null) {
-                setJson(change, ["hooks", item.event], [item.group]);
-                continue;
-            }
-            if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
-                continue;
-            }
-            const groupIndex = groups.findIndex((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)));
-            if(groupIndex >= 0) {
-                const handlerIndex = handlersOf(groups[groupIndex]).findIndex((handler) => isConcosHandler(handler, item.kind));
-                setJson(change, ["hooks", item.event, groupIndex, "hooks", handlerIndex], item.handler);
-                continue;
-            }
-            setJson(change, ["hooks", item.event, groups.length], item.group, true);
-        }
-        if(change.additions.length > 0 && input.host == "codex") {
-            change.notes.push("Codex runs new or changed hooks only after you trust them: open /hooks in Codex.");
-        }
-        if(change.additions.length > 0 && input.host == "claude") {
-            change.notes.push("Claude Code runs them in folders you have trusted.");
-        }
+        addHooks(change, input);
     }
     else {
         // every concos handler, the idle wake included
@@ -392,21 +366,91 @@ export function planWake(input: SetupTarget, mode: "on" | "off"): SetupChange[] 
         if(inspectHooks(input).state != "on") {
             throw new RoomError("Turn on hooks before idle wake.");
         }
-        const groups = hookLists(json(change), change.path)[item.event] ?? [];
-        if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
-            return [];
-        }
-        setJson(change, ["hooks", item.event, groups.length], item.group, true);
-        change.notes.push(
-            `A waiting Claude Code session wakes by itself when a question for it, or an answer to its question, arrives: `
-            + `after ${WAKE_IDLE_MS / 1000} seconds without input, at most ${WAKE_HOURLY_LIMIT} times an hour, `
-            + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn. Codex sessions do not wake.`,
-        );
+        addWake(change, input);
     }
     else {
         removeHandlers(change, hookLists(json(change), change.path), (handler) => isConcosHandler(handler, "watch"));
     }
     return change.additions.length + change.removals.length > 0 ? [change] : [];
+}
+
+/** Adds each missing concos hook handler to `change`, the client's hooks file, as `planHooks` describes. */
+function addHooks(change: SetupChange, input: SetupTarget): void {
+    if(input.host == "codex" && concosHooksInCodexConfig(input)) {
+        throw new RoomError(`${resolveMcpPath(input)} already has concos hooks; keep those, or remove them before turning hooks on here.`);
+    }
+    const before = change.additions.length;
+    for(const item of expectedHooks(input.host)) {
+        const groups = hookLists(json(change), change.path)[item.event];
+        if(groups == null) {
+            setJson(change, ["hooks", item.event], [item.group]);
+            continue;
+        }
+        if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
+            continue;
+        }
+        const groupIndex = groups.findIndex((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)));
+        if(groupIndex >= 0) {
+            const handlerIndex = handlersOf(groups[groupIndex]).findIndex((handler) => isConcosHandler(handler, item.kind));
+            setJson(change, ["hooks", item.event, groupIndex, "hooks", handlerIndex], item.handler);
+            continue;
+        }
+        setJson(change, ["hooks", item.event, groups.length], item.group, true);
+    }
+    if(change.additions.length > before && input.host == "codex") {
+        change.notes.push("Codex runs new or changed hooks only after you trust them: open /hooks in Codex.");
+    }
+    if(change.additions.length > before && input.host == "claude") {
+        change.notes.push("Claude Code runs them in folders you have trusted.");
+    }
+}
+
+/** Adds the idle wake handler to `change`, the client's hooks file, after the other hooks. */
+function addWake(change: SetupChange, input: SetupTarget): void {
+    const item = expectedWake(input.host);
+    const groups = hookLists(json(change), change.path)[item.event] ?? [];
+    if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
+        return;
+    }
+    setJson(change, ["hooks", item.event, groups.length], item.group, true);
+    change.notes.push(
+        `A waiting Claude Code session wakes by itself when a question for it, or an answer to its question, arrives: `
+        + `after ${WAKE_IDLE_MS / 1000} seconds without input, at most ${WAKE_HOURLY_LIMIT} times an hour, `
+        + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn. Codex sessions do not wake.`,
+    );
+}
+
+/**
+ * Everything a client gets at once, in one preview: MCP unless it is already registered, the
+ * hooks for Claude Code and Codex, and with `wake` Claude Code's idle wake. The hooks and idle
+ * wake share one change, since both go into the hooks file. With `skipBrokenHooks`, a hooks file
+ * concos cannot edit safely (invalid, duplicate keys, an odd shape) is left alone and MCP is still
+ * registered, with a note saying why; otherwise that stops the whole plan.
+ */
+export function planRegistration(input: SetupTarget, options: { wake: boolean; skipBrokenHooks: boolean }): SetupChange[] {
+    const changes = inspectSetup(input).registered ? [] : planSetup(input);
+    if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
+        return changes;
+    }
+    let hooks: SetupChange;
+    try {
+        hooks = loadChange(resolveHooksPath(input));
+        addHooks(hooks, input);
+        if(options.wake == true) {
+            addWake(hooks, input);
+        }
+    }
+    catch(ex) {
+        if(options.skipBrokenHooks == false || (ex instanceof RoomError) == false || changes.length == 0) {
+            throw ex;
+        }
+        changes[0].notes.push(`Hooks were left out, and their file untouched: ${ex.message.replace(/; settings were not changed$/, "")}. Fix it, then turn hooks on from this client's row.`);
+        return changes;
+    }
+    if(hooks.additions.length > 0) {
+        changes.push(hooks);
+    }
+    return changes;
 }
 
 function verifyUnchanged(file: string, expected: string | null): void {
@@ -433,10 +477,21 @@ function replaceSettings(file: string, before: string | null, after: string, rep
     finally { fs.rmSync(temporary, { force: true }); }
 }
 
-/** Verifies the preview, backs up originals, and replaces each file atomically. */
+/** Never writes a settings file that concos itself could not read back. */
+function verifyReadable(change: SetupChange): void {
+    if(change.path.endsWith(".toml")) {
+        try { parseToml(change.after); }
+        catch { throw new RoomError(`${change.path}: the change would not be valid TOML; settings were not changed`); }
+        return;
+    }
+    json(change);
+}
+
+/** Verifies the preview and that every result reads back, backs up originals, and replaces each file atomically. */
 export function applySetup(changes: SetupChange[]): void {
     for(const change of changes) {
         verifyUnchanged(change.path, change.before);
+        verifyReadable(change);
     }
     const applied: SetupChange[] = [];
     try {
@@ -487,25 +542,35 @@ export async function runSetup(args: string[]): Promise<void> {
         hooks: { type: "string" }, wake: { type: "string" },
     } });
     if(values.scope != "user") throw new RoomError("concos uses user-wide registration. Remove --scope and register once for this user.");
-    // optional hooks, or Claude Code's idle wake on top of them
+    // optional hooks, or Claude Code's idle wake on top of them; turning either on brings what it
+    // stands on (MCP, and the hooks for idle wake) in the same preview
     const toggle = values.wake != null
-        ? { option: "--wake", name: "idle wake", mode: values.wake, plan: planWake, alreadyOn: "Idle wake is already on.", nothingOn: "Idle wake is not on." }
+        ? { option: "--wake", name: "idle wake", mode: values.wake, wake: true, plan: planWake, alreadyOn: "Idle wake is already on.", nothingOn: "Idle wake is not on." }
         : values.hooks != null
-            ? { option: "--hooks", name: "hooks", mode: values.hooks, plan: planHooks, alreadyOn: "concos hooks are already on.", nothingOn: "There are no concos hooks to remove." }
+            ? { option: "--hooks", name: "hooks", mode: values.hooks, wake: false, plan: planHooks, alreadyOn: "concos hooks are already on.", nothingOn: "There are no concos hooks to remove." }
             : null;
     if(toggle != null) {
         if(toggle.mode != "on" && toggle.mode != "off") throw new RoomError(`${toggle.option} must be on or off.`);
-        const toggleChanges = toggle.plan({ host: values.host ?? "" }, toggle.mode);
+        const target = { host: values.host ?? "" };
+        let toggleChanges: SetupChange[];
+        if(toggle.mode == "on") {
+            // naming the client first gives an unknown one the hooks message, not the MCP one
+            resolveHooksPath(target);
+            toggleChanges = planRegistration(target, { wake: toggle.wake, skipBrokenHooks: false });
+        }
+        else toggleChanges = toggle.plan(target, toggle.mode);
         if(toggleChanges.length == 0) {
             process.stdout.write(`${toggle.mode == "on" ? toggle.alreadyOn : toggle.nothingOn}\n`);
             return;
         }
         writeChanges(toggleChanges);
+        const registering = toggleChanges.some((change) => change.path == resolveMcpPath(target));
         if(values.apply) {
             applySetup(toggleChanges);
-            process.stdout.write(`Turned ${toggle.name} ${toggle.mode}. Existing files were saved as .concos-backup-*.\n`);
+            const done = registering ? `Registered MCP and turned ${toggle.name} on` : `Turned ${toggle.name} ${toggle.mode}`;
+            process.stdout.write(`${done}. Existing files were saved as .concos-backup-*.\n`);
         }
-        else process.stdout.write(`Preview only. Add --apply to turn ${toggle.name} ${toggle.mode}.\n`);
+        else process.stdout.write(`Preview only. Add --apply to ${registering ? "register MCP and " : ""}turn ${toggle.name} ${toggle.mode}.\n`);
         return;
     }
     if(values.host == null && !values.apply) {

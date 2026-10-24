@@ -1,9 +1,9 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 7 · first required by concos 0.1.3. Every table is a record, not a cache.
+// Schema version 9 · first required by concos 0.1.4. Every table is a record, not a cache.
 
 Table meta {
-  key varchar [pk, note: 'last_seq, created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
+  key varchar [pk, note: 'last_seq, last_message_id (schema 9; message numbers are never given twice), created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
   value varchar [not null]
 }
 
@@ -68,18 +68,19 @@ Table checkpoint {
 }
 
 Table message {
-  id integer [pk]
+  id integer [pk, note: 'from meta.last_message_id since schema 9, so a deleted number is never given again']
   seq integer [not null, unique, note: 'from meta.last_seq; orders messages with card changes']
   room varchar [not null, note: 'fixed to main; existing records merged by schema version 3']
   sender_agent_id varchar [not null, ref: > agent.id]
   recipient_agent_id varchar [ref: > agent.id, note: 'the one recipient of a direct message; null for group and all']
-  recipient_scope varchar [not null, default: 'direct', note: 'direct | group | all; a group names its recipients through message_receipt']
+  recipient_scope varchar [not null, default: 'direct', note: 'direct | group | all; a group names its recipients through message_receipt; all is a post on the board of its sender, with no receipts. Schema 8 turned direct rows without a recipient, written by older bridges, into all']
   kind varchar [not null, note: 'note | question | reply | notice']
   reply_to_message_id integer [ref: > message.id]
   body varchar [not null]
   workspace_id varchar [ref: > workspace.id]
   request_id varchar [note: 'sender retry key']
   created_at varchar [not null]
+  edited_at varchar [note: 'a post its sender rewrote: when; the edit also takes the next seq']
 
   indexes {
     (sender_agent_id, request_id) [unique, name: 'uk_message_sender_agent_id_request_id']
@@ -89,7 +90,7 @@ Table message {
     workspace_id [name: 'idx_message_workspace_id']
   }
 
-  Note: 'Kept 24 hours after created_at, read or not; the board hides a message once no active participant still has to receive it. Then deleted, unless an agent active in the last 30 minutes still has to receive it or a kept reply answers it.'
+  Note: 'Deleted 24 hours after created_at (a post: after edited_at), read or not; a post beyond the newest 3 of its sender; a message to agents an hour after its last recipient read it, a question only once an answer to it was read an hour ago. A kept reply keeps what it answers.'
 }
 
 Table message_receipt {
@@ -102,13 +103,13 @@ Table message_receipt {
     (agent_id, received_at) [name: 'idx_message_receipt_agent_id_received_at']
   }
 
-  Note: 'Room-wide messages: one receipt per connected agent when sent. A session that joins later gets receipts for the newest 5 sent in the last 4 hours; one that returns, for the newest 5 it missed within the message lifetime.'
+  Note: 'One per named recipient that had not left when the message was sent; posts to all have none. Schema 8 deleted the receipts room-wide messages had.'
 }
 
 Table message_topic {
   message_id integer [not null, ref: > message.id]
   topic_key varchar [not null, note: 'snake_case, 2-6 words broad to narrow, 3-48 characters']
-  position integer [not null, note: '0 = first topic, the one the board groups by']
+  position integer [not null, note: '0 = first topic']
 
   indexes {
     (message_id, topic_key) [pk]

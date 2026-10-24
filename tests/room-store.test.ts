@@ -84,6 +84,39 @@ describe("join", () => {
         expect(resumed.agent_id).toBe(first.agent_id);
         expect(resumed.resumed).toBe(true);
     });
+
+    it("keeps one card per session: naming the hook's card after an earlier card of its own merges them into the earlier one", () => {
+        const sender = joinAgent("sender");
+        // the model joined by itself before the hooks knew the session, and got a message there
+        const earlier = joinAgent("Dev / API 05");
+        const missed = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "notice", text: "deploy decision", replyTo: null, requestId: null });
+        emptyCheckIn(earlier.agent_id, { checkpoint: "before compaction" });
+        // the session-start hook makes its own card; one more message reaches that card
+        const hook = store.join({ room: "dev", displayName: "Claude Code · work", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, hookSession: { host: "claude", sessionId: "s1" } });
+        const toHook = store.sendMessage(sender.agent_id, { to: hook.agent_id, kind: "note", text: "hello hook card", replyTo: null, requestId: null });
+
+        const named = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: hook.handle });
+        expect(named).toMatchObject({ agent_id: earlier.agent_id, handle: hook.handle, resumed: true });
+        expect(store.requireAgentIdByHandle(hook.handle)).toBe(earlier.agent_id);
+        expect(database.prepare("SELECT id FROM agent WHERE id = :id").get({ id: hook.agent_id })).toBeUndefined();
+        expect(store.readMessages(earlier.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([missed.message_id, toHook.message_id]);
+        expect(store.inspectAgent(earlier.agent_id, { agentId: earlier.agent_id, checkpointLimit: null, beforeCheckpointId: null }).checkpoints[0].text).toBe("before compaction");
+        // hook events now find the earlier card by the session key
+        expect(store.applyHookEvent({ kind: "prompt", host: "claude", sessionId: "s1", cwd: workDirectory, files: [] })?.agentId).toBe(earlier.agent_id);
+    });
+
+    it("leaves cards apart when the earlier one is elsewhere, bound to another session, or named otherwise", () => {
+        const otherFolder = path.join(dataDirectory, "other");
+        fs.mkdirSync(otherFolder);
+        const elsewhere = joinAgent("Dev / API 05", "dev", otherFolder);
+        const otherSession = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, hookSession: { host: "claude", sessionId: "s0" } });
+        store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: otherSession.handle });
+        const hook = store.join({ room: "dev", displayName: "Claude Code · work", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, hookSession: { host: "claude", sessionId: "s1" } });
+        const named = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: hook.handle });
+        expect(named.agent_id).toBe(hook.agent_id);
+        const names = (database.prepare("SELECT id FROM agent WHERE display_name = :name").all({ name: "Dev / API 05" }) as { id: string }[]).map((row) => row.id);
+        expect(names.sort()).toEqual([elsewhere.agent_id, otherSession.agent_id, hook.agent_id].sort());
+    });
 });
 
 describe("check_in", () => {
@@ -188,6 +221,30 @@ describe("messages", () => {
         expect(full.messages[0].received).toBe(false);
     });
 
+    it("names the cut messages a check_in delivered, to read in full", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        const long = store.sendMessage(ui.agent_id, { to: server.agent_id, kind: "notice", text: "x".repeat(MESSAGE_PREVIEW_LENGTH + 1), replyTo: null, requestId: null });
+        store.sendMessage(ui.agent_id, { to: server.agent_id, kind: "note", text: "short", replyTo: null, requestId: null });
+        expect(emptyCheckIn(server.agent_id).read_in_full).toEqual([long.message_id]);
+        expect(emptyCheckIn(server.agent_id).read_in_full).toBeUndefined();
+    });
+
+    it("says why a message asked for by id is not shown", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        const other = joinAgent("other");
+        const toOther = store.sendMessage(ui.agent_id, { to: other.agent_id, kind: "note", text: "not for server", replyTo: null, requestId: null });
+        const toServer = store.sendMessage(ui.agent_id, { to: server.agent_id, kind: "note", text: "for server", replyTo: null, requestId: null });
+        const read = store.readMessages(server.agent_id, { messageIds: [toServer.message_id, toOther.message_id, 999], limit: null });
+        expect(read.messages.map((message) => message.id)).toEqual([toServer.message_id]);
+        expect(read.unavailable).toEqual([
+            { id: toOther.message_id, reason: `sent to other (${other.agent_id}), not to you` },
+            { id: 999, reason: expect.stringMatching(/^not found: deleted/) },
+        ]);
+        expect(store.readMessages(server.agent_id, { messageIds: [toServer.message_id], limit: null }).unavailable).toBeUndefined();
+    });
+
     it("stores a retried send once", () => {
         const ui = joinAgent("ui");
         const server = joinAgent("server");
@@ -199,42 +256,105 @@ describe("messages", () => {
         expect(emptyCheckIn(server.agent_id).pending_count).toBe(1);
     });
 
-    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60_000).toISOString();
-    const receivedIds = (agentId: string) => (database.prepare("SELECT message_id FROM message_receipt WHERE agent_id = :id ORDER BY message_id")
-        .all({ id: agentId }) as { message_id: number }[]).map((row) => row.message_id);
-    const notice = (from: string, text: string) => store.sendMessage(from, { to: "all", kind: "notice", text: text, replyTo: null, requestId: null }).message_id;
+    const post = (from: string, text: string, topics: string[] = []) => store.sendMessage(from, { to: "all", kind: "notice", text: text, replyTo: null, requestId: null, topics: topics });
+    const keptIds = () => (database.prepare("SELECT id FROM message ORDER BY id").all() as { id: number }[]).map((row) => row.id);
 
-    it("gives a room-wide message to everyone present, and to a session joining within four hours", () => {
+    it("posts a room-wide message for reference: nobody receives it, and every other agent sees it once on check_in", () => {
         const ui = joinAgent("ui");
         const server = joinAgent("server");
-        const sent = store.sendMessage(ui.agent_id, { to: "all", kind: "notice", text: "schema frozen", replyTo: null, requestId: null });
-        expect(sent.recipient_count).toBe(1);
-        const late = joinAgent("late");
-        expect(emptyCheckIn(late.agent_id).pending_count).toBe(1);
-        expect(emptyCheckIn(server.agent_id).pending_count).toBe(1);
-        database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: hoursAgo(5), id: sent.message_id });
-        expect(emptyCheckIn(joinAgent("later").agent_id).pending_count).toBe(0);
+        emptyCheckIn(ui.agent_id);
+        emptyCheckIn(server.agent_id);
+        const sent = post(ui.agent_id, "schema frozen");
+        expect(sent).toMatchObject({ posted: true, recipient_count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS n FROM message_receipt").get()).toMatchObject({ n: 0 });
+
+        const seen = emptyCheckIn(server.agent_id);
+        expect(seen.pending_count).toBe(0);
+        expect(seen.messages).toEqual([expect.objectContaining({ id: sent.message_id, to: "all", text: "schema frozen" })]);
+        expect(store.getInbox(server.agent_id)).toBeUndefined();
+        expect(emptyCheckIn(server.agent_id).messages).toBeUndefined();
+        expect(emptyCheckIn(ui.agent_id).messages).toBeUndefined();
+        // a session that joins later sees the posts still kept
+        expect(emptyCheckIn(joinAgent("late").agent_id).messages?.map((message) => message.id)).toEqual([sent.message_id]);
     });
 
-    it("gives a new session at most the five newest room-wide messages", () => {
+    it("lets every agent read a post in full, find it by topic and answer it", () => {
         const ui = joinAgent("ui");
-        const ids = Array.from({ length: 7 }, (_, index) => notice(ui.agent_id, `notice ${index}`));
-        expect(receivedIds(joinAgent("late").agent_id)).toEqual(ids.slice(-5));
+        const server = joinAgent("server");
+        const sent = post(ui.agent_id, "x".repeat(MESSAGE_PREVIEW_LENGTH * 2), ["concos_release"]);
+        expect(store.readMessages(server.agent_id, { messageIds: [sent.message_id], limit: null }).messages[0].text).toHaveLength(MESSAGE_PREVIEW_LENGTH * 2);
+        expect(store.readMessages(server.agent_id, { messageIds: null, limit: null, topic: "concos" }).messages.map((message) => message.id)).toEqual([sent.message_id]);
+        const answer = store.sendMessage(server.agent_id, { to: ui.agent_id, kind: "reply", text: "noted", replyTo: sent.message_id, requestId: null });
+        expect(answer.reply_target_removed).toBeUndefined();
     });
 
-    it("gives a returning session the room-wide messages it missed within a day, not its own", () => {
+    it("lets only the sender rewrite its post, which others see again marked edited", () => {
         const ui = joinAgent("ui");
-        const away = joinAgent("away");
-        const mine = notice(away.agent_id, "from me");
-        store.disconnect([away.agent_id]);
-        // the card is days old, so the day-long lifetime is what limits the catch-up
-        database.prepare("UPDATE agent SET joined_at = :at WHERE id = :id").run({ at: hoursAgo(72), id: away.agent_id });
-        const stale = notice(ui.agent_id, "old news");
-        database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: hoursAgo(25), id: stale });
-        const missed = notice(ui.agent_id, "while you were away");
-        store.join({ room: "dev", displayName: "away", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: away.handle });
-        expect(receivedIds(away.agent_id)).toEqual([missed]);
-        expect(receivedIds(away.agent_id)).not.toContain(mine);
+        const server = joinAgent("server");
+        const sent = post(ui.agent_id, "test DB restarts at 15:00", ["webapp_db"]);
+        emptyCheckIn(server.agent_id);
+        const edited = store.editPost(ui.agent_id, { messageId: sent.message_id, text: "test DB is back", topics: ["webapp_db_restart"] });
+        expect(edited.message_id).toBe(sent.message_id);
+        expect(emptyCheckIn(server.agent_id).messages).toEqual([expect.objectContaining({
+            id: sent.message_id, kind: "notice", text: "test DB is back", topics: ["webapp_db_restart"], edited_at: edited.edited_at,
+        })]);
+
+        const direct = store.sendMessage(ui.agent_id, { to: server.agent_id, kind: "note", text: "hi", replyTo: null, requestId: null });
+        expect(() => store.editPost(server.agent_id, { messageId: sent.message_id, text: "mine now" })).toThrow(/only those can be edited/);
+        expect(() => store.editPost(ui.agent_id, { messageId: direct.message_id, text: "changed" })).toThrow(/only those can be edited/);
+    });
+
+    it("lets the sender take its posts down, all or none, leaving answers without the link", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        const first = post(ui.agent_id, "server restarts at 15:00", ["webapp_db"]).message_id;
+        const second = post(ui.agent_id, "migration after the restart").message_id;
+        const theirs = post(server.agent_id, "server news").message_id;
+        const answer = store.sendMessage(server.agent_id, { to: ui.agent_id, kind: "reply", text: "noted", replyTo: first, requestId: null }).message_id;
+
+        expect(() => store.removePosts(ui.agent_id, [first, theirs])).toThrow(/not your posts to all: 3; nothing was removed/);
+        expect(keptIds()).toEqual([first, second, theirs, answer]);
+        expect(store.removePosts(ui.agent_id, [second, first])).toEqual({ removed: [first, second] });
+        expect(keptIds()).toEqual([theirs, answer]);
+        expect(store.readMessages(ui.agent_id, { messageIds: [answer], limit: null }).messages[0].reply_to).toBeUndefined();
+        expect(database.prepare("SELECT COUNT(*) AS n FROM message_topic").get()).toMatchObject({ n: 0 });
+    });
+
+    it("never hands out a deleted message number again, even past one an older bridge inserted", () => {
+        const ui = joinAgent("ui");
+        const first = post(ui.agent_id, "first").message_id;
+        const second = post(ui.agent_id, "second").message_id;
+        store.removePosts(ui.agent_id, [second]);
+        expect(post(ui.agent_id, "third").message_id).toBe(second + 1);
+        // a bridge older than schema 9 lets SQLite pick the number
+        database.prepare(`
+            INSERT INTO message (seq, room, sender_agent_id, recipient_scope, kind, body, created_at)
+            VALUES (100000, 'main', :sender, 'all', 'notice', 'old bridge', :at)
+        `).run({ sender: ui.agent_id, at: new Date().toISOString() });
+        const oldBridge = Math.max(...keptIds());
+        expect(post(ui.agent_id, "fourth").message_id).toBe(oldBridge + 1);
+        expect(first).toBeLessThan(second);
+    });
+
+    it("keeps each agent's newest three posts, an edit counting as new", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        const ids = Array.from({ length: 5 }, (_, index) => post(ui.agent_id, `post ${index}`).message_id);
+        const other = post(server.agent_id, "server news").message_id;
+        store.editPost(ui.agent_id, { messageId: ids[0], text: "post 0, updated" });
+        expect(store.purgeMessages()).toBe(2);
+        expect(keptIds()).toEqual([ids[0], ids[3], ids[4], other]);
+    });
+
+    it("repairs what older bridges write: a room-wide message stored as direct, and receipts for a post", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        const sent = post(ui.agent_id, "from an old bridge").message_id;
+        database.prepare("UPDATE message SET recipient_scope = 'direct' WHERE id = :id").run({ id: sent });
+        database.prepare("INSERT INTO message_receipt (message_id, agent_id) VALUES (:id, :agent_id)").run({ id: sent, agent_id: server.agent_id });
+        store.cleanUp();
+        expect(database.prepare("SELECT recipient_scope FROM message WHERE id = :id").get({ id: sent })).toMatchObject({ recipient_scope: "all" });
+        expect(store.getInbox(server.agent_id)).toBeUndefined();
     });
 
     it("shares the waiting room across former room names and still requires reply_to", () => {
@@ -348,22 +468,15 @@ describe("ended sessions", () => {
         database.prepare("UPDATE agent SET last_seen_at = :at WHERE id = :id").run({ at: new Date(Date.now() - minutes * 60_000).toISOString(), id: agentId });
     }
 
-    it("leaves closed, silent and human participants out of room-wide messages", () => {
+    it("shows a post to a session that was closed when it went up, once it comes back", () => {
         const sender = joinAgent("sender");
-        const active = joinAgent("active");
-        const closed = joinAgent("closed");
-        const silent = joinAgent("silent");
-        const resting = joinAgent("resting");
-        store.disconnect([closed.agent_id]);
-        silence(silent.agent_id, 31);
-        silence(resting.agent_id, 29);
-        store.ensureHumanParticipant("main", "Reviewer");
-
+        const away = joinAgent("away");
+        emptyCheckIn(away.agent_id);
+        store.disconnect([away.agent_id]);
+        silence(away.agent_id, 31);
         const sent = store.sendMessage(sender.agent_id, { to: "all", kind: "notice", text: "schema frozen", replyTo: null, requestId: null });
-        expect(sent.recipient_count).toBe(2);
-        const receivers = database.prepare("SELECT agent_id FROM message_receipt WHERE message_id = :id ORDER BY agent_id")
-            .all({ id: sent.message_id }) as { agent_id: string }[];
-        expect(receivers.map((row) => row.agent_id).sort()).toEqual([active.agent_id, resting.agent_id].sort());
+        store.join({ room: "dev", displayName: "away", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: away.handle });
+        expect(emptyCheckIn(away.agent_id).messages?.map((message) => message.id)).toEqual([sent.message_id]);
     });
 
     it("still stores a direct message to an ended session, and says it is inactive", () => {
@@ -434,7 +547,7 @@ describe("resolved messages", () => {
         const sender = joinAgent("sender");
         const first = joinAgent("first");
         const second = joinAgent("second");
-        const sent = store.sendMessage(sender.agent_id, { to: "all", kind: "notice", text: "deploy at 5", replyTo: null, requestId: null });
+        const sent = store.sendMessage(sender.agent_id, { to: [first.agent_id, second.agent_id], kind: "notice", text: "deploy at 5", replyTo: null, requestId: null });
         expect(messageState(sent.message_id)).toMatchObject({ resolved: false });
         expect(messageState(sent.message_id).waiting_on.sort()).toEqual(["first", "second"]);
 
@@ -487,11 +600,12 @@ describe("resolved messages", () => {
         expect(messageState(sent.message_id)).toMatchObject({ resolved: false, waiting_on: ["agent"] });
     });
 
-    it("counts a room-wide message that reached nobody as resolved", () => {
-        const alone = joinAgent("alone");
-        const sent = store.sendMessage(alone.agent_id, { to: "all", kind: "notice", text: "anyone?", replyTo: null, requestId: null });
+    it("never waits on anyone for a post", () => {
+        const sender = joinAgent("sender");
+        joinAgent("other");
+        const sent = store.sendMessage(sender.agent_id, { to: "all", kind: "question", text: "anyone on port 5173?", replyTo: null, requestId: null });
         expect(sent.recipient_count).toBe(0);
-        expect(messageState(sent.message_id)).toMatchObject({ resolved: true });
+        expect(messageState(sent.message_id)).toMatchObject({ posted: true, resolved: true, waiting_on: [] });
     });
 });
 
@@ -507,17 +621,45 @@ describe("clean-up", () => {
         return store.sendMessage(from, { to: to, kind: replyTo == null ? "note" : "reply", text: text, replyTo: replyTo, requestId: null }).message_id;
     }
 
-    it("keeps a message for a day, read or not, then deletes it with its receipts", () => {
+    it("deletes a message an hour after its last recipient read it, with its receipts", () => {
         const sender = joinAgent("sender");
-        const reader = joinAgent("reader");
-        const id = send(sender.agent_id, reader.agent_id);
-        store.acknowledge(reader.agent_id, [id]);
-        ageMessage(id, 23 * 60);
+        const first = joinAgent("first");
+        const second = joinAgent("second");
+        const id = store.sendMessage(sender.agent_id, { to: [first.agent_id, second.agent_id], kind: "note", text: "both", replyTo: null, requestId: null }).message_id;
+        store.acknowledge(first.agent_id, [id]);
+        ageMessage(id, 120);
         expect(store.purgeMessages()).toBe(0);
-        ageMessage(id, 25 * 60);
+        store.acknowledge(second.agent_id, [id]);
+        ageMessage(id, 59);
+        expect(store.purgeMessages()).toBe(0);
+        ageMessage(id, 61);
         expect(store.purgeMessages()).toBe(1);
         expect(messageExists(id)).toBe(false);
         expect(receiptCount(id)).toBe(0);
+    });
+
+    it("keeps a read question until an answer to it was read an hour ago, then removes both", () => {
+        const asker = joinAgent("asker");
+        const answerer = joinAgent("answerer");
+        const question = store.sendMessage(asker.agent_id, { to: answerer.agent_id, kind: "question", text: "which port?", replyTo: null, requestId: null }).message_id;
+        store.acknowledge(answerer.agent_id, [question]);
+        ageMessage(question, 120);
+        expect(store.purgeMessages()).toBe(0);
+        const answer = send(answerer.agent_id, asker.agent_id, "18201", question);
+        store.acknowledge(asker.agent_id, [answer]);
+        expect(store.purgeMessages()).toBe(0);
+        ageMessage(answer, 61);
+        expect(store.purgeMessages()).toBe(2);
+    });
+
+    it("keeps a post a day from its last edit", () => {
+        const sender = joinAgent("sender");
+        const id = store.sendMessage(sender.agent_id, { to: "all", kind: "notice", text: "v1", replyTo: null, requestId: null }).message_id;
+        ageMessage(id, 25 * 60);
+        store.editPost(sender.agent_id, { messageId: id, text: "v2" });
+        expect(store.purgeMessages()).toBe(0);
+        database.prepare("UPDATE message SET edited_at = :at WHERE id = :id").run({ at: minutesAgo(25 * 60), id: id });
+        expect(store.purgeMessages()).toBe(1);
     });
 
     it("deletes a message's topics with it", () => {

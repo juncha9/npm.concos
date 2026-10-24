@@ -62,13 +62,15 @@ export class RoomActivity {
             for(const message of messages) {
                 const previous = this.messages.get(message.id);
                 const key = `message:${message.id}`;
-                if(!message.resolved && (previous == null || previous.resolved)) {
+                if(previous == null) {
                     this.mark(key, "NEW", "tab:messages", tab);
                     received += 1;
                 }
-                else if(previous != null && JSON.stringify(message) != JSON.stringify(previous)) {
+                else if(JSON.stringify(message) != JSON.stringify(previous)) {
                     const kind = message.waiting_on.length < previous.waiting_on.length ? "SEEN" : "UPDATED";
-                    this.mark(key, kind, "tab:messages", tab, !message.resolved);
+                    // the last receipt pulses the row but does not light the tab: nobody is left to act;
+                    // a rewritten post is news to everyone
+                    this.mark(key, kind, "tab:messages", tab, !message.resolved || message.edited_at != previous.edited_at);
                     receipts += 1;
                 }
             }
@@ -84,7 +86,7 @@ export class RoomActivity {
         this.messages = new Map(messages.map((message) => [message.id, message]));
         const visible = new Set([
             ...agents.filter((agent) => !agent.left && !agent.ended).map((agent) => `agent:${agent.agent_id}`),
-            ...messages.filter((message) => !message.resolved).map((message) => `message:${message.id}`),
+            ...messages.map((message) => `message:${message.id}`),
         ]);
         for(const unseen of Object.values(this.unseen)) for(const key of unseen) if(!visible.has(key)) unseen.delete(key);
         for(const [key, pulse] of this.pulses) {

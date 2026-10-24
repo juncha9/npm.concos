@@ -136,16 +136,19 @@ describe("hook CLI", () => {
         expect(codexWake.stderr).toContain("Claude Code only");
     });
 
-    it("previews and turns on Codex hooks only after MCP is registered", () => {
+    it("previews and turns on Codex hooks, registering MCP in the same step when it is missing", () => {
         const hooks = (...args: string[]) => spawnSync(process.execPath, [CLI, "setup", "--host", "codex", "--hooks", ...args], { cwd: directory, env: environment, encoding: "utf8" });
-        expect(hooks("on").stderr).toContain("Register concos MCP");
-        execFileSync(process.execPath, [CLI, "setup", "--host", "codex", "--apply"], { cwd: directory, env: environment, stdio: "pipe" });
         const hooksFile = path.join(environment.CODEX_HOME!, "hooks.json");
+        const configFile = path.join(environment.CODEX_HOME!, "config.toml");
         const preview = hooks("on");
+        expect(preview.stdout).toContain("mcp_servers.concos");
         expect(preview.stdout).toContain("concos hook turn-end --host codex");
         expect(preview.stdout).toContain("/hooks");
+        expect(preview.stdout).toContain("Add --apply to register MCP and turn hooks on.");
         expect(fs.existsSync(hooksFile)).toBe(false);
-        hooks("on", "--apply");
+        expect(fs.existsSync(configFile)).toBe(false);
+        expect(hooks("on", "--apply").stdout).toContain("Registered MCP and turned hooks on.");
+        expect(fs.readFileSync(configFile, "utf8")).toContain('args = [ "mcp" ]');
         expect(JSON.parse(fs.readFileSync(hooksFile, "utf8")).hooks.Stop[0].hooks[0].command).toBe("concos hook turn-end --host codex");
         expect(hooks("on").stdout).toContain("already on");
         hooks("off", "--apply");

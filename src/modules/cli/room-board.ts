@@ -13,13 +13,19 @@ import type { ActivityTab } from "./room-activity";
 
 const BOARD_REFRESH_MS = 1000;
 const ANIMATION_FRAME_MS = 140;
-/** Recent messages read for the Messages tab; open ones are shown, resolved ones behind a toggle. */
+/** Recent messages read for the Messages tab; open and resolved ones are shown in one list. */
 const BOARD_MESSAGE_LIMIT = 50;
 /** Pending names shown on a message row before the rest become a count. */
 const PENDING_NAMES_SHOWN = 2;
 const DETAIL_CHECKPOINT_LIMIT = 3;
 const MESSAGE_BODY_INDENT = 2;
-const MESSAGE_PREVIEW_LINES = 3;
+const MESSAGE_PREVIEW_LINES = 2;
+/** Characters a sender's lead, `[Name → Recipient]` or `Name → Recipient:`, may run past the name. */
+const SENDER_LEAD_SPAN = 60;
+/** The question "Ask senders to tidy notices" sends each live poster, followed by its posts. */
+const TIDY_REQUEST = "Please tidy your posts to all: remove the ones that no longer apply with remove_posts, and rewrite the ones that changed with send_message edit. Reply briefly once done. Your posts:";
+/** Width of the first line each post shows in that question. */
+const TIDY_PREVIEW_WIDTH = 80;
 const STATE_PRIORITY: State[] = ["blocked", "working", "waiting", "idle", "finished", "offline", "left", "human"];
 /** States whose rows recede: nothing is expected of them right now. */
 const RECEDING_STATES: State[] = ["idle", "finished", "offline", "left"];
@@ -33,7 +39,9 @@ export interface RoomBoardOptions extends StatusRenderOptions {
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:earlier" | "back";
+type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "tidy:posts" | "back";
+
+type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
 /** Left or ended: still on record, folded away on the board. */
 function isInactive(agent: RoomOverviewAgent): boolean {
@@ -46,6 +54,8 @@ interface BoardView {
     tabs: SelectTabs<BoardValue>;
     agents: RoomOverviewAgent[];
     messages: RoomOverviewMessage[];
+    /** Live agents with posts, whom "Ask senders to tidy notices" asks; read for the Messages tab only. */
+    posters: Poster[];
 }
 
 function oneLine(text: string): string {
@@ -224,10 +234,28 @@ function messageColumns(left: LinePart[], right: LinePart[], width: number): Lin
 }
 
 /**
- * Open messages: structured metadata and three preview lines; Enter opens the full body.
- * Grouped by each message's first topic, groups in key order so related topics sit together
- * and messages without a topic last; newest first within a group. With `showEarlier`, the
- * resolved messages still kept follow under their own heading, newest first.
+ * The text without a lead naming its sender, `[Name → Recipient] …`, `[Name] …` or
+ * `Name → Recipient: …`, which the board already shows; the text itself when nothing else is
+ * left.
+ */
+function withoutSenderLead(text: string, sender: string): string {
+    const name = sender.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const bracketed = `\\[${name}(?![\\p{L}\\p{N}_])[^\\]\\n]{0,${SENDER_LEAD_SPAN}}\\]`;
+    const labelled = `${name}\\s*(?:\\([^)\\n]{0,30}\\))?\\s*(?:(?:→|->)[^:\\n]{0,${SENDER_LEAD_SPAN}})?:`;
+    const stripped = text.replace(new RegExp(`^\\s*(?:${bracketed}|${labelled})`, "u"), "").trimStart();
+    if(stripped == "") {
+        return text;
+    }
+    return stripped;
+}
+
+/**
+ * Every kept message as a compact block: one header line and two preview lines; Enter opens the
+ * full body. Posts to the whole room come first under Notices, then messages to agents. An open
+ * message names whom it still waits on; a resolved one only lacks that mark, and a post never
+ * has it. Grouped by sender under a rule with the sender's name, the sender of the newest one
+ * first and newest first within a group; rows then name only the recipient, show every topic,
+ * and leave a lead repeating the sender out of the preview.
  */
 function buildMessageItems(
     messages: RoomOverviewMessage[],
@@ -235,65 +263,47 @@ function buildMessageItems(
     options: StatusRenderOptions,
     nowMs: number,
     activity: RoomActivity,
-    showEarlier: boolean,
 ): SelectItem<BoardValue>[] {
     const english = options.language == "en";
     const arrow = options.unicode == false ? "->" : "→";
-    const open = messages.filter((message) => message.resolved == false);
     const items: SelectItem<BoardValue>[] = [];
-    if(open.length == 0) {
-        items.push({ separator: true, label: "", hint: english ? "No open messages." : "열린 메시지가 없습니다." });
+    if(messages.length == 0) {
+        items.push({ separator: true, label: "", hint: english ? "No messages." : "메시지가 없습니다." });
     }
 
-    const groups = new Map<string, RoomOverviewMessage[]>();
-    for(const message of [...open].reverse()) {
-        const key = message.topics[0] ?? "";
-        groups.set(key, [...(groups.get(key) ?? []), message]);
-    }
-    const keys = [...groups.keys()].sort((left, right) => {
-        if(left == "" || right == "") {
-            return Number(left == "") - Number(right == "");
+    const posts = messages.filter((message) => message.posted == true);
+    const direct = messages.filter((message) => message.posted == false);
+    if(posts.length > 0) {
+        items.push({ separator: true, label: english ? "Notices" : "공지" });
+        pushGroups(posts, (count) => english ? `${count} post${count == 1 ? "" : "s"}` : `공지 ${count}개`);
+        if(direct.length > 0) {
+            items.push({ separator: true, label: english ? "Messages" : "메시지" });
         }
-        return left.localeCompare(right);
-    });
-    // without any topic the tab looks as it did: no headings
-    const headed = keys.length > 1 || keys[0] != "";
-    for(const key of keys) {
-        const members = groups.get(key)!;
-        if(headed == true) {
-            let label = key;
-            if(key == "") {
-                label = english ? "No topic" : "주제 없음";
-            }
-            items.push({ separator: true, label: label, hint: english ? `${members.length} open` : `열린 메시지 ${members.length}개` });
-        }
-        members.forEach((message, index) => {
-            items.push(messageRow(message, index < members.length - 1));
-        });
     }
-    const earlier = messages.filter((message) => message.resolved == true).reverse();
-    if(showEarlier == true && earlier.length > 0) {
-        items.push({
-            separator: true,
-            label: english ? "Earlier messages" : "지난 메시지",
-            hint: english ? "received by everyone it waited on; kept for a day" : "받을 쪽이 모두 받음, 하루 동안 보관",
-        });
-        earlier.forEach((message, index) => {
-            items.push(messageRow(message, index < earlier.length - 1));
-        });
-    }
+    pushGroups(direct, (count) => english ? `${count} message${count == 1 ? "" : "s"}` : `메시지 ${count}개`);
     return items;
 
-    function messageRow(message: RoomOverviewMessage, spacedBelow: boolean): SelectItem<BoardValue> {
+    function pushGroups(members: RoomOverviewMessage[], countText: (count: number) => string): void {
+        // newest first; a Map keeps insertion order, so the sender of the newest one leads
+        const groups = new Map<string, RoomOverviewMessage[]>();
+        for(const message of [...members].reverse()) {
+            const sender = participantName(message.from_name, message.from_client, message.from_human);
+            groups.set(sender, [...(groups.get(sender) ?? []), message]);
+        }
+        for(const [sender, grouped] of groups) {
+            items.push({ separator: true, rule: true, label: sender, hint: countText(grouped.length) });
+            for(const message of grouped) {
+                items.push(messageRow(message));
+            }
+        }
+    }
+
+    function messageRow(message: RoomOverviewMessage): SelectItem<BoardValue> {
         return {
         value: `message:${message.id}`,
         key: `#${message.id}`,
         label: `#${message.id}`,
         lines: (active, width) => {
-            let paintSender = style.bold;
-            if(active == true) {
-                paintSender = (text) => style.bold(style.accent(text));
-            }
             let paintKind = style.dim;
             if(message.kind == "question") {
                 paintKind = style.warning;
@@ -305,20 +315,24 @@ function buildMessageItems(
                 paintKind = style.success;
             }
             const title: LinePart[] = [
-                { text: `${activity.indicator(`message:${message.id}`)}#${message.id} `, paint: style.dim },
-                { text: `[${message.kind.toUpperCase()}]`, paint: paintKind },
+                { text: `#${message.id} `, paint: style.dim },
+                { text: message.kind.toUpperCase(), paint: (text) => style.bold(paintKind(text)) },
             ];
             if(message.reply_to != null) {
                 title.push({ text: english ? ` · re #${message.reply_to}` : ` · #${message.reply_to}에 답신`, paint: style.dim });
             }
-            const recipient = messageRecipientNames(message, english);
-            title.push(
-                { text: "  " },
-                { text: participantName(message.from_name, message.from_client, message.from_human), paint: paintSender },
-                { text: ` ${arrow} `, paint: style.dim },
-                { text: recipient, paint: style.dim },
-            );
-            const meta: LinePart[] = [{ text: age(message.at, nowMs, english), paint: style.dim }];
+            // the sender is the group heading, and a post goes to everyone
+            if(message.posted == false) {
+                title.push(
+                    { text: `  ${arrow} `, paint: style.dim },
+                    { text: messageRecipientNames(message, english) },
+                );
+            }
+            let when = age(message.at, nowMs, english);
+            if(message.edited_at != null) {
+                when = english ? `edited ${age(message.edited_at, nowMs, english)}` : `${age(message.edited_at, nowMs, english)} 수정`;
+            }
+            const meta: LinePart[] = [{ text: when, paint: style.dim }];
             if(message.waiting_on.length > 0) {
                 // who it waits on: two names, then a count of the rest
                 let names = message.waiting_on.slice(0, PENDING_NAMES_SHOWN).join(", ");
@@ -330,24 +344,43 @@ function buildMessageItems(
                     { text: english ? `Pending ${names}` : `확인 대기 ${names}`, paint: style.warning },
                 );
             }
+            // the activity indicator stands in front of the header; a wrapped header continues under `#`
+            const indicator = activity.indicator(`message:${message.id}`);
+            const headerWidth = width - displayWidth(indicator);
             const badge = activity.badge(`message:${message.id}`, style);
-            const headerWidth = [...title, ...badge, ...meta].reduce((sum, part) => sum + displayWidth(part.text), 0);
-            if(headerWidth + 2 <= width) title.push(...badge);
-            const rows = messageColumns(title, meta, width);
+            const titleWidth = [...title, ...badge, ...meta].reduce((sum, part) => sum + displayWidth(part.text), 0);
+            if(titleWidth + 2 <= headerWidth) title.push(...badge);
+            const header = messageColumns(title, meta, headerWidth);
+            if(active == true) {
+                // the selected block's header reads as one bar across the list
+                for(const row of header) {
+                    const used = row.reduce((sum, part) => sum + displayWidth(part.text), 0);
+                    row.push({ text: " ".repeat(Math.max(0, headerWidth - used)) });
+                    row.forEach((part, index) => {
+                        const paint = part.paint;
+                        row[index] = { text: part.text, paint: (text) => style.inverse(paint != null ? paint(text) : text) };
+                    });
+                }
+            }
+            const rows = header.map((row, index) => {
+                let lead = indicator;
+                if(index > 0) {
+                    lead = " ".repeat(displayWidth(indicator));
+                }
+                return [{ text: lead, paint: style.dim }, ...row];
+            });
             const indent = " ".repeat(MESSAGE_BODY_INDENT);
-            // the first topic is the group heading; a message filed under more shows them all
-            if(message.topics.length > 1) {
+            const bodyWidth = width - MESSAGE_BODY_INDENT;
+            if(message.topics.length > 0) {
                 const topicLabel = english ? "Topics" : "주제";
-                for(const line of wrap(`${topicLabel} ${message.topics.join(", ")}`, width - MESSAGE_BODY_INDENT)) {
+                for(const line of wrap(`${topicLabel} ${message.topics.join(", ")}`, bodyWidth)) {
                     rows.push([{ text: indent }, { text: line, paint: style.dim }]);
                 }
             }
-            rows.push([]);
-            const bodyWidth = width - MESSAGE_BODY_INDENT;
-            for(const line of previewText(message.text, bodyWidth, MESSAGE_PREVIEW_LINES, options.unicode ?? true)) {
+            const preview = withoutSenderLead(message.text, message.from_name);
+            for(const line of previewText(preview, bodyWidth, MESSAGE_PREVIEW_LINES, options.unicode ?? true)) {
                 rows.push([{ text: indent }, { text: line }]);
             }
-            if(spacedBelow == true) rows.push([]);
             return rows;
         },
         };
@@ -363,7 +396,7 @@ function buildView(
     style: Style,
     options: StatusRenderOptions,
     tab: BoardTab,
-    toggles: { showEnded: boolean; showEarlier: boolean },
+    toggles: { showEnded: boolean },
     activity: RoomActivity,
 ): BoardView {
     const english = options.language == "en";
@@ -375,10 +408,10 @@ function buildView(
 
     let items: SelectItem<BoardValue>[];
     let inactiveCount = 0;
-    let earlierCount = 0;
+    let posters: Poster[] = [];
     if(tab == "tab:messages") {
-        items = buildMessageItems(overview.messages, style, options, nowMs, activity, toggles.showEarlier);
-        earlierCount = overview.messages.filter((message) => message.resolved == true).length;
+        items = buildMessageItems(overview.messages, style, options, nowMs, activity);
+        posters = store.livePosters(nowMs);
     }
     else {
         const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true);
@@ -393,12 +426,13 @@ function buildView(
         }
         items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
     }
-    if(earlierCount > 0) {
-        let toggleLabel = english ? `Show earlier messages (${earlierCount})` : `지난 메시지 보기 (${earlierCount})`;
-        if(toggles.showEarlier == true) {
-            toggleLabel = english ? "Hide earlier messages" : "지난 메시지 숨기기";
-        }
-        items.push({ value: "toggle:earlier", key: "earlier", label: toggleLabel });
+    if(posters.length > 0) {
+        items.push({
+            value: "tidy:posts",
+            key: "tidy",
+            label: english ? "Ask senders to tidy notices" : "공지 정리 요청",
+            hint: english ? `${posters.length} agent${posters.length == 1 ? "" : "s"}` : `에이전트 ${posters.length}명`,
+        });
     }
     items.push({ value: "back", label: english ? "Back" : "뒤로" });
 
@@ -410,16 +444,16 @@ function buildView(
         return [`${count} ${stateLabel(state, english).toLowerCase()}`];
     });
     const question = [english ? "Waiting room" : "대합실", ...counts].join(" · ");
-    // the tab counts what still needs attention, like the Agents tab counts who is around
-    const openMessages = overview.messages.filter((message) => message.resolved == false).length;
+    // each tab counts the rows it lists
+    const messageCount = overview.messages.length;
     const tabs: SelectTabs<BoardValue> = {
         active: tab,
         items: [
             { value: "tab:agents", key: "agents", label: english ? `Agents ${agents.length}` : `에이전트 ${agents.length}` },
-            { value: "tab:messages", key: "messages", label: english ? `Messages ${openMessages}` : `메시지 ${openMessages}` },
+            { value: "tab:messages", key: "messages", label: english ? `Messages ${messageCount}` : `메시지 ${messageCount}` },
         ],
     };
-    return { question: question, items: items, tabs: tabs, agents: overview.agents, messages: overview.messages };
+    return { question: question, items: items, tabs: tabs, agents: overview.agents, messages: overview.messages, posters: posters };
 }
 
 /** A list the board shows in place: no `✔ question · answer` line is left behind when it closes. */
@@ -474,22 +508,103 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
     }
 }
 
+/** A yes/no question the board asks in place: no answered line is left behind, and Esc is no. */
+async function confirmInPlace(prompter: Prompter, question: string): Promise<boolean> {
+    const previous = prompter.transient;
+    prompter.transient = true;
+    try {
+        const confirmed = await prompter.askYesNo(question, false);
+        return confirmed;
+    }
+    catch(error) {
+        if(error instanceof PromptBackError) {
+            return false;
+        }
+        throw error;
+    }
+    finally {
+        prompter.transient = previous;
+    }
+}
+
+/** Keeps a short report on screen until Enter or Esc, then takes it away again. */
+async function reportInPlace(prompter: Prompter, report: string): Promise<void> {
+    prompter.write(`\n${report}\n\n`);
+    try {
+        await prompter.pause();
+    }
+    catch(error) {
+        if((error instanceof PromptBackError) == false) {
+            throw error;
+        }
+    }
+    prompter.eraseLines(writtenLineCount(report));
+}
+
+/**
+ * Asks every live poster, by question, to remove its posts that no longer apply and rewrite the
+ * ones that changed, naming each post by number and first line. A question, so the hooks of
+ * Claude Code and Codex continue a turn for it and Claude Code's idle wake rouses a waiting
+ * session (user decision 2026-10-25).
+ */
+async function askToTidyPosts(prompter: Prompter, store: RoomStore, posters: Poster[], english: boolean): Promise<void> {
+    const names = posters.map((poster) => participantName(poster.name, poster.client, false)).join(", ");
+    const question = english ? `Ask ${names} to tidy their notices?` : `${names}에게 공지 정리를 요청할까요?`;
+    if(await confirmInPlace(prompter, question) == false) {
+        return;
+    }
+    const sender = store.ensureHumanParticipant(SHARED_ROOM, os.userInfo().username);
+    for(const poster of posters) {
+        const list = poster.posts.map((post) => `#${post.id} ${previewText(post.text, TIDY_PREVIEW_WIDTH, 1)[0] ?? ""}`);
+        store.sendMessage(sender, { to: poster.agent_id, kind: "question", text: [TIDY_REQUEST, ...list].join("\n"), replyTo: null, requestId: null });
+    }
+    let report = english ? `Asked ${posters.length} agents to tidy their notices.` : `에이전트 ${posters.length}명에게 공지 정리를 요청했습니다.`;
+    if(english == true && posters.length == 1) {
+        report = "Asked 1 agent to tidy its notices.";
+    }
+    await reportInPlace(prompter, report);
+}
+
 async function showMessage(prompter: Prompter, store: RoomStore, message: RoomOverviewMessage, options: RoomBoardOptions): Promise<void> {
+    const english = options.language == "en";
     const text = renderMessageDetail(message, options);
     prompter.write(`\n${text}\n\n`);
     // a person has no check_in: opening a message that names them, alone or in a group, is their
     // acknowledgement. The viewer is the same OS user the menu sends as.
     store.acknowledgeForPerson(os.userInfo().username, message.id);
-    try {
-        await prompter.pause();
+    if(message.posted == false) {
+        try {
+            await prompter.pause();
+        }
+        catch(error) {
+            // Esc after reading goes back to the Messages tab, like Enter
+            if((error instanceof PromptBackError) == false) {
+                throw error;
+            }
+        }
+        prompter.eraseLines(writtenLineCount(text));
+        return;
     }
-    catch(error) {
-        // Esc after reading goes back to the Messages tab, like Enter
-        if((error instanceof PromptBackError) == false) {
-            throw error;
+
+    // a post: the person at the board may take it down for everyone
+    const items: SelectItem<"back" | "remove">[] = [
+        { value: "back", label: english ? "Back" : "뒤로" },
+        { value: "remove", label: english ? "Remove this post" : "이 공지 내리기", hint: english ? "for everyone" : "모두에게서" },
+    ];
+    const action = await selectInPlace(prompter, `#${message.id}`, items, { cancelValue: "back" });
+    let removed = false;
+    if(action == "remove") {
+        const sender = participantName(message.from_name, message.from_client, message.from_human);
+        const question = english ? `Remove post #${message.id} by ${sender}?` : `${sender}의 공지 #${message.id}를 내릴까요?`;
+        if(await confirmInPlace(prompter, question) == true) {
+            store.removePosts(null, [message.id]);
+            removed = true;
         }
     }
     prompter.eraseLines(writtenLineCount(text));
+    if(removed == true) {
+        await reportInPlace(prompter, english ? `Removed post #${message.id}.` : `공지 #${message.id}를 내렸습니다.`);
+    }
 }
 
 /**
@@ -506,7 +621,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
         // opening the board sweeps too, so residue goes even when no agent bridge is running
         store.cleanUp();
         let tab: BoardTab = "tab:agents";
-        const toggles = { showEnded: false, showEarlier: false };
+        const toggles = { showEnded: false };
         const activity = new RoomActivity(prompter.isInteractive, prompter.motionEnabled, options.unicode ?? true, english);
         const loadView = () => buildView(store, prompter.paint, options, tab, toggles, activity);
         let view = loadView();
@@ -551,9 +666,9 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
                 view = loadView();
                 continue;
             }
-            if(picked == "toggle:earlier") {
-                toggles.showEarlier = toggles.showEarlier == false;
+            if(picked == "tidy:posts") {
                 selected[tab] = picked;
+                await askToTidyPosts(prompter, store, view.posters, english);
                 view = loadView();
                 continue;
             }

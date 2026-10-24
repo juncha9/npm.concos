@@ -76,6 +76,11 @@ export async function runSay(options: {
         let summary = english
             ? `#${result.message_id} stored · Room ${room} · ${result.recipient_count} recipient(s) · Delivered on the next check_in.`
             : `#${result.message_id} 저장됨 · 대합실 ${room} · 수신자 ${result.recipient_count}명 · 상대가 다음 check_in에서 받습니다.`;
+        if(result.posted == true) {
+            summary = english
+                ? `#${result.message_id} posted · Room ${room} · Agents see it on their next check_in, for reference.`
+                : `#${result.message_id} 게시됨 · 대합실 ${room} · 에이전트가 다음 check_in에서 참고로 봅니다.`;
+        }
         if(result.inactive_recipients != null) {
             summary += english
                 ? "\nA recipient's session has ended; it reads this only if that session comes back."

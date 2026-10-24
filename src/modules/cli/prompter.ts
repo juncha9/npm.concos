@@ -50,6 +50,8 @@ export interface SelectSeparator {
     label?: string;
     /** Dimmed text after the heading. */
     hint?: string;
+    /** Draws the heading inside a rule across the list, `── label · hint ────`, to set groups apart. */
+    rule?: boolean;
 }
 
 export type SelectItem<T extends string> = SelectChoice<T> | SelectSeparator;
@@ -249,6 +251,8 @@ export interface Style {
     danger(text: string): string;
     dim(text: string): string;
     bold(text: string): string;
+    /** Swapped foreground and background, for a row that must stand out as a whole. */
+    inverse(text: string): string;
 }
 
 function createStyle(enabled: boolean): Style {
@@ -268,6 +272,7 @@ function createStyle(enabled: boolean): Style {
         danger: paint(31, 39),
         dim: paint(2, 22),
         bold: paint(1, 22),
+        inverse: paint(7, 27),
     };
 }
 
@@ -1003,10 +1008,28 @@ export class Prompter {
                 const item = items[index];
                 if("value" in item == false) {
                     if(item.label != null) {
-                        if(lines.length > 0) {
+                        // a heading right under another heading belongs to it: no blank line between
+                        const previous = items[index - 1];
+                        const underHeading = previous != null && "value" in previous == false && previous.label != null;
+                        if(lines.length > 0 && underHeading == false) {
                             lines.push("");
                         }
-                        const heading: LinePart[] = [{ text: `  ${item.label}`, paint: (text) => this.style.bold(this.style.accent(text)) }];
+                        const paintLabel = (text: string) => this.style.bold(this.style.accent(text));
+                        if(item.rule == true) {
+                            const rule = this.symbols.rule;
+                            const heading: LinePart[] = [
+                                { text: `  ${rule}${rule} `, paint: this.style.dim },
+                                { text: item.label, paint: paintLabel },
+                            ];
+                            if(item.hint != null && item.hint !== "") {
+                                heading.push({ text: ` · ${item.hint}`, paint: this.style.dim });
+                            }
+                            const used = heading.reduce((sum, part) => sum + displayWidth(part.text), 0);
+                            heading.push({ text: ` ${rule.repeat(Math.max(0, width - used - 1))}`, paint: this.style.dim });
+                            lines.push(this.fitLine(heading, width));
+                            continue;
+                        }
+                        const heading: LinePart[] = [{ text: `  ${item.label}`, paint: paintLabel }];
                         if(item.hint != null && item.hint !== "") {
                             heading.push({ text: `  ${item.hint}`, paint: this.style.dim });
                         }

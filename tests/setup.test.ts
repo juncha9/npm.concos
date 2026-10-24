@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseJson } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planSetup, planWake } from "../src/modules/cli/setup";
+import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planWake } from "../src/modules/cli/setup";
 import { HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 
 let directory: string;
@@ -338,5 +338,53 @@ describe("optional hooks", () => {
         applySetup(planHooks(input, "off"));
         fs.appendFileSync(path.join(directory, ".codex", "config.toml"), '\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "concos hook turn-end --host codex"\n');
         expect(() => planHooks(input, "on")).toThrow(/already has concos hooks/);
+    });
+});
+
+describe("registration in one preview", () => {
+    const claude = () => ({ host: "claude", home: directory });
+    const hooksFile = () => path.join(directory, ".claude", "settings.json");
+
+    it("registers Claude Code MCP, hooks and idle wake at once, after the user's own hooks and comments", () => {
+        fs.mkdirSync(path.dirname(hooksFile()));
+        fs.writeFileSync(hooksFile(), '{\n  // keep me\n  "permissions": {"allow": ["Read"]},\n  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}\n}\n');
+        const changes = planRegistration(claude(), { wake: true, skipBrokenHooks: true });
+        expect(changes.map((change) => change.path)).toEqual([path.join(directory, ".claude.json"), hooksFile()]);
+        expect(changes[1].notes.join(" ")).toContain("Codex sessions do not wake");
+        expect(fs.readFileSync(hooksFile(), "utf8")).not.toContain("concos");
+        applySetup(changes);
+
+        expect(inspectSetup(claude()).registered).toBe(true);
+        expect(inspectHooks(claude()).state).toBe("on");
+        expect(inspectWake(claude())).toBe(true);
+        const text = fs.readFileSync(hooksFile(), "utf8");
+        expect(text).toContain("// keep me");
+        expect(parseJson(text).permissions).toEqual({ allow: ["Read"] });
+        expect(parseJson(text).hooks.Stop.map((group: { hooks: { command: string }[] }) => group.hooks[0].command))
+            .toEqual(["echo mine", "concos hook turn-end --host claude", "concos hook watch --host claude"]);
+        expect(planRegistration(claude(), { wake: true, skipBrokenHooks: true })).toEqual([]);
+    });
+
+    it("leaves a hooks file it cannot edit safely untouched and still registers MCP, unless asked for hooks", () => {
+        fs.mkdirSync(path.dirname(hooksFile()));
+        const broken = '{"hooks": {"Stop": []}, "hooks": {}}';
+        fs.writeFileSync(hooksFile(), broken);
+        const changes = planRegistration(claude(), { wake: true, skipBrokenHooks: true });
+        expect(changes.map((change) => change.path)).toEqual([path.join(directory, ".claude.json")]);
+        expect(changes[0].notes.join(" ")).toMatch(/Hooks were left out, and their file untouched: .*duplicate JSON key "hooks"\. Fix it/);
+        applySetup(changes);
+        expect(inspectSetup(claude()).registered).toBe(true);
+        expect(fs.readFileSync(hooksFile(), "utf8")).toBe(broken);
+        expect(() => planRegistration(claude(), { wake: false, skipBrokenHooks: false })).toThrow(/duplicate JSON key/);
+    });
+
+    it("refuses idle wake for Codex, and writes nothing a change would leave unreadable", () => {
+        expect(() => planRegistration({ host: "codex", home: directory }, { wake: true, skipBrokenHooks: false })).toThrow(/Claude Code only/);
+        expect(planRegistration({ host: "gemini", home: directory }, { wake: false, skipBrokenHooks: true })).toHaveLength(1);
+        const file = path.join(directory, "settings.json");
+        fs.writeFileSync(file, '{"keep": true}');
+        expect(() => applySetup([{ path: file, before: '{"keep": true}', after: '{"keep": true', additions: [], removals: [], notes: [] }])).toThrow(/invalid JSON/);
+        expect(fs.readFileSync(file, "utf8")).toBe('{"keep": true}');
+        expect(fs.readdirSync(directory)).toEqual(["settings.json"]);
     });
 });

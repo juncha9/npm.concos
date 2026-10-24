@@ -45,8 +45,12 @@ describe("registration menu", () => {
     it("selects a supported client directly and writes only after the preview is accepted", async () => {
         const output = await menu("setup\nclaude\ny\nback\nquit\n");
         expect(output.indexOf("Settings to add")).toBeLessThan(output.indexOf("Register these settings?"));
-        expect(output).toContain("MCP registered for Claude Code.");
+        // one preview names MCP, the hooks and idle wake, before the single question
+        expect(output.indexOf("concos hook watch --host claude")).toBeLessThan(output.indexOf("Register these settings?"));
+        expect(output).toContain("MCP, hooks and idle wake registered for Claude Code.");
         expect(inspectSetup({ host: "claude", home: path.join(directory, "user") })).toEqual({ registered: true, room: "main" });
+        expect(inspectHooks({ host: "claude", home: path.join(directory, "user") }).state).toBe("on");
+        expect(inspectWake({ host: "claude", home: path.join(directory, "user") })).toBe(true);
         expect(fs.existsSync(path.join(directory, ".codex"))).toBe(false);
     });
 
@@ -106,12 +110,11 @@ describe("registration menu", () => {
         for(const host of ["claude", "codex"]) {
             expect(inspectSetup({ host, home: path.join(directory, "user") })).toMatchObject({ registered: true });
         }
-        const afterFirstRegistration = output.slice(output.indexOf("MCP registered for Claude Code."));
-        expect(afterFirstRegistration).toContain("MCP registered");
+        const afterFirstRegistration = output.slice(output.indexOf("MCP, hooks and idle wake registered for Claude Code."));
         expect(afterFirstRegistration).toMatch(/[✔√] MCP registered/);
-        // optional hooks stay off until turned on for the client
-        expect(afterFirstRegistration).toContain("MCP registered · Hooks off");
-        expect(afterFirstRegistration).toContain("MCP registered for Codex CLI.");
+        expect(afterFirstRegistration).toContain("MCP registered · Hooks on · Wake on");
+        expect(afterFirstRegistration).toContain("MCP and hooks registered for Codex CLI.");
+        expect(inspectHooks({ host: "codex", home: path.join(directory, "user") }).state).toBe("on");
     });
 });
 
@@ -180,10 +183,12 @@ describe("room menu", () => {
         const output = await menu("status\nmessages\n1\nback\nquit\n");
         expect(output).toContain("Server (Codex) (1 unread)");
         expect(output).toContain(" Agents 1  [Messages 1]");
-        expect(output).toMatch(/1\) #1 \[QUESTION\] {2}Reviewer (→|->) Server \(Codex\) +just now · Pending Server/);
+        expect(output).toMatch(/\n {2}Reviewer {2}1 message\n/);
+        expect(output).toMatch(/1\) #1 QUESTION {2}(→|->) Server \(Codex\) +just now · Pending Server/);
         const list = output.slice(output.indexOf("[Messages 1]"), output.indexOf("From  Reviewer"));
-        expect(list).not.toContain("Last line of the complete message");
-        expect(list).toMatch(/Original message text.*(…|\.\.\.)/);
+        // two preview lines, the second ending in an ellipsis
+        expect(list).toMatch(/ {2}First line\n +Second line with details(…|\.\.\.)\n/);
+        expect(list).not.toContain("Original message text");
         // the whole-message view, opened with the row's number
         expect(output).toContain("From  Reviewer");
         expect(output).toContain("Awaiting  Server");
@@ -354,7 +359,7 @@ describe("ended sessions on the board", () => {
         expect(await receivedAt()).not.toBeNull();
     });
 
-    it("lists only open messages, says whom they wait on, and counts them on the tab", async () => {
+    it("lists open and received messages together, says whom open ones wait on, and counts both on the tab", async () => {
         const { database, store, live } = await seedWithEnded();
         const other = store.join({ room: "main", displayName: "Other", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
         const done = store.sendMessage(live.agent_id, { to: other.agent_id, kind: "note", text: "already handled", replyTo: null, requestId: null });
@@ -363,26 +368,27 @@ describe("ended sessions on the board", () => {
         database.close();
 
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 1]"));
+        const list = output.slice(output.indexOf("[Messages 2]"));
         expect(list).toContain("still open");
-        expect(list).toMatch(/Live \(Codex\) (→|->) Other \(Codex\)/);
+        expect(list).toContain("  Live (Codex)  2 messages");
+        expect(list).toMatch(/QUESTION {2}(→|->) Other \(Codex\)/);
         expect(list).toContain("Pending Other");
-        expect(list).not.toContain("already handled");
-        expect(list).toContain("Show earlier messages (1)");
+        expect(list).toContain("already handled");
+        expect(output).not.toMatch(/earlier messages/i);
     });
 
-    it("keeps received messages behind Show earlier messages until they are deleted", async () => {
+    it("shows a message everyone received in the list, without a pending mark", async () => {
         const { database, store, live } = await seedWithEnded();
         const other = store.join({ room: "main", displayName: "Other", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
         const done = store.sendMessage(live.agent_id, { to: other.agent_id, kind: "note", text: "already handled", replyTo: null, requestId: null });
         store.acknowledge(other.agent_id, [done.message_id]);
         database.close();
 
-        const output = await menu("status\nmessages\nearlier\nback\nquit\n");
-        const shown = output.slice(output.lastIndexOf("Earlier messages"));
-        expect(shown).toContain("already handled");
-        expect(shown).not.toContain("Pending");
-        expect(output).toContain("Hide earlier messages");
+        const output = await menu("status\nmessages\nback\nquit\n");
+        const list = output.slice(output.indexOf("[Messages 1]"));
+        expect(list).toContain("already handled");
+        expect(list).not.toContain("Pending");
+        expect(list).not.toContain("No messages.");
     });
 
     it("sweeps residue when the board opens", async () => {
@@ -414,34 +420,149 @@ describe("ended sessions on the board", () => {
     });
 });
 
-describe("topics on the board", () => {
-    async function seedMessages(topicLists: string[][]) {
+describe("message groups on the board", () => {
+    /** Sends `[sender name, topics, text]` in order, all to one reader; the text defaults to `message <index>`. */
+    async function seedMessages(sent: [string, string[], string?][]) {
         const database = await openDatabase(path.join(directory, "data"));
         const store = new RoomStore(database);
         const join = (displayName: string) => store.join({ room: "main", displayName, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
-        const sender = join("Sender");
         const reader = join("Reader");
-        topicLists.forEach((topics, index) => {
-            store.sendMessage(sender.agent_id, { to: reader.agent_id, kind: "note", text: `message ${index}`, replyTo: null, requestId: null, topics });
+        const senders = new Map<string, string>();
+        sent.forEach(([name, topics, text], index) => {
+            if(senders.has(name) == false) {
+                senders.set(name, join(name).agent_id);
+            }
+            store.sendMessage(senders.get(name)!, { to: reader.agent_id, kind: "note", text: text ?? `message ${index}`, replyTo: null, requestId: null, topics });
         });
         database.close();
     }
-    const headings = (list: string) => list.split("\n").filter((line) => /^  \S.*  \d+ open$/.test(line));
+    const headings = (list: string) => list.split("\n").filter((line) => /^  \S.*  \d+ messages?$/.test(line));
 
-    it("groups open messages under their first topic, sorted by key, with untagged ones last", async () => {
-        await seedMessages([[], ["concos_release"], ["concos_board", "concos_ui"], ["concos_board"]]);
+    it("groups messages by sender, the sender of the newest message first", async () => {
+        await seedMessages([["Alpha", []], ["Beta", []], ["Alpha", []]]);
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 4]"));
-        expect(headings(list)).toEqual(["  concos_board  2 open", "  concos_release  1 open", "  No topic  1 open"]);
-        expect(list).toContain("Topics concos_board, concos_ui");
+        const list = output.slice(output.indexOf("[Messages 3]"));
+        expect(headings(list)).toEqual(["  Alpha (Codex)  2 messages", "  Beta (Codex)  1 message"]);
+        // newest first within a group
+        expect(list.indexOf("message 2")).toBeLessThan(list.indexOf("message 0"));
     });
 
-    it("keeps the list without headings when no message has a topic", async () => {
-        await seedMessages([[], []]);
+    it("shows every topic a message carries on its row", async () => {
+        await seedMessages([["Alpha", ["concos_release"]], ["Alpha", ["concos_board", "concos_ui"]], ["Alpha", []]]);
+        const output = await menu("status\nmessages\nback\nquit\n");
+        const list = output.slice(output.indexOf("[Messages 3]"));
+        expect(list).toContain("Topics concos_release");
+        expect(list).toContain("Topics concos_board, concos_ui");
+        expect(list.match(/Topics /g)).toHaveLength(2);
+    });
+
+    it("lists posts to the whole room first, under Notices, with their edit time and no pending names", async () => {
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const join = (displayName: string) => store.join({ room: "main", displayName, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const reader = join("Reader");
+        const poster = join("Poster");
+        store.sendMessage(reader.agent_id, { to: poster.agent_id, kind: "note", text: "direct note", replyTo: null, requestId: null });
+        const posted = store.sendMessage(poster.agent_id, { to: "all", kind: "notice", text: "server restarts at 15:00", replyTo: null, requestId: null });
+        store.editPost(poster.agent_id, { messageId: posted.message_id, text: "server is back" });
+        database.close();
+
         const output = await menu("status\nmessages\nback\nquit\n");
         const list = output.slice(output.indexOf("[Messages 2]"));
-        expect(list).toContain("message 1");
-        expect(headings(list)).toEqual([]);
+        expect(list).toContain("\n  Notices\n\n  Poster (Codex)  1 post\n");
+        expect(list).toMatch(/#2 NOTICE +edited just now\n +server is back\n/);
+        expect(list.indexOf("server is back")).toBeLessThan(list.indexOf("\n  Messages\n"));
+        expect(list.indexOf("\n  Messages\n")).toBeLessThan(list.indexOf("direct note"));
+        expect(list).not.toContain("server restarts");
+    });
+
+    it("asks each live agent with posts, by question, to tidy them, naming its posts", async () => {
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const join = (displayName: string) => store.join({ room: "main", displayName, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const poster = join("Poster");
+        const gone = join("Gone");
+        const post = (from: string, text: string) => store.sendMessage(from, { to: "all", kind: "notice", text: text, replyTo: null, requestId: null }).message_id;
+        const first = post(poster.agent_id, "server restarts at 15:00\nsecond line");
+        const second = post(poster.agent_id, "migration after the restart");
+        post(gone.agent_id, "from a closed session");
+        store.disconnect([gone.agent_id]);
+        database.close();
+
+        const output = await menu("status\nmessages\ntidy\ny\nback\nquit\n");
+        expect(output).toContain("Ask senders to tidy notices  1 agent");
+        expect(output).toContain("Ask Poster (Codex) to tidy their notices?");
+        expect(output).toContain("Asked 1 agent to tidy its notices.");
+        const check = await openDatabase(path.join(directory, "data"));
+        try {
+            const asked = check.prepare("SELECT recipient_agent_id, kind, body FROM message WHERE recipient_scope = 'direct'").all() as { recipient_agent_id: string; kind: string; body: string }[];
+            expect(asked).toHaveLength(1);
+            expect(asked[0]).toMatchObject({ recipient_agent_id: poster.agent_id, kind: "question" });
+            expect(asked[0].body.split("\n").slice(1)).toEqual([`#${second} migration after the restart`, `#${first} server restarts at 15:00…`]);
+        }
+        finally { check.close(); }
+    });
+
+    it("lets the person at the board take a post down after confirming", async () => {
+        await seedMessages([["Poster", []]]);
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const posterId = store.findAgentInRoom("main", "Poster");
+        const posted = store.sendMessage(posterId, { to: "all", kind: "notice", text: "stale notice", replyTo: null, requestId: null }).message_id;
+        database.close();
+
+        const kept = await menu(`status\nmessages\n#${posted}\nremove\nn\nback\nquit\n`);
+        expect(kept).not.toContain(`Removed post #${posted}.`);
+        const output = await menu(`status\nmessages\n#${posted}\nremove\ny\nback\nquit\n`);
+        expect(output).toContain(`Remove post #${posted} by Poster (Codex)?`);
+        expect(output).toContain(`Removed post #${posted}.`);
+        const check = await openDatabase(path.join(directory, "data"));
+        try {
+            expect(check.prepare("SELECT id FROM message WHERE id = :id").get({ id: posted })).toBeUndefined();
+        }
+        finally { check.close(); }
+    });
+
+    it("leaves a lead that repeats the sender out of the preview", async () => {
+        await seedMessages([
+            ["Alpha", [], "[Alpha → Reader] build is green"],
+            ["Alpha", [], "Alpha → Reader: schema frozen"],
+            ["Alpha", [], "[Alphabet] stays as written"],
+            ["Alpha", [], "[Alpha]"],
+        ]);
+        const output = await menu("status\nmessages\nback\nquit\n");
+        const list = output.slice(output.indexOf("[Messages 4]"));
+        expect(list).toMatch(/\n +build is green\n/);
+        expect(list).toMatch(/\n +schema frozen\n/);
+        expect(list).not.toContain("Reader]");
+        // another name that only starts the same way, and a lead with nothing after it, stay
+        expect(list).toContain("[Alphabet] stays as written");
+        expect(list).toMatch(/\n +\[Alpha\]\n/);
+    });
+
+    it("draws sender rules on a terminal and inverts the selected block's header", async () => {
+        await seedMessages([["Alpha", []], ["Alpha", []]]);
+        const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+        const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 30 });
+        let screen = "";
+        output.on("data", (chunk) => { screen += chunk.toString(); });
+        const running = runMenu({ input, output, home: path.join(directory, "user") });
+        let frame = "";
+        // menu: Enter concos; board: Tab to Messages; Esc twice leaves
+        for(const key of ["2", "\r", "\t", "SNAP", "\u001b", "\u001b"]) {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            if(key == "SNAP") {
+                frame = screen.slice(screen.lastIndexOf("\u001b[J") + 3);
+                continue;
+            }
+            input.write(key);
+        }
+        await running;
+
+        expect(frame.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "")).toMatch(/ {2}(──|--) Alpha \(Codex\) · 2 messages (─|-)+\n/);
+        const inverted = frame.split("\n").filter((line) => line.includes("\u001b[7m"));
+        expect(inverted).toHaveLength(1);
+        expect(inverted[0]).toContain("#2");
     });
 });
 
@@ -452,7 +573,7 @@ describe("built interactive CLI", () => {
             cwd: directory, env: process.env, input: answers, encoding: "utf8", timeout: 5000,
         });
         expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain("MCP registered for Codex CLI.");
+        expect(result.stdout).toContain("MCP and hooks registered for Codex CLI.");
         expect(inspectSetup({ host: "codex", home: path.join(directory, "user") }).room).toBe("main");
     });
 });
