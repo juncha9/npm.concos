@@ -78,8 +78,9 @@ card (blocker, task, summary, next step, editing claims, references and recent
 checkpoints) and to message it directly; going back puts
 the list where the card was. **Messages** lists open messages newest first in
 separate blocks: one header with the number, colored kind and sender → recipient,
-with age and pending acknowledgement count aligned on the right, above up to
-three preview lines. Narrow windows wrap the complete header rather than cutting it.
+with age and the names it still waits on (two, then a count) aligned on the right,
+above up to three preview lines. Narrow windows wrap the complete header rather
+than cutting it.
 Agent names include their client, for example `Dev / CONCOS 01 (Claude Code)` or
 `concos development (Codex)`, in the list, message details and recipient summaries.
 Messages are grouped under their first topic, topics in alphabetical order and
@@ -97,8 +98,10 @@ does not mark messages as read. Animations keep the cursor and reading position,
 and pause while a detail view is open. Set `CONCOS_REDUCED_MOTION=1` for static
 indicators; piped output never animates. `NO_COLOR` disables color while keeping
 the text indicators.
-A message is resolved once every active agent has
-acknowledged it. Ended sessions
+A message stays open while someone still has to read it: a person, or an agent
+that called concos or ran a hook in the last 30 minutes. An agent idle with its
+session open is not waited on. Once nobody is left, the message moves under Show
+earlier messages until it is deleted. Ended sessions
 (closed, or silent for 30 minutes) are folded away under Show ended sessions. Lines
 in agent rows that exceed the window width end in an ellipsis. Full message text
 wraps to the available width in its detail view.
@@ -116,13 +119,19 @@ sender can reuse one. `read_messages` with a topic returns the newest messages y
 sent or received under it and its narrower topics. Messages are short notes on
 current issues; durable project knowledge belongs in the project's docs.
 
+A message to all reaches every agent in the room, so agents are told to use it only
+for news everyone needs and to send progress to the agents concerned. A session
+that joins later receives the newest five room-wide messages from the last four
+hours; a session that comes back receives the newest five it missed within the
+last day.
+
 concos deletes what is no longer in use, so the database stays the size of current
-work. A resolved message and its receipts go 10 minutes after the last
-acknowledgement; a message still owed only by ended sessions or a person goes after
-a day. Agent cards silent for 7 days go with their checkpoints, each agent keeps its
-newest 50 checkpoints, and unused workspace records go too. Running bridges sweep
-every minute, and opening the waiting room sweeps once. Backups keep the last 7
-daily copies and 3 pre-migration copies.
+work. Messages go a day after they were sent, read or not, with their receipts; a
+message that a remaining reply answers stays with it. Agent cards silent for 7 days
+go with their checkpoints, each agent keeps its newest 50 checkpoints, and unused
+workspace records go too. Running bridges sweep every minute, and opening the
+waiting room sweeps once. Backups keep the last 7 daily copies and 3 pre-migration
+copies.
 
 Agents use `join` to participate and `check_in` to report their status, summary
 and editing claims at task boundaries. Before yielding, they report `waiting`
@@ -163,7 +172,8 @@ receipts are preserved. Old registered `--room` arguments are accepted for
 compatibility and no longer select separate rooms. Project-scoped registration
 is no longer offered. Schema version 4 adds message topics and messages to
 several agents. Schema version 5 records which messages a turn-end hook has
-already pointed out, and version 6 keeps the Claude Code idle wake state.
+already pointed out, and version 6 keeps the Claude Code idle wake state. Version 7
+records when each agent last acted itself, so messages stop waiting on idle sessions.
 
 ## Optional hooks (Claude Code and Codex)
 
