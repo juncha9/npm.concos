@@ -351,4 +351,79 @@ describe("concos mcp over stdio", () => {
         expect(row.editing_list).toBe("[]");
         expect(row.disconnected_at).not.toBeNull();
     }, E2E_TIMEOUT_MS);
+
+    it("answers the MCP requests it offers and stays quiet on the rest, as the SDK it replaced did", async () => {
+        const child = spawn(process.execPath, [CLI_PATH, "mcp"], {
+            env: childEnvironment(),
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        const answers: any[] = [];
+        let buffered = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+            buffered += chunk;
+            let newline = buffered.indexOf("\n");
+            while(newline >= 0) {
+                const line = buffered.slice(0, newline).trim();
+                buffered = buffered.slice(newline + 1);
+                if(line != "") {
+                    answers.push(JSON.parse(line));
+                }
+                newline = buffered.indexOf("\n");
+            }
+        });
+        const sendLine = (line: string): void => {
+            child.stdin.write(`${line}\n`);
+        };
+        const answerTo = async (id: number | string): Promise<any> => {
+            for(let attempt = 0; attempt < 200; attempt++) {
+                const found = answers.find((answer) => answer.id == id);
+                if(found != null) {
+                    return found;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            throw new Error(`no answer to request ${id}`);
+        };
+        const callTool = async (id: number, name: string, args?: unknown): Promise<any> => {
+            sendLine(JSON.stringify({ jsonrpc: "2.0", id: id, method: "tools/call", params: { name: name, arguments: args } }));
+            const answer = await answerTo(id);
+            return answer.result;
+        };
+
+        sendLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2099-01-01", capabilities: {}, clientInfo: { name: "raw", version: "0" } } }));
+        const initialized = (await answerTo(1)).result;
+        expect(initialized.protocolVersion).toBe("2025-11-25");
+        expect(initialized.capabilities).toEqual({ tools: { listChanged: true } });
+        expect(initialized.serverInfo.name).toBe("concos");
+
+        sendLine(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }));
+        const tools = (await answerTo(2)).result.tools;
+        expect(tools.map((tool: any) => tool.name)).toEqual(["join", "check_in", "inspect_agent", "send_message", "read_messages", "leave"]);
+        expect(tools.every((tool: any) => tool.inputSchema.type == "object" && tool.execution.taskSupport == "forbidden")).toBe(true);
+
+        sendLine(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/list", params: {} }));
+        expect((await answerTo(3)).error).toEqual({ code: -32601, message: "Method not found" });
+
+        expect(await callTool(4, "no_such_tool", {})).toEqual({ content: [{ type: "text", text: "Tool no_such_tool not found" }], isError: true });
+        const missing = await callTool(5, "join", { display_name: "", extra: true });
+        expect(missing.isError).toBe(true);
+        expect(missing.content[0].text).toBe("Invalid arguments for tool join: client is required; working_directory is required; display_name must not be empty");
+        // `to` belongs to send_message, so check_in drops it instead of complaining
+        const wrongTypes = await callTool(6, "check_in", { status: "sleeping", received_message_ids: [1.5], to: 3 });
+        expect(wrongTypes.content[0].text).toBe("Invalid arguments for tool check_in: status must be one of working, waiting, idle, finished; received_message_ids[0] must be an integer");
+        const withoutArguments = await callTool(7, "read_messages");
+        expect(withoutArguments).toEqual({ content: [{ type: "text", text: "call join first" }], isError: true });
+
+        // neither a broken line nor a notification is answered, and the bridge keeps serving
+        const answeredBefore = answers.length;
+        sendLine("{not json");
+        sendLine(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7 } }));
+        sendLine(JSON.stringify({ jsonrpc: "2.0", id: "last", method: "ping" }));
+        expect((await answerTo("last")).result).toEqual({});
+        expect(answers.length).toBe(answeredBefore + 1);
+
+        child.stdin.end();
+        await new Promise((resolve) => child.on("exit", resolve));
+    }, E2E_TIMEOUT_MS);
 });

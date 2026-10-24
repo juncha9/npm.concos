@@ -1,7 +1,3 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import {
     AGENT_STATUSES,
     HEARTBEAT_INTERVAL_MS,
@@ -24,6 +20,7 @@ import {
     MESSAGE_KINDS,
     READ_MESSAGES_MAX_LIMIT,
 } from "../../_defs";
+import type { AgentStatus, MessageKind } from "../../_defs";
 import { $logger } from "../../_libs/logger";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { CONCOS_VERSION } from "../../_libs/version";
@@ -31,6 +28,10 @@ import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
 import type { CheckInResult, FullMessage } from "../store/room-store";
+import { serveStdio } from "./stdio-server";
+import type { ToolDefinition, ToolResult } from "./stdio-server";
+import { inputSchema } from "./tool-schema";
+import type { ValueSchema } from "./tool-schema";
 
 const SHUTDOWN_DEADLINE_MS = 3000;
 
@@ -75,7 +76,9 @@ const SERVER_INSTRUCTIONS = [
     "An inbox field on any response counts unread questions and other messages. A message whose full text reached you counts as received on your next call; use read_messages for truncated or unread ones.",
 ].join("\n");
 
-const handleArgument = z.string().optional().describe("Handle from join. Omit to use the last one joined in this session.");
+const HANDLE_PROPERTY: ValueSchema = { type: "string", description: "Handle from join. Omit to use the last one joined in this session." };
+const ANY_INTEGER = { type: "integer", minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER } as const;
+const POSITIVE_INTEGER = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER } as const;
 
 /**
  * Serves the MCP tools over stdio until the client goes away.
@@ -110,7 +113,7 @@ export async function runBridge(): Promise<void> {
         return agentId;
     };
 
-    const runTool = (toolName: string, work: () => unknown): CallToolResult => {
+    const runTool = (toolName: string, work: () => unknown): ToolResult => {
         toolAgentId = null;
         try {
             const result = work();
@@ -131,18 +134,25 @@ export async function runBridge(): Promise<void> {
         }
     };
 
-    const server = new McpServer({ name: "concos", version: CONCOS_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+    const tools: ToolDefinition[] = [];
+    const runners = new Map<string, (values: Record<string, unknown>) => ToolResult>();
+    const registerTool = (definition: ToolDefinition, run: (values: Record<string, unknown>) => ToolResult): void => {
+        tools.push(definition);
+        runners.set(definition.name, run);
+    };
 
-    server.registerTool("join", {
+    registerTool({
+        name: "join",
         description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart.",
-        inputSchema: {
-            display_name: z.string().min(1).max(MAX_DISPLAY_NAME_LENGTH).describe("This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in task."),
-            client: z.string().min(1).max(MAX_CLIENT_LENGTH).describe("Your product, e.g. Claude Code, Codex."),
-            working_directory: z.string().min(1).max(MAX_PATH_LENGTH).describe("Absolute path of the folder you work in."),
-            workspace_root: z.string().max(MAX_PATH_LENGTH).optional().describe("Absolute project root when it differs from working_directory."),
-            resume_handle: z.string().optional().describe("Handle from an earlier join, to come back as the same agent."),
-        },
-    }, (args) => runTool("join", () => {
+        inputSchema: inputSchema({
+            display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in task." },
+            client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
+            working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder you work in." },
+            workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory." },
+            resume_handle: { type: "string", description: "Handle from an earlier join, to come back as the same agent." },
+        }, ["display_name", "client", "working_directory"]),
+    }, (values) => runTool("join", () => {
+        const args = values as { display_name: string; client: string; working_directory: string; workspace_root?: string; resume_handle?: string };
         const result = store.join({
             displayName: args.display_name,
             client: args.client,
@@ -156,24 +166,29 @@ export async function runBridge(): Promise<void> {
         return result;
     }));
 
-    server.registerTool("check_in", {
+    registerTool({
+        name: "check_in",
         description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes and new messages since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing [].",
-        inputSchema: {
-            handle: handleArgument,
-            display_name: z.string().max(MAX_DISPLAY_NAME_LENGTH).optional().describe("Rename your card, e.g. after the user renamed this session; no new join needed."),
-            status: z.enum(AGENT_STATUSES).optional(),
-            task: z.string().max(MAX_TASK_LENGTH).optional(),
-            summary: z.string().max(MAX_SUMMARY_LENGTH).optional().describe("What is done so far and where things stand."),
-            next_step: z.string().max(MAX_NEXT_STEP_LENGTH).optional(),
-            blocker: z.string().max(MAX_BLOCKER_LENGTH).optional(),
-            references: z.array(z.string().max(MAX_LIST_ITEM_LENGTH)).max(MAX_LIST_ITEMS).optional().describe(`Relevant files, commits or docs; up to ${MAX_LIST_ITEMS}.`),
-            editing: z.array(z.string().max(MAX_LIST_ITEM_LENGTH)).max(MAX_LIST_ITEMS).optional().describe(`Files or folders you are editing now, up to ${MAX_LIST_ITEMS}; [] when done.`),
-            checkpoint: z.string().max(MAX_CHECKPOINT_LENGTH).optional().describe("A short work record worth keeping: result, decision, what remains."),
-            received_message_ids: z.array(z.number().int()).max(MAX_RECEIVED_IDS).optional().describe(`Optional, up to ${MAX_RECEIVED_IDS}: messages you read. Full-text deliveries are acknowledged on your next call anyway.`),
-            expected_revision: z.number().int().optional().describe("Reject the update if your card moved past this revision."),
-            cursor: z.string().optional().describe("Omit to continue from the last delivered position; repeat a previous cursor to receive again."),
-        },
-    }, (args) => runTool("check_in", () => {
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },
+            status: { type: "string", enum: AGENT_STATUSES },
+            task: { type: "string", maxLength: MAX_TASK_LENGTH },
+            summary: { type: "string", maxLength: MAX_SUMMARY_LENGTH, description: "What is done so far and where things stand." },
+            next_step: { type: "string", maxLength: MAX_NEXT_STEP_LENGTH },
+            blocker: { type: "string", maxLength: MAX_BLOCKER_LENGTH },
+            references: { type: "array", items: { type: "string", maxLength: MAX_LIST_ITEM_LENGTH }, maxItems: MAX_LIST_ITEMS, description: `Relevant files, commits or docs; up to ${MAX_LIST_ITEMS}.` },
+            editing: { type: "array", items: { type: "string", maxLength: MAX_LIST_ITEM_LENGTH }, maxItems: MAX_LIST_ITEMS, description: `Files or folders you are editing now, up to ${MAX_LIST_ITEMS}; [] when done.` },
+            checkpoint: { type: "string", maxLength: MAX_CHECKPOINT_LENGTH, description: "A short work record worth keeping: result, decision, what remains." },
+            received_message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Optional, up to ${MAX_RECEIVED_IDS}: messages you read. Full-text deliveries are acknowledged on your next call anyway.` },
+            expected_revision: { ...ANY_INTEGER, description: "Reject the update if your card moved past this revision." },
+            cursor: { type: "string", description: "Omit to continue from the last delivered position; repeat a previous cursor to receive again." },
+        }),
+    }, (values) => runTool("check_in", () => {
+        const args = values as {
+            handle?: string; display_name?: string; status?: AgentStatus; task?: string; summary?: string; next_step?: string; blocker?: string;
+            references?: string[]; editing?: string[]; checkpoint?: string; received_message_ids?: number[]; expected_revision?: number; cursor?: string;
+        };
         const agentId = resolveAgentId(args.handle);
         const result = store.checkIn(agentId, {
             cursor: args.cursor ?? null,
@@ -194,15 +209,17 @@ export async function runBridge(): Promise<void> {
         return shapeCheckIn(result);
     }));
 
-    server.registerTool("inspect_agent", {
+    registerTool({
+        name: "inspect_agent",
         description: "Read another agent's full card and recent checkpoints.",
-        inputSchema: {
-            handle: handleArgument,
-            agent_id: z.string().min(1),
-            checkpoint_limit: z.number().int().min(1).optional().describe(`Checkpoints to return, at most ${INSPECT_CHECKPOINT_MAX_LIMIT}; a larger value returns ${INSPECT_CHECKPOINT_MAX_LIMIT}.`),
-            before_checkpoint_id: z.number().int().optional().describe("Page to older checkpoints."),
-        },
-    }, (args) => runTool("inspect_agent", () => {
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            agent_id: { type: "string", minLength: 1 },
+            checkpoint_limit: { ...POSITIVE_INTEGER, description: `Checkpoints to return, at most ${INSPECT_CHECKPOINT_MAX_LIMIT}; a larger value returns ${INSPECT_CHECKPOINT_MAX_LIMIT}.` },
+            before_checkpoint_id: { ...ANY_INTEGER, description: "Page to older checkpoints." },
+        }, ["agent_id"]),
+    }, (values) => runTool("inspect_agent", () => {
+        const args = values as { handle?: string; agent_id: string; checkpoint_limit?: number; before_checkpoint_id?: number };
         const agentId = resolveAgentId(args.handle);
         let checkpointLimit: number | null = null;
         if(args.checkpoint_limit != null) {
@@ -215,20 +232,26 @@ export async function runBridge(): Promise<void> {
         });
     }));
 
-    server.registerTool("send_message", {
+    registerTool({
+        name: "send_message",
         description: "Leave a message for one agent, several, or the whole room. Success means stored, not read.",
-        inputSchema: {
-            handle: handleArgument,
-            to: z.union([z.string().min(1), z.array(z.string().min(1)).min(1).max(MAX_RECIPIENTS)])
-                .describe(`An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all".`),
-            kind: z.enum(MESSAGE_KINDS).optional().describe("Default note. Use question when you need an answer, reply with reply_to."),
-            text: z.string().min(1).max(MAX_MESSAGE_LENGTH),
-            topics: z.array(z.string()).max(MAX_TOPICS_PER_MESSAGE).optional()
-                .describe(`Up to ${MAX_TOPICS_PER_MESSAGE} snake_case topic keys, broad to narrow, e.g. webapp_login_redirect. Reuse one from similar_topics when it fits.`),
-            reply_to: z.number().int().optional(),
-            request_id: z.string().max(MAX_REQUEST_ID_LENGTH).optional().describe("Reuse on retry to avoid storing the message twice."),
-        },
-    }, (args) => runTool("send_message", () => {
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            to: {
+                anyOf: [
+                    { type: "string", minLength: 1 },
+                    { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: MAX_RECIPIENTS },
+                ],
+                description: `An agent_id, a list of up to ${MAX_RECIPIENTS} agent_ids, or "all".`,
+            },
+            kind: { type: "string", enum: MESSAGE_KINDS, description: "Default note. Use question when you need an answer, reply with reply_to." },
+            text: { type: "string", minLength: 1, maxLength: MAX_MESSAGE_LENGTH },
+            topics: { type: "array", items: { type: "string" }, maxItems: MAX_TOPICS_PER_MESSAGE, description: `Up to ${MAX_TOPICS_PER_MESSAGE} snake_case topic keys, broad to narrow, e.g. webapp_login_redirect. Reuse one from similar_topics when it fits.` },
+            reply_to: ANY_INTEGER,
+            request_id: { type: "string", maxLength: MAX_REQUEST_ID_LENGTH, description: "Reuse on retry to avoid storing the message twice." },
+        }, ["to", "text"]),
+    }, (values) => runTool("send_message", () => {
+        const args = values as { handle?: string; to: string | string[]; kind?: MessageKind; text: string; topics?: string[]; reply_to?: number; request_id?: string };
         const agentId = resolveAgentId(args.handle);
         return store.sendMessage(agentId, {
             to: args.to,
@@ -240,15 +263,17 @@ export async function runBridge(): Promise<void> {
         });
     }));
 
-    server.registerTool("read_messages", {
+    registerTool({
+        name: "read_messages",
         description: "Read full message text: the ids given, the newest under a topic, or by default your messages not yet received. Returned messages count as received on your next call.",
-        inputSchema: {
-            handle: handleArgument,
-            message_ids: z.array(z.number().int()).max(MAX_RECEIVED_IDS).optional().describe(`Up to ${MAX_RECEIVED_IDS} ids; at most ${READ_MESSAGES_MAX_LIMIT} messages come back per call, with has_more.`),
-            topic: z.string().optional().describe("A topic key or its leading words, e.g. webapp: your messages under it and narrower topics."),
-            limit: z.number().int().min(1).optional().describe(`Messages per call, at most ${READ_MESSAGES_MAX_LIMIT}; a larger value returns ${READ_MESSAGES_MAX_LIMIT} with has_more.`),
-        },
-    }, (args) => runTool("read_messages", () => {
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Up to ${MAX_RECEIVED_IDS} ids; at most ${READ_MESSAGES_MAX_LIMIT} messages come back per call, with has_more.` },
+            topic: { type: "string", description: "A topic key or its leading words, e.g. webapp: your messages under it and narrower topics." },
+            limit: { ...POSITIVE_INTEGER, description: `Messages per call, at most ${READ_MESSAGES_MAX_LIMIT}; a larger value returns ${READ_MESSAGES_MAX_LIMIT} with has_more.` },
+        }),
+    }, (values) => runTool("read_messages", () => {
+        const args = values as { handle?: string; message_ids?: number[]; topic?: string; limit?: number };
         const agentId = resolveAgentId(args.handle);
         // a limit over the maximum is read as "as many as allowed", not as a mistake to reject
         let limit: number | null = null;
@@ -258,15 +283,17 @@ export async function runBridge(): Promise<void> {
         return store.readMessages(agentId, { messageIds: args.message_ids ?? null, limit: limit, topic: args.topic ?? null });
     }));
 
-    server.registerTool("leave", {
+    registerTool({
+        name: "leave",
         description: "Finish your participation, leaving a final summary. Clears your editing list.",
-        inputSchema: {
-            handle: handleArgument,
-            summary: z.string().max(MAX_SUMMARY_LENGTH).optional(),
-            next_step: z.string().max(MAX_NEXT_STEP_LENGTH).optional().describe("What whoever continues should do next."),
-            checkpoint: z.string().max(MAX_CHECKPOINT_LENGTH).optional(),
-        },
-    }, (args) => runTool("leave", () => {
+        inputSchema: inputSchema({
+            handle: HANDLE_PROPERTY,
+            summary: { type: "string", maxLength: MAX_SUMMARY_LENGTH },
+            next_step: { type: "string", maxLength: MAX_NEXT_STEP_LENGTH, description: "What whoever continues should do next." },
+            checkpoint: { type: "string", maxLength: MAX_CHECKPOINT_LENGTH },
+        }),
+    }, (values) => runTool("leave", () => {
+        const args = values as { handle?: string; summary?: string; next_step?: string; checkpoint?: string };
         const agentId = resolveAgentId(args.handle);
         return store.leave(agentId, {
             summary: args.summary ?? null,
@@ -315,6 +342,19 @@ export async function runBridge(): Promise<void> {
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-    await server.connect(new StdioServerTransport());
+    serveStdio({
+        name: "concos",
+        version: CONCOS_VERSION,
+        instructions: SERVER_INSTRUCTIONS,
+        tools: tools,
+        callTool: (name, values) => {
+            const run = runners.get(name);
+            if(run == null) {
+                throw new Error(`tool ${name} is listed without a runner`);
+            }
+            return run(values);
+        },
+        logger: _logger,
+    });
     _logger.info(`concos ${CONCOS_VERSION} bridge ready`);
 }
