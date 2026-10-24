@@ -52,7 +52,8 @@ Registration always uses the client's user configuration. Register each client
 once, then use it across your projects.
 
 Existing files are backed up and unrelated settings are preserved. Conflicting
-commands are reported for review before writing.
+commands are reported for review before writing. A settings file with duplicate
+keys, or one that changed after the preview, is left as it is.
 
 Enable concos MCP in your client, then start a task in a new session.
 All participating clients and the terminal interface must use the same local
