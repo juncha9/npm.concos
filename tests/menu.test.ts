@@ -180,7 +180,7 @@ describe("room menu", () => {
         const output = await menu("status\nmessages\n1\nback\nquit\n");
         expect(output).toContain("Server (Codex) (1 unread)");
         expect(output).toContain(" Agents 1  [Messages 1]");
-        expect(output).toMatch(/1\) #1 \[QUESTION\] {2}Reviewer (→|->) Server \(Codex\) +just now · Pending 1/);
+        expect(output).toMatch(/1\) #1 \[QUESTION\] {2}Reviewer (→|->) Server \(Codex\) +just now · Pending Server/);
         const list = output.slice(output.indexOf("[Messages 1]"), output.indexOf("From  Reviewer"));
         expect(list).not.toContain("Last line of the complete message");
         expect(list).toMatch(/Original message text.*(…|\.\.\.)/);
@@ -366,9 +366,23 @@ describe("ended sessions on the board", () => {
         const list = output.slice(output.indexOf("[Messages 1]"));
         expect(list).toContain("still open");
         expect(list).toMatch(/Live \(Codex\) (→|->) Other \(Codex\)/);
-        expect(list).toContain("Pending 1");
+        expect(list).toContain("Pending Other");
         expect(list).not.toContain("already handled");
-        expect(list).not.toContain("resolved");
+        expect(list).toContain("Show earlier messages (1)");
+    });
+
+    it("keeps received messages behind Show earlier messages until they are deleted", async () => {
+        const { database, store, live } = await seedWithEnded();
+        const other = store.join({ room: "main", displayName: "Other", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const done = store.sendMessage(live.agent_id, { to: other.agent_id, kind: "note", text: "already handled", replyTo: null, requestId: null });
+        store.acknowledge(other.agent_id, [done.message_id]);
+        database.close();
+
+        const output = await menu("status\nmessages\nearlier\nback\nquit\n");
+        const shown = output.slice(output.lastIndexOf("Earlier messages"));
+        expect(shown).toContain("already handled");
+        expect(shown).not.toContain("Pending");
+        expect(output).toContain("Hide earlier messages");
     });
 
     it("sweeps residue when the board opens", async () => {
@@ -376,8 +390,8 @@ describe("ended sessions on the board", () => {
         const other = store.join({ room: "main", displayName: "Other", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
         const done = store.sendMessage(live.agent_id, { to: other.agent_id, kind: "note", text: "handled", replyTo: null, requestId: null });
         store.acknowledge(other.agent_id, [done.message_id]);
-        const longAgo = new Date(Date.now() - 60 * 60_000).toISOString();
-        database.prepare("UPDATE message_receipt SET received_at = :at WHERE message_id = :id").run({ at: longAgo, id: done.message_id });
+        const pastLifetime = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+        database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: pastLifetime, id: done.message_id });
         database.close();
 
         await menu("status\nback\nquit\n");

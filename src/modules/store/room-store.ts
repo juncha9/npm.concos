@@ -21,8 +21,10 @@ import {
     MAX_TOPICS_PER_MESSAGE,
     MIN_TOPIC_KEY_LENGTH,
     OFFLINE_AFTER_MS,
-    RESOLVED_MESSAGE_GRACE_MS,
-    UNDELIVERED_MESSAGE_RETENTION_MS,
+    AWAIT_AFTER_MS,
+    LATE_BROADCAST_LIMIT,
+    LATE_BROADCAST_NEW_WINDOW_MS,
+    MESSAGE_LIFETIME_MS,
     READ_MESSAGES_DEFAULT_LIMIT,
     RECIPIENT_ALL,
     SHARED_ROOM,
@@ -279,11 +281,12 @@ export interface RoomOverviewMessage {
     /** Topic keys in the sender's order; the first is the one the board groups by. */
     topics: string[];
     /**
-     * Every active recipient has acknowledged it. Ended and left recipients are not waited for,
-     * or a message to a session that closed would stay open forever; one that comes back reopens it.
+     * No recipient it waits on still has to acknowledge it, so the board hides it until it is
+     * deleted. Only agents that acted within AWAIT_AFTER_MS, and people, are waited on: a closed or
+     * idle session would otherwise keep it open forever; one that acts again reopens it.
      */
     resolved: boolean;
-    /** Names of active recipients who have not acknowledged it yet. */
+    /** Names of recipients it waits on who have not acknowledged it yet. */
     waiting_on: string[];
     waiting_on_participants: RoomOverviewParticipant[];
     kind: MessageKind;
@@ -356,6 +359,21 @@ const ACTIVE_AGENT_CONDITION = `(
 /** The `:active_since` value for `ACTIVE_AGENT_CONDITION`; stored times are ISO UTC, so text order is time order. */
 function activeSince(nowMs: number): string {
     return new Date(nowMs - ENDED_AFTER_MS).toISOString();
+}
+
+/**
+ * SQL condition on alias `A` for a participant a message still waits on: a person at the CLI, or
+ * an agent whose session is connected and itself called concos or ran a hook since
+ * `:awaited_since`. A session left idle keeps its heartbeat, but nobody waits on it.
+ */
+const AWAITED_CONDITION = `(
+    A.left_at IS NULL
+    AND (A.is_human = 1 OR (A.disconnected_at IS NULL AND A.last_call_at >= :awaited_since))
+)`;
+
+/** The `:awaited_since` value for `AWAITED_CONDITION`. */
+function awaitedSince(nowMs: number): string {
+    return new Date(nowMs - AWAIT_AFTER_MS).toISOString();
 }
 
 /** Lowercase, with spaces and hyphens turned into single underscores: `Webapp login-redirect` → `webapp_login_redirect`. */
@@ -601,7 +619,8 @@ export class RoomStore {
         }
         const workspacePath = resolveWorkspacePath(input.workspaceRoot ?? input.workingDirectory);
         const workingDirectory = path.resolve(input.workingDirectory);
-        const nowText = new Date().toISOString();
+        const nowMs = Date.now();
+        const nowText = new Date(nowMs).toISOString();
 
         return runInTransaction(this.database, () => {
             const session = input.hookSession;
@@ -649,6 +668,7 @@ export class RoomStore {
                         working_directory = :working_directory,
                         changed_seq = :changed_seq,
                         last_seen_at = :now,
+                        last_call_at = :now,
                         status = CASE WHEN left_at IS NOT NULL THEN 'working' ELSE status END,
                         disconnected_at = NULL,
                         left_at = NULL
@@ -662,6 +682,12 @@ export class RoomStore {
                     changed_seq: seq,
                     now: nowText,
                 });
+                // what it missed while away: sent after the card first joined and still alive
+                let missedSince = new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString();
+                if(resumed.joined_at > missedSince) {
+                    missedSince = resumed.joined_at;
+                }
+                this.receiveLateBroadcasts(resumed.id, room, missedSince);
                 return { agent_id: resumed.id, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
             }
 
@@ -670,11 +696,11 @@ export class RoomStore {
             this.prepare(`
                 INSERT INTO agent (
                     id, room, handle_hash, display_name, client, is_human, workspace_id, working_directory,
-                    changed_seq, joined_at, updated_at, last_seen_at, host, host_session_id
+                    changed_seq, joined_at, updated_at, last_seen_at, last_call_at, host, host_session_id
                 )
                 VALUES (
                     :id, :room, :handle_hash, :display_name, :client, 0, :workspace_id, :working_directory,
-                    :changed_seq, :now, :now, :now, :host, :host_session_id
+                    :changed_seq, :now, :now, :now, :now, :host, :host_session_id
                 )
             `).run({
                 id: agentId,
@@ -689,8 +715,31 @@ export class RoomStore {
                 host_session_id: session?.sessionId ?? null,
                 now: nowText,
             });
+            this.receiveLateBroadcasts(agentId, room, new Date(nowMs - LATE_BROADCAST_NEW_WINDOW_MS).toISOString());
             return { agent_id: agentId, handle: handle, room: room, workspace_id: workspaceId, resumed: false };
         });
+    }
+
+    /**
+     * Gives a session that joined or came back late the room-wide messages it has no receipt for:
+     * sent by others since `since`, newest first, at most LATE_BROADCAST_LIMIT. They then count as
+     * unread like any other message.
+     */
+    private receiveLateBroadcasts(agentId: string, room: string, since: string): void {
+        this.prepare(`
+            INSERT INTO message_receipt (message_id, agent_id)
+            SELECT M.id, :agent_id
+            FROM message AS M
+            WHERE M.room = :room
+                AND M.recipient_scope = 'all'
+                AND M.sender_agent_id <> :agent_id
+                AND M.created_at >= :since
+                AND NOT EXISTS (
+                    SELECT 1 FROM message_receipt AS MR WHERE MR.message_id = M.id AND MR.agent_id = :agent_id
+                )
+            ORDER BY M.seq DESC
+            LIMIT :limit
+        `).run({ agent_id: agentId, room: room, since: since, limit: LATE_BROADCAST_LIMIT });
     }
 
     /**
@@ -782,7 +831,7 @@ export class RoomStore {
                 if(continueFor.length > 0) {
                     this.prepare(`
                         UPDATE agent
-                        SET hook_nudged_seq = :nudged_seq, last_seen_at = :now, disconnected_at = NULL
+                        SET hook_nudged_seq = :nudged_seq, last_seen_at = :now, last_call_at = :now, disconnected_at = NULL
                         WHERE id = :id
                     `).run({ nudged_seq: continueFor[continueFor.length - 1].seq, now: now, id: row.id });
                     return { agentId: row.id, continueFor: continueFor };
@@ -809,7 +858,7 @@ export class RoomStore {
                     revision = revision + :changed, changed_seq = :seq,
                     updated_at = CASE WHEN :changed THEN :now ELSE updated_at END,
                     editing_updated_at = CASE WHEN :editing_changed THEN :now ELSE editing_updated_at END,
-                    last_seen_at = :now, disconnected_at = :disconnected,
+                    last_seen_at = :now, last_call_at = :now, disconnected_at = :disconnected,
                     wake_generation = wake_generation + :wake_step
                 WHERE id = :id
             `).run({
@@ -957,7 +1006,7 @@ export class RoomStore {
             const cardChanged = fieldsChanged == true || displayName != current.display_name;
             if(cardChanged == false && checkpoint == "") {
                 this.prepare(`
-                    UPDATE agent SET last_seen_at = :now, disconnected_at = NULL WHERE id = :id
+                    UPDATE agent SET last_seen_at = :now, last_call_at = :now, disconnected_at = NULL WHERE id = :id
                 `).run({ now: nowText, id: agentId });
                 return this.requireAgent(agentId);
             }
@@ -985,6 +1034,7 @@ export class RoomStore {
                     updated_at = :now,
                     editing_updated_at = :editing_updated_at,
                     last_seen_at = :now,
+                    last_call_at = :now,
                     disconnected_at = NULL
                 WHERE id = :id
             `).run({
@@ -1604,6 +1654,7 @@ export class RoomStore {
                     updated_at = :now,
                     editing_updated_at = :now,
                     last_seen_at = :now,
+                    last_call_at = :now,
                     left_at = :now
                 WHERE id = :id
             `).run({ ...values, changed_seq: this.nextSeq(), now: nowText, id: agentId });
@@ -1619,14 +1670,13 @@ export class RoomStore {
     }
 
     /**
-     * Deletes messages, with their receipts, that no active participant is waiting on any more.
+     * Deletes messages, with their receipts and topics, once they outlived MESSAGE_LIFETIME_MS,
+     * read or not: the store holds the last day of messages and no more.
      *
      * Flow:
-     *  1) Candidates: nothing pending on an active agent, and either fully acknowledged past
-     *     RESOLVED_MESSAGE_GRACE_MS, or sent past UNDELIVERED_MESSAGE_RETENTION_MS (only ended or
-     *     left sessions, or a person who never opened it, still owe an acknowledgement)
+     *  1) Candidates: sent before the lifetime began
      *  2) Keep any candidate that a remaining message replies to, until that reply goes as well
-     *  3) Delete receipts, then messages, in one transaction
+     *  3) Delete receipts, topics, then messages, in one transaction
      *
      * Returns the number of messages deleted.
      */
@@ -1634,36 +1684,8 @@ export class RoomStore {
         return runInTransaction(this.database, () => {
             // (1) Candidates
             const candidates = this.prepare(`
-                SELECT M.id
-                FROM message AS M
-                WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM message_receipt AS MR
-                        JOIN agent AS A
-                            ON A.id = MR.agent_id
-                        WHERE MR.message_id = M.id
-                            AND MR.received_at IS NULL
-                            AND A.is_human = 0
-                            AND ${ACTIVE_AGENT_CONDITION}
-                    )
-                    AND (
-                        (
-                            NOT EXISTS (
-                                SELECT 1 FROM message_receipt AS MR
-                                WHERE MR.message_id = M.id AND MR.received_at IS NULL
-                            )
-                            AND COALESCE(
-                                (SELECT MAX(MR.received_at) FROM message_receipt AS MR WHERE MR.message_id = M.id),
-                                M.created_at
-                            ) < :resolved_before
-                        )
-                        OR M.created_at < :undelivered_before
-                    )
-            `).all({
-                active_since: activeSince(nowMs),
-                resolved_before: new Date(nowMs - RESOLVED_MESSAGE_GRACE_MS).toISOString(),
-                undelivered_before: new Date(nowMs - UNDELIVERED_MESSAGE_RETENTION_MS).toISOString(),
-            }) as { id: number }[];
+                SELECT M.id FROM message AS M WHERE M.created_at < :lifetime_start
+            `).all({ lifetime_start: new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString() }) as { id: number }[];
             if(candidates.length == 0) {
                 return 0;
             }
@@ -1709,7 +1731,7 @@ export class RoomStore {
      * still in use. Safe to call often: each step only touches rows past its retention.
      *
      * Flow:
-     *  1) Messages no active agent waits on (`purgeMessages`)
+     *  1) Messages past their lifetime (`purgeMessages`)
      *  2) Agent cards silent past AGENT_RETENTION_MS, with their checkpoints and receipts, once no
      *     message still names them; people at the CLI are kept
      *  3) Checkpoints beyond the newest CHECKPOINT_KEEP_PER_AGENT of each agent
@@ -1804,7 +1826,7 @@ export class RoomStore {
     recordCall(agentId: string, deliveredMessageIds: number[]): void {
         runInTransaction(this.database, () => {
             this.prepare(`
-                UPDATE agent SET last_seen_at = :now, disconnected_at = NULL
+                UPDATE agent SET last_seen_at = :now, last_call_at = :now, disconnected_at = NULL
                 WHERE id = :id AND left_at IS NULL
             `).run({ now: new Date().toISOString(), id: agentId });
             this.acknowledge(agentId, deliveredMessageIds);
@@ -1974,15 +1996,16 @@ export class RoomStore {
                         ON G.id = GR.agent_id
                     WHERE GR.message_id = M.id
                 ) AS group_participants,
-                -- active recipients who have not acknowledged it yet, including their clients
+                -- recipients it still waits on who have not acknowledged it yet, including their clients,
+                -- by name so the row a refresh redraws names the same people in the same order
                 (
-                    SELECT json_group_array(json_object('name', A.display_name, 'client', A.client, 'human', A.is_human))
+                    SELECT json_group_array(json_object('name', A.display_name, 'client', A.client, 'human', A.is_human) ORDER BY A.display_name)
                     FROM message_receipt AS MR
                     JOIN agent AS A
                         ON A.id = MR.agent_id
                     WHERE MR.message_id = M.id
                         AND MR.received_at IS NULL
-                        AND ${ACTIVE_AGENT_CONDITION}
+                        AND ${AWAITED_CONDITION}
                 ) AS waiting_on
             FROM message AS M
             JOIN agent AS S
@@ -1992,7 +2015,7 @@ export class RoomStore {
             WHERE M.room = :room
             ORDER BY M.seq DESC
             LIMIT :limit
-        `).all({ room: room, limit: messageLimit, active_since: activeSince(nowMs) }) as {
+        `).all({ room: room, limit: messageLimit, awaited_since: awaitedSince(nowMs) }) as {
             id: number;
             created_at: string;
             from_name: string;

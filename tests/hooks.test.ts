@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase } from "../src/modules/store/database";
 import { SCHEMA_STEPS } from "../src/modules/store/schema";
@@ -272,15 +272,33 @@ describe("schema migration", () => {
         old.exec(SCHEMA_STEPS[0]);
         old.exec(SCHEMA_STEPS[1]);
         old.exec("PRAGMA user_version = 2");
-        const previous = new RoomStore(old);
-        const agents = Array.from({ length: 6 }, (_, index) => previous.join({
-            displayName: `Agent ${index}`, client: "test", workingDirectory: directory, workspaceRoot: null, resumeHandle: null,
-            ...(index == 0 ? { hookSession: { host: "claude", sessionId: "preserved-session" } } : {}),
-        }));
-        // Version 2 rows are written as SQL from here on: today's checkIn and sendMessage read and
-        // fill tables and columns that version 2 does not have.
+        // Version 2 rows are written as SQL: today's store reads and fills tables and columns that
+        // version 2 does not have. Handles are hashed as the store hashes them, and the hook
+        // session's handle comes from the version 2 secret, as session-start derives it.
         const nextSeq = () => (old.prepare("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'last_seq' RETURNING CAST(value AS INTEGER) AS seq").get() as { seq: number }).seq;
         const now = new Date().toISOString();
+        const workspaceId = "ws_version2";
+        old.prepare("INSERT INTO workspace (id, display_path, compare_path, is_verified, created_at) VALUES (?, ?, ?, 1, ?)")
+            .run(workspaceId, directory, directory, now);
+        const secret = (old.prepare("SELECT value FROM meta WHERE key = 'hook_handle_secret'").get() as { value: string }).value;
+        const agents = Array.from({ length: 6 }, (_, index) => {
+            const agentId = `agt_version2_${index}`;
+            let handle = `version2-handle-${index}`;
+            let host: string | null = null;
+            let sessionId: string | null = null;
+            if(index == 0) {
+                host = "claude";
+                sessionId = "preserved-session";
+                handle = createHmac("sha256", secret).update(JSON.stringify([host, sessionId])).digest("base64url");
+            }
+            old.prepare(`
+                INSERT INTO agent (id, room, handle_hash, display_name, client, workspace_id, working_directory,
+                    changed_seq, joined_at, updated_at, last_seen_at, host, host_session_id)
+                VALUES (?, 'main', ?, ?, 'test', ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(agentId, createHash("sha256").update(handle).digest("hex"), `Agent ${index}`, workspaceId, directory,
+                nextSeq(), now, now, now, host, sessionId);
+            return { agent_id: agentId, handle: handle, workspace_id: workspaceId };
+        });
         // agent 1 has already been delivered every old card before the message is recorded
         old.prepare("UPDATE agent SET delivered_seq = (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'last_seq') WHERE id = ?").run(agents[1].agent_id);
         const question = old.prepare(`

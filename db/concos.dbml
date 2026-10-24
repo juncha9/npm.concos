@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 6 · first required by concos 0.1.2. Every table is a record, not a cache.
+// Schema version 7 · first required by concos 0.1.3. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
@@ -43,6 +43,7 @@ Table agent {
   updated_at varchar [not null, note: 'last card or checkpoint change, not liveness']
   editing_updated_at varchar
   last_seen_at varchar [not null, note: 'bridge heartbeat']
+  last_call_at varchar [note: 'last concos tool call or hook event of the agent itself, never the heartbeat; messages wait only on agents that acted within 30 minutes. Schema 7 filled existing cards from updated_at']
   disconnected_at varchar
   left_at varchar
 
@@ -87,6 +88,8 @@ Table message {
     reply_to_message_id [name: 'idx_message_reply_to_message_id']
     workspace_id [name: 'idx_message_workspace_id']
   }
+
+  Note: 'Kept 24 hours after created_at, read or not; the board hides a message once no active participant still has to receive it. Then deleted, unless an agent active in the last 30 minutes still has to receive it or a kept reply answers it.'
 }
 
 Table message_receipt {
@@ -98,6 +101,8 @@ Table message_receipt {
     (message_id, agent_id) [pk]
     (agent_id, received_at) [name: 'idx_message_receipt_agent_id_received_at']
   }
+
+  Note: 'Room-wide messages: one receipt per connected agent when sent. A session that joins later gets receipts for the newest 5 sent in the last 4 hours; one that returns, for the newest 5 it missed within the message lifetime.'
 }
 
 Table message_topic {

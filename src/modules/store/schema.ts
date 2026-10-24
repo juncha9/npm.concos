@@ -188,4 +188,11 @@ export const SCHEMA_STEPS: readonly string[] = [
     ALTER TABLE agent ADD COLUMN wake_generation INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE agent ADD COLUMN woken_at_list TEXT NOT NULL DEFAULT '[]';
     `,
+    `
+    -- When the agent itself last acted: a concos tool call or a hook event, never the bridge
+    -- heartbeat. Messages wait only on agents that acted recently; existing cards start from
+    -- their last card change.
+    ALTER TABLE agent ADD COLUMN last_call_at TEXT;
+    UPDATE agent SET last_call_at = updated_at;
+    `,
 ];

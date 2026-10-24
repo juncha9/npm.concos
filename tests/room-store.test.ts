@@ -199,14 +199,42 @@ describe("messages", () => {
         expect(emptyCheckIn(server.agent_id).pending_count).toBe(1);
     });
 
-    it("gives a room-wide message only to participants present when it was sent", () => {
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60_000).toISOString();
+    const receivedIds = (agentId: string) => (database.prepare("SELECT message_id FROM message_receipt WHERE agent_id = :id ORDER BY message_id")
+        .all({ id: agentId }) as { message_id: number }[]).map((row) => row.message_id);
+    const notice = (from: string, text: string) => store.sendMessage(from, { to: "all", kind: "notice", text: text, replyTo: null, requestId: null }).message_id;
+
+    it("gives a room-wide message to everyone present, and to a session joining within four hours", () => {
         const ui = joinAgent("ui");
         const server = joinAgent("server");
         const sent = store.sendMessage(ui.agent_id, { to: "all", kind: "notice", text: "schema frozen", replyTo: null, requestId: null });
         expect(sent.recipient_count).toBe(1);
         const late = joinAgent("late");
-        expect(emptyCheckIn(late.agent_id).pending_count).toBe(0);
+        expect(emptyCheckIn(late.agent_id).pending_count).toBe(1);
         expect(emptyCheckIn(server.agent_id).pending_count).toBe(1);
+        database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: hoursAgo(5), id: sent.message_id });
+        expect(emptyCheckIn(joinAgent("later").agent_id).pending_count).toBe(0);
+    });
+
+    it("gives a new session at most the five newest room-wide messages", () => {
+        const ui = joinAgent("ui");
+        const ids = Array.from({ length: 7 }, (_, index) => notice(ui.agent_id, `notice ${index}`));
+        expect(receivedIds(joinAgent("late").agent_id)).toEqual(ids.slice(-5));
+    });
+
+    it("gives a returning session the room-wide messages it missed within a day, not its own", () => {
+        const ui = joinAgent("ui");
+        const away = joinAgent("away");
+        const mine = notice(away.agent_id, "from me");
+        store.disconnect([away.agent_id]);
+        // the card is days old, so the day-long lifetime is what limits the catch-up
+        database.prepare("UPDATE agent SET joined_at = :at WHERE id = :id").run({ at: hoursAgo(72), id: away.agent_id });
+        const stale = notice(ui.agent_id, "old news");
+        database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: hoursAgo(25), id: stale });
+        const missed = notice(ui.agent_id, "while you were away");
+        store.join({ room: "dev", displayName: "away", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: away.handle });
+        expect(receivedIds(away.agent_id)).toEqual([missed]);
+        expect(receivedIds(away.agent_id)).not.toContain(mine);
     });
 
     it("shares the waiting room across former room names and still requires reply_to", () => {
@@ -416,6 +444,19 @@ describe("resolved messages", () => {
         expect(messageState(sent.message_id)).toMatchObject({ resolved: true, waiting_on: [] });
     });
 
+    it("does not wait on a connected session idle past half an hour, and waits again once it acts", () => {
+        const sender = joinAgent("sender");
+        const idle = joinAgent("idle");
+        const sent = store.sendMessage(sender.agent_id, { to: idle.agent_id, kind: "note", text: "later", replyTo: null, requestId: null });
+        expect(messageState(sent.message_id)).toMatchObject({ resolved: false, waiting_on: ["idle"] });
+        // its bridge keeps beating, but the agent itself has not called concos for 31 minutes
+        database.prepare("UPDATE agent SET last_call_at = :at WHERE id = :id").run({ at: new Date(Date.now() - 31 * 60_000).toISOString(), id: idle.agent_id });
+        store.heartbeat([idle.agent_id]);
+        expect(messageState(sent.message_id)).toMatchObject({ resolved: true, waiting_on: [] });
+        store.recordCall(idle.agent_id, []);
+        expect(messageState(sent.message_id)).toMatchObject({ resolved: false, waiting_on: ["idle"] });
+    });
+
     it("does not wait on a recipient whose session ended, and reopens when it comes back", () => {
         const sender = joinAgent("sender");
         const away = joinAgent("away");
@@ -466,14 +507,14 @@ describe("clean-up", () => {
         return store.sendMessage(from, { to: to, kind: replyTo == null ? "note" : "reply", text: text, replyTo: replyTo, requestId: null }).message_id;
     }
 
-    it("deletes a fully acknowledged message with its receipts only after the grace period", () => {
+    it("keeps a message for a day, read or not, then deletes it with its receipts", () => {
         const sender = joinAgent("sender");
         const reader = joinAgent("reader");
         const id = send(sender.agent_id, reader.agent_id);
         store.acknowledge(reader.agent_id, [id]);
-        ageMessage(id, 9);
+        ageMessage(id, 23 * 60);
         expect(store.purgeMessages()).toBe(0);
-        ageMessage(id, 11);
+        ageMessage(id, 25 * 60);
         expect(store.purgeMessages()).toBe(1);
         expect(messageExists(id)).toBe(false);
         expect(receiptCount(id)).toBe(0);
@@ -484,18 +525,18 @@ describe("clean-up", () => {
         const reader = joinAgent("reader");
         const id = store.sendMessage(sender.agent_id, { to: reader.agent_id, kind: "note", text: "hello", replyTo: null, requestId: null, topics: ["concos_board"] }).message_id;
         store.acknowledge(reader.agent_id, [id]);
-        ageMessage(id, 11);
+        ageMessage(id, 25 * 60);
         expect(store.purgeMessages()).toBe(1);
         expect(database.prepare("SELECT COUNT(*) AS n FROM message_topic").get()).toMatchObject({ n: 0 });
     });
 
-    it("keeps a message an active agent has not acknowledged, however old", () => {
+    it("deletes a message past its lifetime even when an active agent never received it", () => {
         const sender = joinAgent("sender");
         const reader = joinAgent("reader");
         const id = send(sender.agent_id, reader.agent_id);
-        ageMessage(id, 3 * 24 * 60);
-        expect(store.purgeMessages()).toBe(0);
-        expect(messageExists(id)).toBe(true);
+        ageMessage(id, 25 * 60);
+        expect(store.purgeMessages()).toBe(1);
+        expect(messageExists(id)).toBe(false);
     });
 
     it("keeps a message owed only by an ended session or a person for a day, then deletes it", () => {
@@ -513,18 +554,18 @@ describe("clean-up", () => {
         expect(store.purgeMessages()).toBe(2);
     });
 
-    it("keeps a resolved message while a reply to it remains, and removes the thread together", () => {
+    it("keeps a message past its lifetime while a reply to it remains, and removes the thread together", () => {
         const asker = joinAgent("asker");
         const answerer = joinAgent("answerer");
         const question = send(asker.agent_id, answerer.agent_id, "which port?");
         store.acknowledge(answerer.agent_id, [question]);
         const answer = send(answerer.agent_id, asker.agent_id, "18201", question);
-        ageMessage(question, 30);
+        ageMessage(question, 25 * 60);
         expect(store.purgeMessages()).toBe(0);
         expect(messageExists(question)).toBe(true);
 
         store.acknowledge(asker.agent_id, [answer]);
-        ageMessage(answer, 30);
+        ageMessage(answer, 25 * 60);
         expect(store.purgeMessages()).toBe(2);
     });
 
@@ -533,7 +574,7 @@ describe("clean-up", () => {
         const answerer = joinAgent("answerer");
         const question = send(asker.agent_id, answerer.agent_id, "which port?");
         store.acknowledge(answerer.agent_id, [question]);
-        ageMessage(question, 30);
+        ageMessage(question, 25 * 60);
         expect(store.purgeMessages()).toBe(1);
         const late = store.sendMessage(answerer.agent_id, { to: asker.agent_id, kind: "reply", text: "18201", replyTo: question, requestId: null });
         expect(late.reply_target_removed).toBe(true);

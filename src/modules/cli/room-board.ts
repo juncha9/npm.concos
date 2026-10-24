@@ -13,8 +13,10 @@ import type { ActivityTab } from "./room-activity";
 
 const BOARD_REFRESH_MS = 1000;
 const ANIMATION_FRAME_MS = 140;
-/** Recent messages read for the Messages tab; open ones are shown, resolved ones counted. */
+/** Recent messages read for the Messages tab; open ones are shown, resolved ones behind a toggle. */
 const BOARD_MESSAGE_LIMIT = 50;
+/** Pending names shown on a message row before the rest become a count. */
+const PENDING_NAMES_SHOWN = 2;
 const DETAIL_CHECKPOINT_LIMIT = 3;
 const MESSAGE_BODY_INDENT = 2;
 const MESSAGE_PREVIEW_LINES = 3;
@@ -31,7 +33,7 @@ export interface RoomBoardOptions extends StatusRenderOptions {
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "back";
+type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:earlier" | "back";
 
 /** Left or ended: still on record, folded away on the board. */
 function isInactive(agent: RoomOverviewAgent): boolean {
@@ -224,14 +226,23 @@ function messageColumns(left: LinePart[], right: LinePart[], width: number): Lin
 /**
  * Open messages: structured metadata and three preview lines; Enter opens the full body.
  * Grouped by each message's first topic, groups in key order so related topics sit together
- * and messages without a topic last; newest first within a group.
+ * and messages without a topic last; newest first within a group. With `showEarlier`, the
+ * resolved messages still kept follow under their own heading, newest first.
  */
-function buildMessageItems(messages: RoomOverviewMessage[], style: Style, options: StatusRenderOptions, nowMs: number, activity: RoomActivity): SelectItem<BoardValue>[] {
+function buildMessageItems(
+    messages: RoomOverviewMessage[],
+    style: Style,
+    options: StatusRenderOptions,
+    nowMs: number,
+    activity: RoomActivity,
+    showEarlier: boolean,
+): SelectItem<BoardValue>[] {
     const english = options.language == "en";
     const arrow = options.unicode == false ? "->" : "→";
     const open = messages.filter((message) => message.resolved == false);
+    const items: SelectItem<BoardValue>[] = [];
     if(open.length == 0) {
-        return [{ separator: true, label: "", hint: english ? "No open messages." : "열린 메시지가 없습니다." }];
+        items.push({ separator: true, label: "", hint: english ? "No open messages." : "열린 메시지가 없습니다." });
     }
 
     const groups = new Map<string, RoomOverviewMessage[]>();
@@ -247,7 +258,6 @@ function buildMessageItems(messages: RoomOverviewMessage[], style: Style, option
     });
     // without any topic the tab looks as it did: no headings
     const headed = keys.length > 1 || keys[0] != "";
-    const items: SelectItem<BoardValue>[] = [];
     for(const key of keys) {
         const members = groups.get(key)!;
         if(headed == true) {
@@ -259,6 +269,17 @@ function buildMessageItems(messages: RoomOverviewMessage[], style: Style, option
         }
         members.forEach((message, index) => {
             items.push(messageRow(message, index < members.length - 1));
+        });
+    }
+    const earlier = messages.filter((message) => message.resolved == true).reverse();
+    if(showEarlier == true && earlier.length > 0) {
+        items.push({
+            separator: true,
+            label: english ? "Earlier messages" : "지난 메시지",
+            hint: english ? "received by everyone it waited on; kept for a day" : "받을 쪽이 모두 받음, 하루 동안 보관",
+        });
+        earlier.forEach((message, index) => {
+            items.push(messageRow(message, index < earlier.length - 1));
         });
     }
     return items;
@@ -297,11 +318,18 @@ function buildMessageItems(messages: RoomOverviewMessage[], style: Style, option
                 { text: ` ${arrow} `, paint: style.dim },
                 { text: recipient, paint: style.dim },
             );
-            const meta: LinePart[] = [
-                { text: age(message.at, nowMs, english), paint: style.dim },
-                { text: " · ", paint: style.dim },
-                { text: english ? `Pending ${message.waiting_on.length}` : `확인 대기 ${message.waiting_on.length}`, paint: style.warning },
-            ];
+            const meta: LinePart[] = [{ text: age(message.at, nowMs, english), paint: style.dim }];
+            if(message.waiting_on.length > 0) {
+                // who it waits on: two names, then a count of the rest
+                let names = message.waiting_on.slice(0, PENDING_NAMES_SHOWN).join(", ");
+                if(message.waiting_on.length > PENDING_NAMES_SHOWN) {
+                    names = `${message.waiting_on[0]} +${message.waiting_on.length - 1}`;
+                }
+                meta.push(
+                    { text: " · ", paint: style.dim },
+                    { text: english ? `Pending ${names}` : `확인 대기 ${names}`, paint: style.warning },
+                );
+            }
             const badge = activity.badge(`message:${message.id}`, style);
             const headerWidth = [...title, ...badge, ...meta].reduce((sum, part) => sum + displayWidth(part.text), 0);
             if(headerWidth + 2 <= width) title.push(...badge);
@@ -335,7 +363,7 @@ function buildView(
     style: Style,
     options: StatusRenderOptions,
     tab: BoardTab,
-    toggles: { showEnded: boolean },
+    toggles: { showEnded: boolean; showEarlier: boolean },
     activity: RoomActivity,
 ): BoardView {
     const english = options.language == "en";
@@ -347,8 +375,10 @@ function buildView(
 
     let items: SelectItem<BoardValue>[];
     let inactiveCount = 0;
+    let earlierCount = 0;
     if(tab == "tab:messages") {
-        items = buildMessageItems(overview.messages, style, options, nowMs, activity);
+        items = buildMessageItems(overview.messages, style, options, nowMs, activity, toggles.showEarlier);
+        earlierCount = overview.messages.filter((message) => message.resolved == true).length;
     }
     else {
         const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true);
@@ -362,6 +392,13 @@ function buildView(
             toggleLabel = english ? "Hide ended sessions" : "종료된 세션 숨기기";
         }
         items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
+    }
+    if(earlierCount > 0) {
+        let toggleLabel = english ? `Show earlier messages (${earlierCount})` : `지난 메시지 보기 (${earlierCount})`;
+        if(toggles.showEarlier == true) {
+            toggleLabel = english ? "Hide earlier messages" : "지난 메시지 숨기기";
+        }
+        items.push({ value: "toggle:earlier", key: "earlier", label: toggleLabel });
     }
     items.push({ value: "back", label: english ? "Back" : "뒤로" });
 
@@ -469,7 +506,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
         // opening the board sweeps too, so residue goes even when no agent bridge is running
         store.cleanUp();
         let tab: BoardTab = "tab:agents";
-        const toggles = { showEnded: false };
+        const toggles = { showEnded: false, showEarlier: false };
         const activity = new RoomActivity(prompter.isInteractive, prompter.motionEnabled, options.unicode ?? true, english);
         const loadView = () => buildView(store, prompter.paint, options, tab, toggles, activity);
         let view = loadView();
@@ -510,6 +547,12 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             }
             if(picked == "toggle:ended") {
                 toggles.showEnded = toggles.showEnded == false;
+                selected[tab] = picked;
+                view = loadView();
+                continue;
+            }
+            if(picked == "toggle:earlier") {
+                toggles.showEarlier = toggles.showEarlier == false;
                 selected[tab] = picked;
                 view = loadView();
                 continue;
