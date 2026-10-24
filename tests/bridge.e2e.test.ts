@@ -1,0 +1,354 @@
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+// runs the built bundle the way an MCP host does; `npm test` builds it first
+const CLI_PATH = path.resolve("dist/cli.js");
+const E2E_TIMEOUT_MS = 30000;
+
+let dataDirectory: string;
+let workDirectory: string;
+const openClients: Client[] = [];
+
+function childEnvironment(): Record<string, string> {
+    const environment: Record<string, string> = {};
+    for(const [key, value] of Object.entries(process.env)) {
+        if(value != null) {
+            environment[key] = value;
+        }
+    }
+    environment.CONCOS_HOME = dataDirectory;
+    return environment;
+}
+
+async function connectBridge(cwd = workDirectory): Promise<Client> {
+    const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [CLI_PATH, "mcp"],
+        env: childEnvironment(),
+        cwd,
+        stderr: "pipe",
+    });
+    const client = new Client({ name: "concos-e2e", version: "0.0.0" });
+    await client.connect(transport);
+    openClients.push(client);
+    return client;
+}
+
+async function callTool(client: Client, name: string, args: Record<string, unknown>): Promise<Record<string, any>> {
+    const result = await client.callTool({ name: name, arguments: args });
+    const content = result.content as { type: string; text: string }[];
+    if(result.isError == true) {
+        throw new Error(`${name} failed: ${content[0].text}`);
+    }
+    return JSON.parse(content[0].text);
+}
+
+beforeEach(() => {
+    dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "concos-e2e-"));
+    workDirectory = path.join(dataDirectory, "work");
+    fs.mkdirSync(workDirectory);
+});
+
+afterEach(async () => {
+    for(const client of openClients.splice(0)) {
+        await client.close();
+    }
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+});
+
+describe("concos mcp over stdio", () => {
+    it("shares user hooks, status and messages across projects without room selectors", async () => {
+        const otherDirectory = path.join(dataDirectory, "other-project");
+        fs.mkdirSync(otherDirectory);
+        const start = (host: string, cwd: string) => {
+            const output = JSON.parse(execFileSync(process.execPath, [CLI_PATH, "hook", "session-start", "--host", host], {
+                env: childEnvironment(), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+                input: JSON.stringify({ session_id: `${host}-user-session`, cwd }),
+            }));
+            return /handle=([\w-]+)/.exec(output.hookSpecificOutput.additionalContext)![1];
+        };
+        const firstHandle = start("claude", workDirectory);
+        const secondHandle = start("codex", otherDirectory);
+        const first = await connectBridge(workDirectory);
+        const second = await connectBridge(otherDirectory);
+        const joined = await callTool(first, "join", { display_name: "First", client: "Claude Code", working_directory: workDirectory, resume_handle: firstHandle });
+        const peer = await callTool(second, "join", { display_name: "Second", client: "Codex", working_directory: otherDirectory, resume_handle: secondHandle });
+        expect(joined.room).toBe("main");
+        expect(peer.room).toBe("main");
+        expect(joined.workspace_id).not.toBe(peer.workspace_id);
+        expect((await first.listTools()).tools.find((tool) => tool.name == "join")!.inputSchema.properties).not.toHaveProperty("room");
+        await callTool(first, "send_message", { to: peer.agent_id, kind: "question", text: "Across projects" });
+        execFileSync(process.execPath, [CLI_PATH, "say", peer.agent_id, "Status from another project", "--kind", "question"], {
+            cwd: workDirectory, env: childEnvironment(), stdio: "pipe",
+        });
+        const inbox = await callTool(second, "read_messages", {});
+        expect(inbox.messages.map((message: any) => message.text)).toEqual(["Across projects", "Status from another project"]);
+        const overview = JSON.parse(execFileSync(process.execPath, [CLI_PATH, "status", "--json"], {
+            cwd: otherDirectory, env: childEnvironment(), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+        }));
+        expect(overview).toHaveLength(1);
+        expect(overview[0].room).toBe("main");
+        expect(overview[0].agents.filter((agent: any) => !agent.human)).toHaveLength(2);
+        expect(overview[0].agents.find((agent: any) => agent.agent_id == peer.agent_id).pending_count).toBe(2);
+    }, E2E_TIMEOUT_MS);
+
+    it("answers the scripted commands in English", () => {
+        const run = (...args: string[]) => spawnSync(process.execPath, [CLI_PATH, ...args], {
+            cwd: workDirectory, env: childEnvironment(), encoding: "utf8",
+        });
+        expect(run("status").stdout).toContain("No agents have joined the shared waiting room yet.");
+        expect(run("say").stderr).toContain("concos: say: name a recipient");
+        expect(run("say", "all", "Hello", "--kind", "shout").stderr).toContain("concos: --kind must be one of");
+        expect(run("say", "all").stderr).toContain("concos: say: add the message text after the recipient");
+        expect(run("say", "all", "Schema is frozen").stdout).toContain("stored · Room main");
+    }, E2E_TIMEOUT_MS);
+
+    it("shows the copyright notice in the help text and under the hashbang of every built file", () => {
+        const help = spawnSync(process.execPath, [CLI_PATH, "--help"], { env: childEnvironment(), encoding: "utf8" });
+        expect(help.stdout.split("\n")[1]).toBe("Copyright (C) 2026 juncha9 · AGPL-3.0-or-later · https://github.com/juncha9/npm.concos");
+        const distDirectory = path.dirname(CLI_PATH);
+        for(const file of fs.readdirSync(distDirectory).filter((name) => name.endsWith(".js"))) {
+            const [hashbang, notice] = fs.readFileSync(path.join(distDirectory, file), "utf8").split("\n");
+            expect(hashbang, file).toBe("#!/usr/bin/env node");
+            expect(notice, file).toBe("/*! concos | Copyright (C) 2026 juncha9 | AGPL-3.0-or-later | https://github.com/juncha9/npm.concos */");
+        }
+    });
+
+    it("adds caller-specific inbox counts to all six tools and keeps hook events from consuming messages", async () => {
+        const hook = (kind: string, extra: Record<string, unknown> = {}) => JSON.parse(execFileSync(process.execPath,
+            [CLI_PATH, "hook", kind, "--host", "claude", "--room", "e2e"], {
+                env: childEnvironment(), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+                input: JSON.stringify({ session_id: "host-session", cwd: workDirectory, ...extra }),
+            }));
+        const started = hook("session-start");
+        const handle = /handle=([\w-]+)/.exec(started.hookSpecificOutput.additionalContext)![1];
+        const database = new DatabaseSync(path.join(dataDirectory, "concos.db"));
+        const recipient = database.prepare("SELECT id FROM agent WHERE host_session_id = 'host-session'").get() as { id: string };
+        database.close();
+        const sender = await connectBridge();
+        const first = await callTool(sender, "join", { display_name: "sender", client: "test", working_directory: workDirectory });
+        expect(first.inbox).toBeUndefined();
+        const question = await callTool(sender, "send_message", { to: recipient.id, kind: "question", text: "Please review" });
+        const note = await callTool(sender, "send_message", { to: recipient.id, kind: "notice", text: "FYI" });
+        const receiver = await connectBridge();
+        const resumed = await callTool(receiver, "join", { display_name: "receiver", client: "test", working_directory: workDirectory, resume_handle: handle });
+        expect(resumed.agent_id).toBe(recipient.id);
+        expect(resumed.inbox).toEqual({ questions: 1, notes: 1 });
+        expect(hook("prompt").hookSpecificOutput.additionalContext).toContain(`unread for you — question #${question.message_id} from sender`);
+        hook("file-edited", { tool_name: "Edit", tool_input: { file_path: path.join(workDirectory, "x.ts") } });
+        // until something delivers them, every tool reports the caller's unread messages
+        for(const [tool, args] of [
+            ["inspect_agent", { agent_id: first.agent_id }],
+            ["send_message", { to: first.agent_id, text: "reply", kind: "reply", reply_to: question.message_id }],
+        ] as const) {
+            const result = await callTool(receiver, tool, args);
+            expect(result.inbox).toEqual({ questions: 1, notes: 1 });
+        }
+        // check_in delivers both in full: they leave this response's inbox and are received on the next call
+        const delivered = await callTool(receiver, "check_in", {});
+        expect(delivered.room.messages.map((message: any) => message.id)).toEqual([question.message_id, note.message_id]);
+        expect(delivered.inbox).toBeUndefined();
+        const receivedAt = () => {
+            const check = new DatabaseSync(path.join(dataDirectory, "concos.db"));
+            const rows = check.prepare("SELECT received_at FROM message_receipt WHERE agent_id = :id ORDER BY message_id").all({ id: recipient.id }) as { received_at: string | null }[];
+            check.close();
+            return rows.map((row) => row.received_at != null);
+        };
+        expect(receivedAt()).toEqual([false, false]);
+        // Switching handles must not leak the last-joined participant's unread counts.
+        const other = await callTool(receiver, "join", { display_name: "other", client: "test", working_directory: workDirectory });
+        expect(other.inbox).toBeUndefined();
+        expect((await callTool(receiver, "inspect_agent", { handle, agent_id: first.agent_id })).inbox).toBeUndefined();
+        expect(receivedAt()).toEqual([true, true]);
+        hook("turn-end");
+        const inspected = await callTool(receiver, "inspect_agent", { handle, agent_id: recipient.id });
+        expect(inspected.card).toMatchObject({ status: "waiting", editing: [] });
+        const left = await callTool(receiver, "leave", { handle });
+        expect(left.inbox).toBeUndefined();
+        await callTool(receiver, "join", { display_name: "receiver", client: "test", working_directory: workDirectory, resume_handle: handle });
+        const cleared = await callTool(receiver, "check_in", { received_message_ids: [question.message_id, note.message_id] });
+        expect(cleared.inbox).toBeUndefined();
+        expect(hook("prompt")).toEqual({});
+        hook("session-end");
+        // seen from another agent: a call from the ended session itself would bring it back
+        expect((await callTool(sender, "inspect_agent", { agent_id: recipient.id })).card.online).toBe(false);
+    }, E2E_TIMEOUT_MS);
+
+    it("acknowledges a truncated message only after read_messages delivered its whole text, on the next call", async () => {
+        const writer = await connectBridge();
+        const reader = await connectBridge();
+        await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const joined = await callTool(reader, "join", { display_name: "reader", client: "test", working_directory: workDirectory });
+        const sent = await callTool(writer, "send_message", { to: joined.agent_id, text: "long ".repeat(200) });
+        const receivedAt = () => {
+            const check = new DatabaseSync(path.join(dataDirectory, "concos.db"));
+            const row = check.prepare("SELECT received_at FROM message_receipt WHERE message_id = :id").get({ id: sent.message_id }) as { received_at: string | null };
+            check.close();
+            return row.received_at;
+        };
+
+        const preview = await callTool(reader, "check_in", {});
+        expect(preview.room.messages[0]).toMatchObject({ id: sent.message_id, truncated: true });
+        expect(preview.inbox).toEqual({ questions: 0, notes: 1 });
+        await callTool(reader, "check_in", {});
+        expect(receivedAt()).toBeNull();
+
+        const full = await callTool(reader, "read_messages", {});
+        expect(full.messages[0].text.length).toBeGreaterThan(900);
+        expect(full.inbox).toBeUndefined();
+        expect(receivedAt()).toBeNull();
+        await callTool(reader, "check_in", {});
+        expect(receivedAt()).not.toBeNull();
+    }, E2E_TIMEOUT_MS);
+
+    it("reads a count over the maximum as the maximum, states the limits, and renames through check_in", async () => {
+        const writer = await connectBridge();
+        const reader = await connectBridge();
+        const wrote = await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const joined = await callTool(reader, "join", { display_name: "reader", client: "test", working_directory: workDirectory });
+        for(let index = 0; index < 12; index += 1) {
+            await callTool(writer, "send_message", { to: joined.agent_id, text: `message ${index}` });
+        }
+
+        const page = await callTool(reader, "read_messages", { limit: 20 });
+        expect(page.messages).toHaveLength(10);
+        expect(page.has_more).toBe(true);
+        const inspected = await callTool(reader, "inspect_agent", { agent_id: wrote.agent_id, checkpoint_limit: 50 });
+        expect(inspected.card.agent_id).toBe(wrote.agent_id);
+        const readTool = (await reader.listTools()).tools.find((tool) => tool.name == "read_messages")!;
+        expect(JSON.stringify(readTool.inputSchema)).toContain("at most 10");
+
+        await callTool(reader, "check_in", { display_name: "Dev / API 09" });
+        expect((await callTool(writer, "inspect_agent", { agent_id: joined.agent_id })).card.name).toBe("Dev / API 09");
+    }, E2E_TIMEOUT_MS);
+
+    it("sends one message to a list of agents under topics, and reads a topic back with its narrower ones", async () => {
+        const writer = await connectBridge();
+        const first = await connectBridge();
+        const second = await connectBridge();
+        await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const one = await callTool(first, "join", { display_name: "one", client: "test", working_directory: workDirectory });
+        const two = await callTool(second, "join", { display_name: "two", client: "test", working_directory: workDirectory });
+        await callTool(writer, "send_message", { to: one.agent_id, text: "tabs first pass", topics: ["concos_board_tabs"] });
+        const sent = await callTool(writer, "send_message", { to: [one.agent_id, two.agent_id], text: "layout review", topics: ["concos board"] });
+        expect(sent).toMatchObject({ recipient_count: 2, similar_topics: ["concos_board_tabs"] });
+
+        const received = await callTool(second, "check_in", {});
+        expect(received.room.messages).toEqual([expect.objectContaining({ id: sent.message_id, to: "group", topics: ["concos_board"] })]);
+        const byTopic = await callTool(first, "read_messages", { topic: "concos_board" });
+        expect(byTopic.messages.map((message: { text: string }) => message.text)).toEqual(["tabs first pass", "layout review"]);
+    }, E2E_TIMEOUT_MS);
+
+    it("shares reported status and messages between separate bridge processes without hooks", async () => {
+        const claude = await connectBridge();
+        const codex = await connectBridge();
+
+        const tools = await claude.listTools();
+        expect(tools.tools.map((tool) => tool.name).sort()).toEqual(
+            ["check_in", "inspect_agent", "join", "leave", "read_messages", "send_message"]
+        );
+        expect(claude.getInstructions()).toContain("check_in");
+
+        const ui = await callTool(claude, "join", { display_name: "UI", client: "Claude Code", working_directory: workDirectory });
+        const server = await callTool(codex, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
+        expect(ui.room).toBe("main");
+        await callTool(claude, "check_in", {});
+
+        await callTool(codex, "check_in", { status: "working", task: "message storage", editing: ["src/messages.ts"] });
+        const seen = await callTool(claude, "check_in", {});
+        expect(seen.room.agents).toEqual([
+            expect.objectContaining({ agent_id: server.agent_id, task: "message storage", editing: ["src/messages.ts"] }),
+        ]);
+
+        const sent = await callTool(claude, "send_message", { to: server.agent_id, kind: "question", text: "Does the response carry message_id?" });
+        const received = await callTool(codex, "check_in", {});
+        expect(received.room.messages).toEqual([expect.objectContaining({ id: sent.message_id, kind: "question", from: ui.agent_id })]);
+        // delivered in full in this very answer, so it is no longer counted as waiting
+        expect(received.inbox).toBeUndefined();
+
+        const acknowledged = await callTool(codex, "check_in", { received_message_ids: [sent.message_id] });
+        expect(acknowledged.inbox).toBeUndefined();
+        expect(acknowledged.you.revision).toBeGreaterThan(0);
+        expect(acknowledged.room).toMatchObject({ changed: false });
+
+        await callTool(codex, "check_in", { status: "waiting", editing: [] });
+        const waiting = await callTool(claude, "inspect_agent", { agent_id: server.agent_id });
+        expect(waiting.card).toMatchObject({ status: "waiting", editing: [], online: true });
+
+        const statusJson = execFileSync(process.execPath, [CLI_PATH, "status", "--room", "e2e", "--json"], {
+            env: childEnvironment(),
+            encoding: "utf8",
+        });
+        const overview = JSON.parse(statusJson)[0];
+        expect(overview.agents.map((agent: { name: string }) => agent.name).sort()).toEqual(["Server", "UI"]);
+        expect(overview.messages[0].text).toBe("Does the response carry message_id?");
+    }, E2E_TIMEOUT_MS);
+
+    it("exits when stdin closes and releases the editing claim", async () => {
+        const child = spawn(process.execPath, [CLI_PATH, "mcp"], {
+            env: childEnvironment(),
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        const responses = new Map<number, any>();
+        let buffered = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+            buffered += chunk;
+            let newline = buffered.indexOf("\n");
+            while(newline >= 0) {
+                const line = buffered.slice(0, newline).trim();
+                buffered = buffered.slice(newline + 1);
+                if(line != "") {
+                    const message = JSON.parse(line);
+                    responses.set(message.id, message);
+                }
+                newline = buffered.indexOf("\n");
+            }
+        });
+        const request = async (id: number, method: string, params: unknown): Promise<any> => {
+            child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: id, method: method, params: params })}\n`);
+            for(let attempt = 0; attempt < 200; attempt++) {
+                if(responses.has(id) == true) {
+                    return responses.get(id);
+                }
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            throw new Error(`no response to ${method}`);
+        };
+
+        await request(1, "initialize", {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "raw", version: "0" },
+        });
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+        const joined = await request(2, "tools/call", {
+            name: "join",
+            arguments: { display_name: "Server", client: "raw", working_directory: workDirectory },
+        });
+        const agentId = JSON.parse(joined.result.content[0].text).agent_id;
+        await request(3, "tools/call", { name: "check_in", arguments: { editing: ["src/a.ts"] } });
+
+        const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+        const startedAt = Date.now();
+        child.stdin.end();
+        const exitCode = await exited;
+        expect(exitCode).toBe(0);
+        expect(Date.now() - startedAt).toBeLessThan(5000);
+
+        const database = new DatabaseSync(path.join(dataDirectory, "concos.db"));
+        const row = database.prepare("SELECT editing_list, disconnected_at FROM agent WHERE id = :id").get({ id: agentId }) as {
+            editing_list: string;
+            disconnected_at: string | null;
+        };
+        database.close();
+        expect(row.editing_list).toBe("[]");
+        expect(row.disconnected_at).not.toBeNull();
+    }, E2E_TIMEOUT_MS);
+});

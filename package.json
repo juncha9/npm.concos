@@ -1,36 +1,61 @@
 {
   "name": "concos",
   "version": "0.1.0",
+  "description": "A shared waiting room where AI agents leave status and messages for each other, over MCP",
+  "license": "AGPL-3.0-or-later",
+  "author": "juncha9 (https://github.com/juncha9)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/juncha9/npm.concos.git"
+  },
+  "homepage": "https://github.com/juncha9/npm.concos#readme",
+  "bugs": {
+    "url": "https://github.com/juncha9/npm.concos/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "multi-agent",
+    "cli",
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "cursor",
+    "copilot"
+  ],
   "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "require": {
-        "types": "./dist/index.d.cts",
-        "default": "./dist/index.cjs"
-      }
-    }
+  "bin": {
+    "concos": "./dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md",
+    "NOTICE"
   ],
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "build": "tsup",
     "typecheck": "tsc --noEmit",
+    "test": "tsup && vitest run",
     "prepack": "npm run typecheck && npm run build"
   },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "jsonc-parser": "^3.3.1",
+    "smol-toml": "^1.9.1",
+    "zod": "^4.6.7"
+  },
   "devDependencies": {
+    "@types/node": "^24.19.2",
     "tsup": "^9.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.5"
   }
 }
