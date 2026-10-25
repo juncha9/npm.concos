@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 9 · first required by concos 0.1.4. Every table is a record, not a cache.
+// Schema version 10 · first required by concos 0.1.4. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, last_message_id (schema 9; message numbers are never given twice), created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
@@ -27,6 +27,7 @@ Table agent {
   workspace_id varchar [ref: > workspace.id]
   working_directory varchar
   status varchar [not null, default: 'working', note: 'working | waiting | idle | finished']
+  role varchar [not null, default: '', note: 'schema 10: the standing role the user gave the agent, set by check_in or by the person at the board; task is what it is doing now']
   task varchar [not null, default: '']
   summary varchar [not null, default: '']
   next_step varchar [not null, default: '']

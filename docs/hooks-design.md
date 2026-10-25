@@ -4,7 +4,7 @@
 
 ## 1. 목적과 범위
 
-MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 하나, User 범위 등록 한 번, 영어 CLI라는 지금 구조를 그대로 둔다. 훅이 없어도 대합실은 MCP만으로 완결된다.
+MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 하나, User 범위 등록 한 번, 영어 CLI라는 지금 구조를 그대로 둔다. 훅이 없어도 대합실은 MCP만으로 완결된다. 2026-10-25 개정: Claude Code·Codex를 처음 등록하면 훅이 MCP와 함께 기본으로 켜지고(8절), 등록 화면이나 `--hooks off`로 끌 수 있다. 훅 없이도 완결된다는 원칙은 그대로다.
 
 훅이 하는 일:
 
@@ -108,7 +108,7 @@ concos: question #17 from concos development is unread. Read it with read_messag
 
 - **화면**: 등록 화면의 클라이언트 행에 `MCP registered · Hooks off`처럼 두 상태를 함께 보인다. 행을 고르면 동작을 고른다: MCP 등록(미등록일 때), Turn on hooks, Turn off hooks, Back. 훅은 MCP를 등록한 뒤에만 켤 수 있다. 1단계에서는 Claude Code·Codex 행에만 훅 동작이 있다. 2026-10-25 개정: 처음 등록할 때는 MCP와 훅, Claude Code의 대기 깨우기를 한 미리보기와 한 번의 확인으로 함께 쓴다(`planRegistration`). 훅 파일을 안전하게 고칠 수 없으면 그 파일은 그대로 두고 MCP만 등록하며, 이유를 미리보기에 적는다. 이미 등록된 행은 위 동작으로 켜고 끈다.
 - **비대화형**: `concos setup --host claude --hooks on [--apply]`, `--hooks off`. 2026-10-25부터 `--hooks on`은 MCP가 없으면 함께 등록하고, `--wake on`은 빠진 MCP와 훅까지 함께 켠다.
-- **쓰기**: 미리보기 → 확인 → `.concos-backup-*` 백업 → 원자적 교체(기존 `applySetup`). 다른 훅과 주석은 보존한다. 결과를 concos가 다시 읽을 수 없는 변경은 쓰지 않는다. `command`가 `concos hook `으로 시작하는 항목을 concos 소유로 본다.
+- **쓰기**: 미리보기 → 확인 → `.concos-mcp-backup-*` 백업 → 원자적 교체(기존 `applySetup`). 다른 훅과 주석은 보존한다. 결과를 concos가 다시 읽을 수 없는 변경은 쓰지 않는다. `command`가 `concos hook `으로 시작하는 항목을 concos 소유로 본다.
 - **켜기**: 없는 항목만 추가한다. concos 그룹은 각 이벤트 목록의 맨 뒤에 붙인다. Codex는 신뢰를 `<파일>:<이벤트>:<그룹 번호>:<항목 번호>`와 명령 해시로 기록하므로(0단계 V4), 앞에 끼워 넣으면 뒤에 있던 사용자 훅을 다시 신뢰해야 한다. 옛 형식의 concos 훅(`--room` 인수 등)은 같은 자리에서 현재 형식으로 바꾼다.
 - **끄기**: concos 항목만 지우고, 그 때문에 비게 된 그룹만 함께 지운다. concos 그룹 뒤에 다른 훅이 있었다면 번호가 당겨져 Codex에서 다시 신뢰해야 할 수 있다. 미리보기에 그 사실을 적는다.
 - **상태 표시**: 기대하는 다섯 항목이 모두 있으면 `Hooks on`, 일부만 있으면 `Hooks 4/5`처럼 개수, 없으면 `Hooks off`.
@@ -207,7 +207,7 @@ Codex `~/.codex/hooks.json`:
 - `src/modules/hooks/types.ts`, `handler.ts`, `adapters/claude.ts`, `adapters/codex.ts`: `stop_hook_active` 읽기, Stop의 `decision: block` 출력, 알림 문구, 이벤트별 `timeout`.
 - `src/modules/cli/clients.ts`, `setup.ts`: 훅 설정 위치, 켜기·끄기 계획, 상태 조회, `--hooks on|off`.
 - `src/modules/cli/menu.ts`: 클라이언트 행의 동작 목록. concos development 세션이 같은 파일을 고치므로 시작 전에 범위를 맞춘다.
-- `db/concos.dbml`, `README.md`, `SCAFFOLD.md`, 이 문서.
+- `dbml/concos.dbml`, `README.md`, `SCAFFOLD.md`, 이 문서.
 - 테스트: Stop 상기가 메시지당 한 번인지, `stop_hook_active`, 대상 규칙(직접·그룹 포함, 전체 제외, 내 질문의 답 포함, 답에 대한 답 제외), 상기 중 `waiting` 미전환, 설정 켜기·끄기의 보존·백업·중복 방지, Codex `config.toml` 중복 감지, 실제 `dist/cli.js` 자식 프로세스로 두 클라이언트 입력 fixture 실행.
 
 **2단계 — 대기 세션 깨우기 (Claude Code 전용).** 구현 · 2026-10-25. 스키마 6(`wake_generation`, `woken_at_list`), `RoomStore.startWakeWatch`·`checkWakeWatch`, `src/modules/hooks/watch.ts`, `concos setup --host claude --wake on|off`, Claude Code 행의 "Turn on idle wake". 자동 테스트 158개 통과.

@@ -8,7 +8,7 @@ import { participantName } from "./status-renderer";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
-import { applySetup, hasWake, HOST_LABELS, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planWake, resolveHooksPath } from "./setup";
+import { applySetup, hasWake, HOST_LABELS, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveHooksPath } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 
 export interface MenuOptions {
@@ -68,7 +68,7 @@ function previewChanges(prompter: Prompter, changes: SetupChange[]): void {
 }
 
 /**
- * Optional hooks for a client whose MCP is registered, and Claude Code's idle wake on top of
+ * Hooks for a client whose MCP is registered, and Claude Code's idle wake on top of
  * them: each turned on or off after a preview.
  */
 async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
@@ -76,12 +76,13 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
     const hooks = inspectHooks(draft);
     const canWake = hasWake(draft.host);
     const wakeOn = canWake && inspectWake(draft);
-    prompter.write("Hooks are optional. They record this client's working and waiting status and edited files,\n"
+    prompter.write("Hooks come on with the first registration and can be turned off here.\n"
+        + "They record this client's working and waiting status and edited files,\n"
         + "and at the end of a turn remind the agent once about unread questions sent to it.\n");
     if(canWake) {
         prompter.write("Idle wake, for Claude Code only, wakes a waiting session by itself when a question for it arrives.\n");
     }
-    const items: SelectItem<"on" | "off" | "wake-on" | "wake-off" | "back">[] = [];
+    const items: SelectItem<"on" | "off" | "wake-on" | "wake-off" | "remove" | "back">[] = [];
     if(hooks.state != "on") {
         items.push({ value: "on", label: "Turn on hooks", hint: hooks.state == "partial" ? `${hooks.present} of ${hooks.expected} are on` : undefined });
     }
@@ -94,8 +95,9 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
     if(wakeOn) {
         items.push({ value: "wake-off", label: "Turn off idle wake" });
     }
+    items.push({ value: "remove", label: "Unregister concos", hint: "MCP entry and hooks" });
     items.push({ separator: true }, { value: "back", label: "Back" });
-    const action = await prompter.select(`${label} · Optional hooks`, items, { cancelValue: "back" });
+    const action = await prompter.select(`${label} · Hooks`, items, { cancelValue: "back" });
     if(action == "back") return;
 
     const steps = {
@@ -103,8 +105,25 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
         "off": { plan: () => planHooks(draft, "off"), question: "Remove these hooks?", done: `Hooks turned off for ${label}.` },
         "wake-on": { plan: () => planWake(draft, "on"), question: "Turn on idle wake?", done: `Idle wake turned on for ${label}.` },
         "wake-off": { plan: () => planWake(draft, "off"), question: "Remove idle wake?", done: `Idle wake turned off for ${label}.` },
+        "remove": { plan: () => planUnregister(draft), question: "Remove concos from this client?", done: `concos removed from ${label}.` },
     };
-    const step = steps[action];
+    await applyStep(prompter, steps[action]);
+}
+
+/** A registered client without hooks: it can only be unregistered. */
+async function editRegistered(prompter: Prompter, draft: SetupDraft): Promise<void> {
+    const label = HOST_LABELS[draft.host];
+    const action = await prompter.select(`${label} · Registered`, [
+        { value: "remove", label: "Unregister concos", hint: "MCP entry" },
+        { separator: true },
+        { value: "back", label: "Back" },
+    ], { cancelValue: "back" });
+    if(action == "back") return;
+    await applyStep(prompter, { plan: () => planUnregister(draft), question: "Remove concos from this client?", done: `concos removed from ${label}.` });
+}
+
+/** Previews a settings change, applies it once confirmed, and reports. */
+async function applyStep(prompter: Prompter, step: { plan: () => SetupChange[]; question: string; done: string }): Promise<void> {
     const changes = step.plan();
     previewChanges(prompter, changes);
     if(!await prompter.askYesNo(step.question, false)) return;
@@ -139,7 +158,7 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
                     await editHooks(prompter, draft);
                 }
                 else {
-                    await prompter.pause();
+                    await editRegistered(prompter, draft);
                 }
                 continue;
             }

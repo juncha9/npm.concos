@@ -136,6 +136,24 @@ describe("check_in", () => {
         expect(again).toEqual({ changed: false, pending_count: 0, cursor: again.cursor, revision: again.revision });
     });
 
+    it("keeps an agent's role apart from its task, and lets the person at the board set it without making the agent look active", () => {
+        const ui = joinAgent("ui");
+        const server = joinAgent("server");
+        emptyCheckIn(ui.agent_id);
+        emptyCheckIn(server.agent_id, { update: { role: "owner of the app-api service", task: "storage" } });
+        emptyCheckIn(server.agent_id, { update: { task: "review" } });
+        const seen = emptyCheckIn(ui.agent_id);
+        expect(seen.agents).toEqual([expect.objectContaining({ agent_id: server.agent_id, role: "owner of the app-api service", task: "review" })]);
+
+        const before = database.prepare("SELECT last_call_at, revision FROM agent WHERE id = :id").get({ id: server.agent_id }) as { last_call_at: string; revision: number };
+        store.setRoleFromBoard(server.agent_id, "  test server deployments  ");
+        const after = database.prepare("SELECT role, last_call_at, revision FROM agent WHERE id = :id").get({ id: server.agent_id }) as { role: string; last_call_at: string; revision: number };
+        expect(after).toEqual({ role: "test server deployments", last_call_at: before.last_call_at, revision: before.revision + 1 });
+        expect(emptyCheckIn(ui.agent_id).agents).toEqual([expect.objectContaining({ role: "test server deployments" })]);
+        expect(store.inspectAgent(ui.agent_id, { agentId: server.agent_id, checkpointLimit: null, beforeCheckpointId: null }).card.role).toBe("test server deployments");
+        expect(() => store.setRoleFromBoard(store.ensureHumanParticipant("main", "Reviewer"), "x")).toThrow(/no role card/);
+    });
+
     it("does not echo an agent's own change back to it", () => {
         const ui = joinAgent("ui");
         const result = emptyCheckIn(ui.agent_id, { update: { task: "layout" } });

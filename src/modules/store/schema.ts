@@ -208,4 +208,8 @@ export const SCHEMA_STEPS: readonly string[] = [
     -- to messages by number. Starts from the highest number still kept.
     INSERT INTO meta (key, value) SELECT 'last_message_id', CAST(COALESCE(MAX(id), 0) AS TEXT) FROM message;
     `,
+    `
+    -- The standing role the user gave an agent, apart from task (what it is doing now).
+    ALTER TABLE agent ADD COLUMN role TEXT NOT NULL DEFAULT '';
+    `,
 ];

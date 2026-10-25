@@ -5,7 +5,7 @@ import type { Style } from "../src/modules/cli/prompter";
 
 const style: Style = { accent: (text) => text, success: (text) => text, warning: (text) => text, danger: (text) => text, dim: (text) => text, bold: (text) => text, inverse: (text) => text };
 const agent: RoomOverviewAgent = {
-    agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting",
+    agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting", role: "",
     task: "storage", next_step: "review", blocker: "", editing: [], workspace_path: "/project",
     updated_at: "2026-10-25T00:00:00Z", online: true, stale: false, left: false, ended: false, pending_count: 0,
 };

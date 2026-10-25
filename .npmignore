@@ -20,7 +20,7 @@ tsconfig*.json
 tsup.config.ts
 vitest.config.ts
 [Ss]cripts/
-[Dd]b/
+[Dd]bml/
 [Dd]ocs/
 README_DEV.md
 DESIGN.md

@@ -15,9 +15,11 @@ Usage
   concos setup                              Open the same registration form
   concos setup --host <client> [--apply]     Preview user settings; --apply writes them
   concos setup --host claude|codex --hooks on|off [--apply]
-                                            Optional hooks: status, edited files, message reminders
+                                            Hooks: status, edited files, message reminders
   concos setup --host claude --wake on|off [--apply]
                                             Claude Code only: wake a waiting session for a question
+  concos setup --host <client> --remove [--apply]
+                                            Unregister: remove the concos MCP entry and hooks only
   concos mcp                                Run the MCP bridge over stdio
   concos status [--json]                     Show participants and recent messages
   concos say <to[,to...]|all> <text> [--kind note|question|notice] [--topic <key>]... [--as <name>]

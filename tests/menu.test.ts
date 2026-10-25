@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMenu } from "../src/modules/cli/menu";
 import type { MenuOptions } from "../src/modules/cli/menu";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planSetup } from "../src/modules/cli/setup";
+import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup } from "../src/modules/cli/setup";
 import { openDatabase } from "../src/modules/store/database";
 import { RoomStore } from "../src/modules/store/room-store";
 
@@ -76,7 +76,7 @@ describe("registration menu", () => {
         fs.mkdirSync(path.dirname(hookFile));
         fs.writeFileSync(hookFile, '{"hooks":{"Stop":[{"hooks":[{"command":"legacy-hook"}]}]}}');
         const before = fs.readFileSync(hookFile, "utf8");
-        // the client's optional hooks open next; back leaves them untouched
+        // the client's hooks open next; back leaves them untouched
         const output = await menu("claude\nback\nback\nquit\n", { host: "claude", startWithSetup: true });
         expect(output).toContain("User-wide registration");
         expect(output).toContain("already has the same registration");
@@ -142,6 +142,25 @@ describe("room menu", () => {
         expect(output).toContain("Stored messages; retry dedupe remains.");
         expect(output).toContain("merged the storage layer");
         expect(output.lastIndexOf("concos · Shared waiting room")).toBeGreaterThan(output.indexOf("merged the storage layer"));
+    });
+
+    it("shows an agent's role on its row and lets the person at the board set it", async () => {
+        const agent = await seedRoom();
+        const database = await openDatabase(path.join(directory, "data"));
+        new RoomStore(database).checkIn(agent.agent_id, {
+            cursor: null, expectedRevision: null, update: { role: "storage owner", task: "message storage" }, checkpoint: null, receivedMessageIds: [],
+        });
+        database.close();
+
+        const output = await menu("status\nServer\nrole\nreview owner\nback\nquit\n");
+        expect(output).toMatch(/ {10}Role {5}storage owner\n +Task {5}message storage/);
+        expect(output).toContain("Role (Enter keeps it, - clears it)");
+        expect(output).toMatch(/ {10}Role {5}review owner/);
+        const check = await openDatabase(path.join(directory, "data"));
+        try {
+            expect(check.prepare("SELECT role, task FROM agent WHERE id = :id").get({ id: agent.agent_id })).toEqual({ role: "review owner", task: "message storage" });
+        }
+        finally { check.close(); }
     });
 
     it("erases an agent's card on a terminal when going back, so the list returns in its place", async () => {
@@ -578,14 +597,14 @@ describe("built interactive CLI", () => {
     });
 });
 
-describe("optional hooks on the registration screen", () => {
+describe("hooks on the registration screen", () => {
     const home = () => path.join(directory, "user");
 
     it("shows the hook state beside Claude Code and turns hooks on and off after a preview", async () => {
         applySetup(planSetup({ host: "claude", home: home() }));
         const on = await menu("claude\non\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
         expect(on).toContain("MCP registered · Hooks off");
-        expect(on).toContain("Claude Code · Optional hooks");
+        expect(on).toContain("Claude Code · Hooks");
         expect(on.indexOf("Settings to add")).toBeLessThan(on.indexOf("Turn on these hooks?"));
         expect(on).toContain("Hooks turned on for Claude Code.");
         expect(on).toContain("MCP registered · Hooks on");
@@ -605,7 +624,20 @@ describe("optional hooks on the registration screen", () => {
         expect(fs.existsSync(path.join(home(), ".codex", "hooks.json"))).toBe(false);
         const gemini = await menu("gemini\nback\nquit\n", { host: "gemini", startWithSetup: true });
         expect(gemini).toContain("already has the same registration");
-        expect(gemini).not.toContain("Optional hooks");
+        expect(gemini).not.toContain("Gemini CLI · Hooks");
+    });
+
+    it("unregisters a client from its row, taking out only the concos entry and hooks", async () => {
+        const claude = { host: "claude", home: home() };
+        applySetup(planRegistration(claude, { wake: true, skipBrokenHooks: false }));
+        applySetup(planSetup({ host: "gemini", home: home() }));
+        const output = await menu("claude\nremove\ny\ngemini\nremove\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
+        expect(output.indexOf("Settings to remove")).toBeLessThan(output.indexOf("Remove concos from this client?"));
+        expect(output).toContain("concos removed from Claude Code.");
+        expect(output).toContain("concos removed from Gemini CLI.");
+        expect(inspectSetup(claude).registered).toBe(false);
+        expect(inspectHooks(claude).state).toBe("off");
+        expect(inspectSetup({ host: "gemini", home: home() }).registered).toBe(false);
     });
 
     it("offers idle wake on the Claude Code row once its hooks are on, and shows it beside the client", async () => {

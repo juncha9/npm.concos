@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseJson } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planWake } from "../src/modules/cli/setup";
+import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveMcpPath } from "../src/modules/cli/setup";
 import { HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 
 let directory: string;
@@ -50,9 +50,28 @@ describe("user-wide setup", () => {
         expect(configData).toEqual({ ...configBefore, mcpServers: { ...configBefore.mcpServers, concos: { command: "concos", args: ["mcp"] } } });
         expect(configAfter.startsWith("\uFEFF")).toBe(true);
         expect(configAfter).toContain("// keep preferences and project registrations\r\n");
-        const backup = fs.readdirSync(directory).find((file) => file.startsWith(".claude.json.concos-backup-"))!;
+        const backup = fs.readdirSync(directory).find((file) => file.startsWith(".claude.json.concos-mcp-backup-"))!;
         expect(fs.readFileSync(path.join(directory, backup), "utf8")).toBe(configOriginal);
         expect(planSetup(input)).toEqual([]);
+    });
+
+    it("writes added entries in the file's own line endings and indentation", () => {
+        fs.mkdirSync(path.join(directory, ".codex"));
+        const toml = path.join(directory, ".codex", "config.toml");
+        fs.writeFileSync(toml, 'model = "x"\r\n\r\n[mcp_servers.other]\r\ncommand = "other"\r\n');
+        applySetup(planSetup({ host: "codex", home: directory }));
+        const tomlText = fs.readFileSync(toml, "utf8");
+        expect(tomlText.replace(/\r\n/g, "")).not.toContain("\n");
+        expect(parseToml(tomlText).mcp_servers).toMatchObject({ other: { command: "other" }, concos: { command: "concos" } });
+
+        for(const [host, file, indent] of [["gemini", ".gemini/settings.json", "\t"], ["cursor", ".cursor/mcp.json", "    "]] as const) {
+            fs.mkdirSync(path.join(directory, path.dirname(file)));
+            fs.writeFileSync(path.join(directory, file), `{\n${indent}"mcpServers": {\n${indent}${indent}"other": { "command": "other" }\n${indent}}\n}\n`);
+            applySetup(planSetup({ host, home: directory }));
+            const text = fs.readFileSync(path.join(directory, file), "utf8");
+            expect(text).toContain(`\n${indent}${indent}"concos": {`);
+            expect(parseJson(text).mcpServers.other).toEqual({ command: "other" });
+        }
     });
 
     it("appends a user TOML server without rewriting existing tables or comments", () => {
@@ -67,7 +86,7 @@ describe("user-wide setup", () => {
         expect(parseToml(result)).toEqual({ ...before, mcp_servers: { ...before.mcp_servers as object, concos: { command: "concos", args: ["mcp"] } } });
         applySetup(changes);
         expect(fs.readFileSync(config, "utf8")).toBe(result);
-        const backup = fs.readdirSync(path.dirname(config)).find((file) => file.startsWith("config.toml.concos-backup-"))!;
+        const backup = fs.readdirSync(path.dirname(config)).find((file) => file.startsWith("config.toml.concos-mcp-backup-"))!;
         expect(fs.readFileSync(path.join(path.dirname(config), backup), "utf8")).toBe(original);
     });
 
@@ -144,16 +163,16 @@ describe("user-wide setup", () => {
         const write = fs.writeFileSync.bind(fs);
         const spy = vi.spyOn(fs, "writeFileSync").mockImplementation((target, data, options) => {
             write(target, data, options);
-            if(String(target).includes(".concos-tmp-")) write(file, concurrent);
+            if(String(target).includes(".concos-mcp-tmp-")) write(file, concurrent);
         });
         try {
             expect(() => applySetup(changes)).toThrow(/changed since preview/);
         }
         finally { spy.mockRestore(); }
         expect(fs.readFileSync(file, "utf8")).toBe(concurrent);
-        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-tmp-"))).toBe(false);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-mcp-tmp-"))).toBe(false);
         if(original != null) {
-            const backup = fs.readdirSync(directory).find((name) => name.includes(".concos-backup-"))!;
+            const backup = fs.readdirSync(directory).find((name) => name.includes(".concos-mcp-backup-"))!;
             expect(fs.readFileSync(path.join(directory, backup), "utf8")).toBe(original);
         }
     });
@@ -235,7 +254,7 @@ describe("user-wide setup", () => {
     });
 });
 
-describe("optional hooks", () => {
+describe("hooks", () => {
     const commands = (groups: { hooks: { command: string }[] }[]) => groups.map((group) => group.hooks[0].command);
 
     it("are offered for Claude Code and Codex once MCP is registered", () => {
@@ -338,6 +357,75 @@ describe("optional hooks", () => {
         applySetup(planHooks(input, "off"));
         fs.appendFileSync(path.join(directory, ".codex", "config.toml"), '\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "concos hook turn-end --host codex"\n');
         expect(() => planHooks(input, "on")).toThrow(/already has concos hooks/);
+    });
+});
+
+describe("unregistering", () => {
+    const write = (relative: string, text: string) => {
+        fs.mkdirSync(path.dirname(path.join(directory, relative)), { recursive: true });
+        fs.writeFileSync(path.join(directory, relative), text);
+    };
+    const read = (relative: string) => fs.readFileSync(path.join(directory, relative), "utf8");
+
+    it("takes out only the concos entry and hooks, giving TOML and hook files back byte for byte", () => {
+        const toml = 'model = "x"\r\n\r\n[mcp_servers.other]\r\ncommand = "other"\r\n';
+        write(".codex/config.toml", toml);
+        // written over several lines, as clients write it; a list on one line comes back spread out (same data)
+        const hooks = `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }] }] } }, null, 2)}\n`;
+        write(".codex/hooks.json", hooks);
+        const codex = { host: "codex", home: directory };
+        applySetup(planRegistration(codex, { wake: false, skipBrokenHooks: false }));
+        expect(inspectHooks(codex).state).toBe("on");
+        applySetup(planUnregister(codex));
+        expect(read(".codex/config.toml")).toBe(toml);
+        expect(read(".codex/hooks.json")).toBe(hooks);
+        expect(planUnregister(codex)).toEqual([]);
+
+        const inline = '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}\n';
+        write(".codex/hooks.json", inline);
+        applySetup(planRegistration(codex, { wake: false, skipBrokenHooks: false }));
+        applySetup(planUnregister(codex));
+        expect(JSON.parse(read(".codex/hooks.json"))).toEqual(JSON.parse(inline));
+
+        for(const host of ["claude", "gemini", "cursor", "copilot"]) {
+            const input = { host, home: directory };
+            const file = path.relative(directory, resolveMcpPath(input));
+            write(file, '{\n  // keep\n  "theme": "dark",\n  "mcpServers": {"other": {"command": "other"}}\n}\n');
+            applySetup(planRegistration(input, { wake: host == "claude", skipBrokenHooks: false }));
+            applySetup(planUnregister(input));
+            expect(parseJson(read(file))).toEqual({ theme: "dark", mcpServers: { other: { command: "other" } } });
+            expect(read(file)).toContain("// keep");
+            expect(inspectSetup(input).registered).toBe(false);
+        }
+        expect(inspectHooks({ host: "claude", home: directory }).state).toBe("off");
+    });
+
+    it("keeps the comments above the next TOML table, and refuses entries it did not write", () => {
+        write(".codex/config.toml", 'model = "x"\n\n[mcp_servers.concos]\ncommand = "concos"\nargs = ["mcp"]\n\n# about projects\n[projects."D:/x"]\ntrust_level = "trusted"\n');
+        const codex = { host: "codex", home: directory };
+        applySetup(planUnregister(codex));
+        expect(read(".codex/config.toml")).toBe('model = "x"\n\n# about projects\n[projects."D:/x"]\ntrust_level = "trusted"\n');
+
+        const others = 'model = "x"\n\n[mcp_servers.concos]\ncommand = "someone-else"\n';
+        write(".codex/config.toml", others);
+        expect(() => planUnregister(codex)).toThrow(/runs something else/);
+        const inline = '[mcp_servers]\nconcos = { command = "concos", args = ["mcp"] }\n';
+        write(".codex/config.toml", inline);
+        expect(() => planUnregister(codex)).toThrow(/remove the \[mcp_servers.concos\] table by hand/);
+        expect(read(".codex/config.toml")).toBe(inline);
+    });
+
+    it("still takes out the MCP entry when the hooks file cannot be edited safely, and leaves that file alone", () => {
+        const claude = { host: "claude", home: directory };
+        applySetup(planSetup(claude));
+        const broken = '{"hooks": {}, "hooks": {}}';
+        write(".claude/settings.json", broken);
+        const changes = planUnregister(claude);
+        expect(changes.map((change) => path.relative(directory, change.path))).toEqual([".claude.json"]);
+        expect(changes[0].notes.join(" ")).toMatch(/Hooks were left in place, and their file untouched/);
+        applySetup(changes);
+        expect(inspectSetup(claude).registered).toBe(false);
+        expect(read(".claude/settings.json")).toBe(broken);
     });
 });
 

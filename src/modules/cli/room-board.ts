@@ -1,5 +1,5 @@
 import os from "node:os";
-import { SHARED_ROOM } from "../../_defs";
+import { MAX_ROLE_LENGTH, SHARED_ROOM } from "../../_defs";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { openDatabase } from "../store/database";
 import { RoomStore } from "../store/room-store";
@@ -93,8 +93,8 @@ function writtenLineCount(text: string): number {
 
 /**
  * The Agents tab, grouped by project with blocked and working agents first. Each agent is a
- * state column, its name with the unread count right after it, then its blocker, task and next
- * step on lines aligned under the name.
+ * state column, its name with the unread count right after it, then its role, blocker, task and
+ * next step on lines aligned under the name.
  */
 function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: boolean, nowMs: number, showEnded: boolean, activity: RoomActivity, unicode = true): {
     items: SelectItem<BoardValue>[];
@@ -105,16 +105,18 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
     const inactive = allAgents.filter((agent) => isInactive(agent) == true);
     // fixed widths from every possible value, so a refresh never shifts the columns
     const stateWidth = Math.max(...STATE_PRIORITY.map((state) => displayWidth(stateLabel(state, english).toLowerCase()))) + 2 + (activity.enabled ? 2 : 0);
-    const fieldLabels = { blocker: english ? "Blocker" : "막힘", task: english ? "Task" : "작업", next: english ? "Next" : "다음" };
+    const fieldLabels = { role: english ? "Role" : "역할", blocker: english ? "Blocker" : "막힘", task: english ? "Task" : "작업", next: english ? "Next" : "다음" };
     const fieldWidth = Math.max(...Object.values(fieldLabels).map(displayWidth)) + 2;
 
     const agentRow = (agent: RoomOverviewAgent): SelectItem<BoardValue> => {
         const state = stateOf(agent);
         const receding = RECEDING_STATES.includes(state);
-        const fields: [string, string, boolean][] = [
-            [fieldLabels.blocker, oneLine(agent.blocker), true],
-            [fieldLabels.task, oneLine(agent.task), false],
-            [fieldLabels.next, oneLine(agent.next_step), false],
+        // label, text, blocker, lines shown: the role stays put, so one line is enough
+        const fields: [string, string, boolean, number][] = [
+            [fieldLabels.role, oneLine(agent.role), false, 1],
+            [fieldLabels.blocker, oneLine(agent.blocker), true, 1],
+            [fieldLabels.task, oneLine(agent.task), false, 2],
+            [fieldLabels.next, oneLine(agent.next_step), false, 2],
         ];
         return {
             value: `agent:${agent.agent_id}`,
@@ -139,7 +141,7 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                 first.push({ text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim });
 
                 const rows = [first];
-                for(const [label, text, isBlocker] of fields) {
+                for(const [label, text, isBlocker, lineLimit] of fields) {
                     if(text == "") {
                         continue;
                     }
@@ -152,7 +154,7 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                     }
                     const indent = Math.min(stateWidth, Math.max(0, width - fieldWidth - 12));
                     const contentWidth = width - indent - fieldWidth;
-                    const content = previewText(text, contentWidth, isBlocker ? 1 : 2, unicode);
+                    const content = previewText(text, contentWidth, lineLimit, unicode);
                     content.forEach((line, index) => rows.push([
                         { text: " ".repeat(indent) },
                         { text: index == 0 ? padToWidth(label, fieldWidth) : " ".repeat(fieldWidth), paint: style.dim },
@@ -474,6 +476,34 @@ async function selectInPlace<T extends string>(
     }
 }
 
+/** The person at the board writes an agent's role: Enter keeps it, `-` clears it, Esc goes back. */
+async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, english: boolean): Promise<void> {
+    const previous = prompter.transient;
+    prompter.transient = true;
+    let typed: string;
+    try {
+        typed = await prompter.ask(english ? "Role (Enter keeps it, - clears it)" : "역할 (Enter는 그대로, -는 지우기)", agent.role);
+    }
+    catch(error) {
+        if(error instanceof PromptBackError) {
+            return;
+        }
+        throw error;
+    }
+    finally {
+        prompter.transient = previous;
+    }
+    let role = typed;
+    if(typed.trim() == "-") {
+        role = "";
+    }
+    if(role.trim().length > MAX_ROLE_LENGTH) {
+        await reportInPlace(prompter, english ? `A role holds at most ${MAX_ROLE_LENGTH} characters; it was not changed.` : `역할은 ${MAX_ROLE_LENGTH}자까지입니다. 바꾸지 않았습니다.`);
+        return;
+    }
+    store.setRoleFromBoard(agent.agent_id, role);
+}
+
 async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions): Promise<void> {
     const english = options.language == "en";
     // the agent itself is the viewer: inspectAgent only requires both to be in the same room
@@ -485,15 +515,25 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
     const card = renderAgentDetail(agent, detail, options);
     prompter.write(`\n${card}\n\n`);
 
-    const items: SelectItem<"say" | "back">[] = [];
+    const items: SelectItem<"say" | "role" | "back">[] = [];
     if(agent.human == false && agent.left == false) {
         items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기" });
+    }
+    if(agent.human == false) {
+        items.push({ value: "role", label: english ? "Set role" : "역할 정하기", hint: english ? "What this agent is responsible for" : "이 에이전트가 맡은 일" });
+    }
+    if(items.length > 0) {
         items.push({ separator: true });
     }
     items.push({ value: "back", label: english ? "Back" : "뒤로" });
     const action = await selectInPlace(prompter, participantName(agent.name, agent.client, agent.human), items, { cancelValue: "back" });
     if(action == "back") {
         prompter.eraseLines(writtenLineCount(card));
+        return;
+    }
+    if(action == "role") {
+        prompter.eraseLines(writtenLineCount(card));
+        await setRole(prompter, store, agent, english);
         return;
     }
     try {

@@ -3,6 +3,7 @@ export const MAX_DISPLAY_NAME_LENGTH = 60;
 export const MAX_CLIENT_LENGTH = 40;
 export const MAX_PATH_LENGTH = 1000;
 export const MAX_TASK_LENGTH = 200;
+export const MAX_ROLE_LENGTH = 200;
 export const MAX_SUMMARY_LENGTH = 2000;
 export const MAX_NEXT_STEP_LENGTH = 300;
 export const MAX_BLOCKER_LENGTH = 300;

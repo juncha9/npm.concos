@@ -234,6 +234,7 @@ export function renderRoomStatus(overview: {
             if(agent.stale && !agent.left && !agent.human) {
                 add(english ? "Stale report" : "오래된 상태 보고", "    ", (text) => paint(text, 33));
             }
+            field(english ? "Role" : "역할", agent.role);
             field(english ? "Task" : "작업", agent.task);
             field(english ? "Next" : "다음", agent.next_step);
             field(english ? "Blocker" : "막힘", agent.blocker, true);
@@ -341,6 +342,7 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
         add(card.workspace.path, "", 2);
     }
     lines.push(paint((unicode ? "─" : "-").repeat(width), 2));
+    field(english ? "Role" : "역할", card.role);
     field(english ? "Blocker" : "막힘", card.blocker, 31);
     field(english ? "Task" : "작업", card.task);
     field(english ? "Summary" : "요약", card.summary);

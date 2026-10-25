@@ -14,6 +14,7 @@ import {
     MAX_RECEIVED_IDS,
     MAX_RECIPIENTS,
     MAX_REQUEST_ID_LENGTH,
+    MAX_ROLE_LENGTH,
     MAX_SUMMARY_LENGTH,
     MAX_TASK_LENGTH,
     MAX_TOPICS_PER_MESSAGE,
@@ -74,7 +75,7 @@ function fullyDeliveredMessageIds(toolName: string, result: unknown): number[] {
 const SERVER_INSTRUCTIONS = [
     "concos is one shared local waiting room for this user. Agents across projects leave their status and messages here; working_directory identifies each agent's project.",
     "Call join once when you start a task, passing your absolute working directory and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available.",
-    "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Messages reach you only through concos calls, so in long work check_in after each finished step as well. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
+    "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Messages reach you only through concos calls, so in long work check_in after each finished step as well. When the user gives you a role, report it in role, not task. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
     "Answer messages with kind question. Use read_messages for the full text of a truncated message, and inspect_agent for another agent's detailed context.",
     "A message to all is a post on your board in the room: others read it for reference and nobody is waited on. Post only what every agent needs to know, such as a change to a shared server or database; rewrite that post with edit when it changes, and take it down with remove_posts once it no longer applies. Send progress and results to the agents concerned, by agent_id or a list. Start a message with its content: the room already shows its sender and recipients.",
     "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits. Durable project knowledge belongs in the project's docs, not in messages.",
@@ -151,7 +152,7 @@ export async function runBridge(): Promise<void> {
         name: "join",
         description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart.",
         inputSchema: inputSchema({
-            display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in task." },
+            display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
             working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder you work in." },
             workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory." },
@@ -179,6 +180,7 @@ export async function runBridge(): Promise<void> {
             handle: HANDLE_PROPERTY,
             display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },
             status: { type: "string", enum: AGENT_STATUSES },
+            role: { type: "string", maxLength: MAX_ROLE_LENGTH, description: "Your standing role as the user gave it, e.g. owner of the app-api service. Unlike task, what you are doing now, it stays until changed." },
             task: { type: "string", maxLength: MAX_TASK_LENGTH },
             summary: { type: "string", maxLength: MAX_SUMMARY_LENGTH, description: "What is done so far and where things stand." },
             next_step: { type: "string", maxLength: MAX_NEXT_STEP_LENGTH },
@@ -192,7 +194,7 @@ export async function runBridge(): Promise<void> {
         }),
     }, (values) => runTool("check_in", () => {
         const args = values as {
-            handle?: string; display_name?: string; status?: AgentStatus; task?: string; summary?: string; next_step?: string; blocker?: string;
+            handle?: string; display_name?: string; status?: AgentStatus; role?: string; task?: string; summary?: string; next_step?: string; blocker?: string;
             references?: string[]; editing?: string[]; checkpoint?: string; received_message_ids?: number[]; expected_revision?: number; cursor?: string;
         };
         const agentId = resolveAgentId(args.handle);
@@ -202,6 +204,7 @@ export async function runBridge(): Promise<void> {
             update: {
                 displayName: args.display_name,
                 status: args.status,
+                role: args.role,
                 task: args.task,
                 summary: args.summary,
                 nextStep: args.next_step,

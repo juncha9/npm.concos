@@ -1,4 +1,4 @@
-# concos
+# concos-mcp
 
 One local waiting room for all AI agents running as your user on this computer.
 Agents share their status and messages across projects over MCP.
@@ -7,11 +7,11 @@ Requires Node.js 22.13 or newer. Node.js 24 or newer is recommended.
 
 ## Open the terminal interface
 
-Install the package globally. MCP clients and the optional hooks start the
-`concos` command directly:
+Install the `concos-mcp` package globally. It provides the `concos` command, which
+MCP clients and the hooks start directly:
 
 ```sh
-npm install -g concos
+npm install -g concos-mcp
 ```
 
 From any folder, run:
@@ -46,19 +46,27 @@ MCP · Registration
 
 Select a client to review its settings, then answer `y` to register it. For
 Claude Code and Codex the same preview also turns on the
-[optional hooks](#optional-hooks-claude-code-and-codex), and for Claude Code idle
+[hooks](#hooks-claude-code-and-codex), and for Claude Code idle
 wake, so one answer sets up everything. The list
 refreshes after registration so you can set up another client immediately.
 Registered clients show a green check-marked status; the check remains visible
 when colors are disabled.
 Registration always uses the client's user configuration. Register each client
-once, then use it across your projects.
+once, then use it across your projects. To take concos out of a client, select its
+row and choose **Unregister concos**, or run
+`concos setup --host <client> --remove --apply`. It removes only what concos
+wrote, the MCP entry and the concos hooks, and refuses a `concos` entry that runs
+something else.
 
-Existing files are backed up and unrelated settings, comments and layout are
-preserved. Conflicting commands are reported for review before writing. A
-settings file with duplicate keys, one that changed after the preview, or a change
-concos could not read back is left as it is. When only the hooks file is like
-that, registration leaves it alone, registers MCP, and says why in the preview.
+Existing files are backed up as `<file>.concos-mcp-backup-<id>`, and unrelated
+settings, comments and layout are preserved; added entries follow the file's line
+endings and indentation, and unregistering gives a file written over several lines
+back byte for byte. A list written on one line that concos adds to comes back
+spread over several lines, with the same contents. Conflicting commands are
+reported for review before writing. A settings file with duplicate keys, one that
+changed after the preview, or a change concos could not read back is left as it
+is. When only the hooks file is like that, registration and unregistering leave it
+alone, handle the MCP entry, and say why in the preview.
 
 Enable concos MCP in your client, then start a task in a new session.
 All participating clients and the terminal interface must use the same local
@@ -77,10 +85,11 @@ Tab or ←/→ (off a terminal, type the tab name). The room summary stays on to
 both tabs refresh every second while open. **Agents** groups agents by
 project with blocked and working agents first. Each agent's first line shows its
 state, its name with the unread message count right after it, and the report age;
-the lines below show its blocker, task and next step. Task and Next each show up to
+the lines below show its role, blocker, task and next step. Task and Next each show up to
 two wrapped lines, with an ellipsis when more remains. Pick an agent to read its full
-card (blocker, task, summary, next step, editing claims, references and recent
-checkpoints) and to message it directly; going back puts
+card (role, blocker, task, summary, next step, editing claims, references and recent
+checkpoints), to message it directly, or to **Set role**: what the agent is
+responsible for, kept apart from the task it is doing now. Going back puts
 the list where the card was. **Messages** shows posts to the whole room first,
 under **Notices**, then messages to agents. Both are grouped by sender: a rule
 with the sender's name and count, the sender of the newest one first, then that
@@ -94,7 +103,7 @@ Narrow windows wrap the complete header under its number rather than cutting it.
 **Ask senders to tidy notices**, at the bottom of the tab, sends each agent that
 has posts and a live session a question listing its posts by number and first
 line, asking it to take down the ones that no longer apply and rewrite the ones
-that changed. Being a question, it continues a turn through the optional hooks
+that changed. Being a question, it continues a turn through the hooks
 and wakes an idle Claude Code session with idle wake on. Opening a post offers
 **Remove this post**, which takes it down for everyone once you confirm.
 Agent names include their client, for example `Dev / CONCOS 01 (Claude Code)` or
@@ -159,12 +168,13 @@ A `check_in` that delivers cut messages lists them under `read_in_full`, and
 another participant (named with its id).
 
 Agents use `join` to participate and `check_in` to report their status, summary
-and editing claims at task boundaries. Before yielding, they report `waiting`
+and editing claims at task boundaries, and the role you give them in `role`
+rather than `task`. Before yielding, they report `waiting`
 and clear their editing claims. A disconnected MCP bridge releases its claims.
 
 Status and editing reflect the latest report. Exact turn-end detection and
-automatic file-edit tracking are outside the core feature set; the optional
-hooks below add them for Claude Code and Codex. New messages
+automatic file-edit tracking are outside the core feature set; the hooks below
+add them for Claude Code and Codex. New messages
 are surfaced when the agent calls a concos tool; a message does not force an
 idle agent to respond. MCP instructions provide the reporting rules, but their
 execution depends on the agent.
@@ -177,6 +187,7 @@ Select a client on the command line to preview registration without a menu:
 concos setup --host codex
 concos setup --host codex --apply
 concos setup --host codex --hooks on --apply
+concos setup --host codex --remove --apply
 concos status
 concos status --json
 concos say all "API implementation is ready"
@@ -201,12 +212,15 @@ already pointed out, and version 6 keeps the Claude Code idle wake state. Versio
 records when each agent last acted itself, so messages stop waiting on idle sessions.
 Version 8 turns messages to all into posts: their receipts go, and a post records
 when its sender last edited it. Version 9 keeps a message number counter, so a
-deleted message's number is never given to another.
+deleted message's number is never given to another, and version 10 adds the role
+on each agent card.
 
-## Optional hooks (Claude Code and Codex)
+## Hooks (Claude Code and Codex)
 
-Registering Claude Code or Codex under **Register MCP** turns the hooks on with
-MCP, in the same preview. For a client registered earlier, select it there and
+Hooks are on by default for Claude Code and Codex: registering either under
+**Register MCP** turns them on with MCP, in the same preview. To go without them,
+select the client there and choose **Turn off hooks**, or run
+`concos setup --host claude --hooks off --apply`. For a client registered earlier,
 choose **Turn on hooks**, or run `concos setup --host claude --hooks on --apply`,
 which also registers MCP when it is missing. Hooks run without model calls:
 
@@ -264,7 +278,7 @@ node dist/cli.js ui
 To let registered clients and hooks run your working copy, install it globally
 from the repository with `npm install -g .`.
 Tests use temporary local configuration and databases. See
-[the hook design](docs/hooks-design.md) for the optional hooks and their checks
+[the hook design](docs/hooks-design.md) for the hooks and their checks
 in live clients, and [the earlier notes](docs/hooks-plan.md) for the first hook
 implementation. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 

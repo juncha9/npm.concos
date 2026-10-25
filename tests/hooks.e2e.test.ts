@@ -153,6 +153,16 @@ describe("hook CLI", () => {
         expect(hooks("on").stdout).toContain("already on");
         hooks("off", "--apply");
         expect(JSON.parse(fs.readFileSync(hooksFile, "utf8"))).toEqual({ hooks: {} });
+
+        // unregistering takes out the MCP table, and the hooks when they are on
+        hooks("on", "--apply");
+        const remove = (...args: string[]) => spawnSync(process.execPath, [CLI, "setup", "--host", "codex", "--remove", ...args], { cwd: directory, env: environment, encoding: "utf8" });
+        expect(remove().stdout).toContain("Add --apply to remove concos from this client.");
+        expect(fs.readFileSync(configFile, "utf8")).toContain("mcp_servers.concos");
+        expect(remove("--apply").stdout).toContain("Removed concos from this client.");
+        expect(fs.readFileSync(configFile, "utf8")).not.toContain("concos");
+        expect(JSON.parse(fs.readFileSync(hooksFile, "utf8"))).toEqual({ hooks: {} });
+        expect(remove().stdout).toContain("concos is not registered for Codex CLI.");
     });
 
     it("rejects project-scoped registration before creating settings", () => {

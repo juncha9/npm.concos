@@ -99,12 +99,24 @@ function json(change: SetupChange): Record<string, any> {
     return record(getNodeValue(tree), change.path);
 }
 
-/** Edits one value in place, keeping comments and layout; `insert` adds an array element at that index. */
+/** The indentation a JSON file already uses (its first indented line), so added entries match it. */
+function indentationOf(source: string): { insertSpaces: boolean; tabSize: number } {
+    const indent = /\n([ \t]+)\S/.exec(source)?.[1];
+    if(indent == null) {
+        return { insertSpaces: true, tabSize: 2 };
+    }
+    if(indent.startsWith("\t") == true) {
+        return { insertSpaces: false, tabSize: 1 };
+    }
+    return { insertSpaces: true, tabSize: indent.length };
+}
+
+/** Edits one value in place, keeping comments, layout and indentation; `insert` adds an array element at that index. */
 function editJson(change: SetupChange, keys: (string | number)[], value: unknown, insert = false): void {
     const bom = change.after.startsWith("\uFEFF") ? "\uFEFF" : "";
     const source = change.after.slice(bom.length);
     change.after = bom + applyEdits(source, modify(source, keys, value, {
-        formattingOptions: { insertSpaces: true, tabSize: 2, eol: change.after.includes("\r\n") ? "\r\n" : "\n" },
+        formattingOptions: { ...indentationOf(source), eol: change.after.includes("\r\n") ? "\r\n" : "\n" },
         isArrayInsertion: insert,
     }));
 }
@@ -164,7 +176,10 @@ export function planSetup(input: SetupTarget & { room?: string }): SetupChange[]
         server.env = { CONCOS_HOME: path.resolve(process.env.CONCOS_HOME) };
     }
     if(config.mcpFormat == "toml") {
-        mcpFile.after += `${mcpFile.after.endsWith("\n") || mcpFile.after == "" ? "" : "\n"}\n${stringifyToml({ mcp_servers: { concos: server } })}`;
+        // the appended table keeps the file's line endings, so a CRLF file does not turn mixed
+        const eol = mcpFile.after.includes("\r\n") ? "\r\n" : "\n";
+        const table = stringifyToml({ mcp_servers: { concos: server } }).replace(/\r?\n/g, eol);
+        mcpFile.after += `${mcpFile.after.endsWith("\n") || mcpFile.after == "" ? "" : eol}${eol}${table}`;
         // Inline tables and dotted keys can make an appended table invalid; fail before any writes.
         try { parseToml(mcpFile.after); }
         catch { throw new RoomError(`${mcpFile.path}: cannot append concos to this TOML layout; add the server table manually`); }
@@ -175,6 +190,101 @@ export function planSetup(input: SetupTarget & { room?: string }): SetupChange[]
             : adapter.id == "cursor" ? { type: "stdio", ...server } : server);
     }
     return mcpFile.additions.length > 0 ? [mcpFile] : [];
+}
+
+/** A line naming the concos server table, `[mcp_servers.concos]`, or with `subTable` one under it. */
+function concosTableHeader(line: string, subTable: boolean): boolean {
+    const name = String.raw`\[\s*mcp_servers\s*\.\s*(?:concos|"concos"|'concos')\s*`;
+    return new RegExp(subTable ? `^\\s*${name}\\.` : `^\\s*${name}\\]\\s*(?:#.*)?$`).test(line);
+}
+
+/**
+ * Takes the `[mcp_servers.concos]` table, its sub-tables and the blank line registration put
+ * before it out of a TOML file, line by line so every other byte stays. Comments and blank lines
+ * right above the next table belong to that table and stay. The result must parse to the same
+ * settings minus concos, or nothing changes: a server written as an inline table or dotted keys
+ * is left for the user to remove.
+ */
+function removeTomlTable(change: SetupChange, value: unknown): void {
+    const lines = change.after.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    const text = (line: string) => line.replace(/\r?\n$/, "");
+    const manual = new RoomError(`${change.path}: cannot take concos out of this TOML layout; remove the [mcp_servers.concos] table by hand`);
+    const start = lines.findIndex((line) => concosTableHeader(text(line), false));
+    if(start < 0) {
+        throw manual;
+    }
+    let end = start + 1;
+    while(end < lines.length && (/^\s*\[/.test(text(lines[end])) == false || concosTableHeader(text(lines[end]), true))) {
+        end += 1;
+    }
+    // comments and blank lines just above the next table are that table's
+    if(end < lines.length) {
+        while(end > start + 1 && /^\s*(#.*)?$/.test(text(lines[end - 1]))) {
+            end -= 1;
+        }
+    }
+    let from = start;
+    if(from > 0 && text(lines[from - 1]).trim() == "") {
+        from -= 1;
+    }
+    const after = [...lines.slice(0, from), ...lines.slice(end)].join("");
+    // an mcp_servers left empty and one that is gone read the same
+    const withoutEmptyServers = (data: Record<string, any>) => {
+        if(data.mcp_servers != null && Object.keys(data.mcp_servers).length == 0) delete data.mcp_servers;
+        return data;
+    };
+    const expected = parseToml(change.after) as Record<string, any>;
+    delete expected.mcp_servers.concos;
+    let parsed: Record<string, any>;
+    try { parsed = parseToml(after) as Record<string, any>; }
+    catch { throw manual; }
+    if(JSON.stringify(withoutEmptyServers(parsed)) != JSON.stringify(withoutEmptyServers(expected))) {
+        throw manual;
+    }
+    change.after = after;
+    change.removals.push({ key: "mcp_servers.concos", value: value });
+}
+
+/**
+ * Builds the change that takes concos out of a client, without writing: its MCP server entry,
+ * and for Claude Code and Codex every concos hook, idle wake included. Only what concos would
+ * have written goes: a server named concos that runs something else is refused, and everything
+ * around ours stays. A hooks file concos cannot edit safely is left alone while the MCP entry
+ * still goes, with a note saying why.
+ */
+export function planUnregister(input: SetupTarget): SetupChange[] {
+    const adapter = getMcpClient(input.host);
+    const changes: SetupChange[] = [];
+    const mcpFile = loadChange(resolveMcpPath(input));
+    const key = adapter.mcpFormat == "toml" ? "mcp_servers" : "mcpServers";
+    let data: Record<string, any>;
+    if(adapter.mcpFormat == "toml") {
+        try { data = parseToml(mcpFile.after); }
+        catch { throw new RoomError(`${mcpFile.path}: invalid TOML; settings were not changed`); }
+    }
+    else data = json(mcpFile);
+    const servers = data[key] === undefined ? {} : record(data[key], `${mcpFile.path}: ${key}`);
+    if(Object.hasOwn(servers, "concos") == true) {
+        if(compatibleServer(servers.concos) == false) {
+            throw new RoomError(`${mcpFile.path}: ${key}.concos runs something else, so it was left as it is`);
+        }
+        if(adapter.mcpFormat == "toml") removeTomlTable(mcpFile, servers.concos);
+        else removeJson(mcpFile, [key, "concos"], servers.concos);
+        changes.push(mcpFile);
+    }
+    if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
+        return changes;
+    }
+    try {
+        changes.push(...planHooks(input, "off"));
+    }
+    catch(ex) {
+        if((ex instanceof RoomError) == false || changes.length == 0) {
+            throw ex;
+        }
+        changes[0].notes.push(`Hooks were left in place, and their file untouched: ${ex.message.replace(/; settings were not changed$/, "")}.`);
+    }
+    return changes;
 }
 
 function hookAdapter(host: string) {
@@ -459,7 +569,7 @@ function verifyUnchanged(file: string, expected: string | null): void {
 
 /** Publishes complete contents, checking again after writing the temporary file. */
 function replaceSettings(file: string, before: string | null, after: string, replaced?: () => void): void {
-    const temporary = `${file}.concos-tmp-${randomUUID()}`;
+    const temporary = `${file}.concos-mcp-tmp-${randomUUID()}`;
     try {
         fs.writeFileSync(temporary, after, { encoding: "utf8", flag: "wx", mode: before == null ? 0o600 : fs.statSync(file).mode });
         verifyUnchanged(file, before);
@@ -498,7 +608,7 @@ export function applySetup(changes: SetupChange[]): void {
         for(const change of changes) {
             verifyUnchanged(change.path, change.before);
             fs.mkdirSync(path.dirname(change.path), { recursive: true });
-            if(change.before != null) fs.copyFileSync(change.path, `${change.path}.concos-backup-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
+            if(change.before != null) fs.copyFileSync(change.path, `${change.path}.concos-mcp-backup-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
             replaceSettings(change.path, change.before, change.after, () => applied.push(change));
         }
     }
@@ -539,10 +649,27 @@ function writeChanges(changes: SetupChange[]): void {
 export async function runSetup(args: string[]): Promise<void> {
     const { values } = parseArgs({ args, options: {
         host: { type: "string" }, room: { type: "string" }, scope: { type: "string", default: "user" }, apply: { type: "boolean" },
-        hooks: { type: "string" }, wake: { type: "string" },
+        hooks: { type: "string" }, wake: { type: "string" }, remove: { type: "boolean" },
     } });
     if(values.scope != "user") throw new RoomError("concos uses user-wide registration. Remove --scope and register once for this user.");
-    // optional hooks, or Claude Code's idle wake on top of them; turning either on brings what it
+    // unregister: the MCP entry and every concos hook, nothing else
+    if(values.remove == true) {
+        if(values.host == null) throw new RoomError("--remove needs --host <client>.");
+        const target = { host: values.host };
+        const removal = planUnregister(target);
+        if(removal.length == 0) {
+            process.stdout.write(`concos is not registered for ${HOST_LABELS[values.host] ?? values.host}.\n`);
+            return;
+        }
+        writeChanges(removal);
+        if(values.apply) {
+            applySetup(removal);
+            process.stdout.write("Removed concos from this client. Existing files were saved as .concos-mcp-backup-*.\n");
+        }
+        else process.stdout.write("Preview only. Add --apply to remove concos from this client.\n");
+        return;
+    }
+    // hooks, or Claude Code's idle wake on top of them; turning either on brings what it
     // stands on (MCP, and the hooks for idle wake) in the same preview
     const toggle = values.wake != null
         ? { option: "--wake", name: "idle wake", mode: values.wake, wake: true, plan: planWake, alreadyOn: "Idle wake is already on.", nothingOn: "Idle wake is not on." }
@@ -568,7 +695,7 @@ export async function runSetup(args: string[]): Promise<void> {
         if(values.apply) {
             applySetup(toggleChanges);
             const done = registering ? `Registered MCP and turned ${toggle.name} on` : `Turned ${toggle.name} ${toggle.mode}`;
-            process.stdout.write(`${done}. Existing files were saved as .concos-backup-*.\n`);
+            process.stdout.write(`${done}. Existing files were saved as .concos-mcp-backup-*.\n`);
         }
         else process.stdout.write(`Preview only. Add --apply to ${registering ? "register MCP and " : ""}turn ${toggle.name} ${toggle.mode}.\n`);
         return;
@@ -586,7 +713,7 @@ export async function runSetup(args: string[]): Promise<void> {
     writeChanges(changes);
     if(values.apply) {
         applySetup(changes);
-        process.stdout.write("MCP registered. Existing files were saved as .concos-backup-*. Enable concos MCP in your client, then open a new session.\n");
+        process.stdout.write("MCP registered. Existing files were saved as .concos-mcp-backup-*. Enable concos MCP in your client, then open a new session.\n");
     }
     else process.stdout.write("Preview only. Add --apply to register MCP. The installed concos command must be on PATH.\n");
 }

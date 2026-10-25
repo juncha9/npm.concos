@@ -16,6 +16,7 @@ import {
     ENDED_AFTER_MS,
     MAX_DISPLAY_NAME_LENGTH,
     MAX_RECIPIENTS,
+    MAX_ROLE_LENGTH,
     MAX_SIMILAR_TOPICS,
     MAX_TOPIC_KEY_LENGTH,
     MAX_TOPICS_PER_MESSAGE,
@@ -46,6 +47,7 @@ interface AgentRow {
     workspace_id: string | null;
     working_directory: string | null;
     status: AgentStatus;
+    role: string;
     task: string;
     summary: string;
     next_step: string;
@@ -110,13 +112,15 @@ export interface EditResult {
 
 const AGENT_COLUMNS = `
     id, room, display_name, client, is_human, workspace_id, working_directory,
-    status, task, summary, next_step, blocker, reference_list, editing_list,
+    status, role, task, summary, next_step, blocker, reference_list, editing_list,
     revision, changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, disconnected_at, left_at
 `;
 
 export interface CardUpdate {
     status?: AgentStatus;
+    /** The standing role the user gave the agent; unlike task, it stays until changed. */
+    role?: string;
     task?: string;
     summary?: string;
     nextStep?: string;
@@ -174,6 +178,7 @@ export interface CompactCard {
     agent_id: string;
     name: string;
     status: AgentStatus;
+    role?: string;
     task?: string;
     next_step?: string;
     blocker?: string;
@@ -219,6 +224,7 @@ export interface FullCard {
     client: string;
     human: boolean;
     status: AgentStatus;
+    role: string;
     task: string;
     summary: string;
     next_step: string;
@@ -264,6 +270,7 @@ export interface RoomOverviewAgent {
     client: string;
     human: boolean;
     status: AgentStatus;
+    role: string;
     task: string;
     next_step: string;
     blocker: string;
@@ -495,12 +502,13 @@ function resolveWorkspacePath(rawPath: string): { displayPath: string; comparePa
 }
 
 function applyCardUpdate(current: AgentRow, update: CardUpdate): {
-    values: Pick<AgentRow, "status" | "task" | "summary" | "next_step" | "blocker" | "reference_list" | "editing_list">;
+    values: Pick<AgentRow, "status" | "role" | "task" | "summary" | "next_step" | "blocker" | "reference_list" | "editing_list">;
     cardChanged: boolean;
     editingChanged: boolean;
 } {
     const values = {
         status: update.status ?? current.status,
+        role: update.role?.trim() ?? current.role,
         task: update.task?.trim() ?? current.task,
         summary: update.summary?.trim() ?? current.summary,
         next_step: update.nextStep?.trim() ?? current.next_step,
@@ -517,6 +525,7 @@ function applyCardUpdate(current: AgentRow, update: CardUpdate): {
     const editingChanged = values.editing_list != current.editing_list;
     const cardChanged = editingChanged == true
         || values.status != current.status
+        || values.role != current.role
         || values.task != current.task
         || values.summary != current.summary
         || values.next_step != current.next_step
@@ -1137,6 +1146,7 @@ export class RoomStore {
                 UPDATE agent
                 SET display_name = :display_name,
                     status = :status,
+                    role = :role,
                     task = :task,
                     summary = :summary,
                     next_step = :next_step,
@@ -1315,6 +1325,9 @@ export class RoomStore {
 
     private toCompactCard(row: AgentRow, nowMs: number): CompactCard {
         const card: CompactCard = { agent_id: row.id, name: row.display_name, status: row.status };
+        if(row.role != "") {
+            card.role = preview(row.role, CARD_FIELD_PREVIEW_LENGTH);
+        }
         if(row.task != "") {
             card.task = preview(row.task, CARD_FIELD_PREVIEW_LENGTH);
         }
@@ -1417,6 +1430,7 @@ export class RoomStore {
                 client: target.client,
                 human: target.is_human == 1,
                 status: target.status,
+                role: target.role,
                 task: target.task,
                 summary: target.summary,
                 next_step: target.next_step,
@@ -1912,6 +1926,32 @@ export class RoomStore {
         return `sent to ${parseList(row.recipients).join(", ")}, not to you`;
     }
 
+    /**
+     * The person at the board sets an agent's role. The card's revision and change sequence move,
+     * so the agent and others see it on their next check_in; the agent's own activity times stay,
+     * since a person's edit says nothing about whether the agent is at work.
+     */
+    setRoleFromBoard(agentId: string, role: string): void {
+        const text = role.trim();
+        if(text.length > MAX_ROLE_LENGTH) {
+            throw new RoomError(`role must contain at most ${MAX_ROLE_LENGTH} characters`);
+        }
+        runInTransaction(this.database, () => {
+            const current = this.requireAgent(agentId);
+            if(current.is_human == 1) {
+                throw new RoomError("a person has no role card");
+            }
+            if(current.role == text) {
+                return;
+            }
+            this.prepare(`
+                UPDATE agent
+                SET role = :role, revision = revision + 1, changed_seq = :changed_seq, updated_at = :now
+                WHERE id = :id
+            `).run({ role: text, changed_seq: this.nextSeq(), now: new Date().toISOString(), id: agentId });
+        });
+    }
+
     /** Leaves the final context on the card, clears the editing claim and marks the participant left. */
     leave(agentId: string, input: { summary: string | null; nextStep: string | null; checkpoint: string | null }): { left: true } {
         const nowText = new Date().toISOString();
@@ -1929,6 +1969,7 @@ export class RoomStore {
             this.prepare(`
                 UPDATE agent
                 SET status = :status,
+                    role = :role,
                     task = :task,
                     summary = :summary,
                     next_step = :next_step,
@@ -2289,6 +2330,7 @@ export class RoomStore {
                 client: row.client,
                 human: row.is_human == 1,
                 status: row.status,
+                role: row.role,
                 task: row.task,
                 next_step: row.next_step,
                 blocker: row.blocker,
