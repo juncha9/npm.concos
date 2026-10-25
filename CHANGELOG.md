@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- A menu in a terminal shorter than it left a copy of its top lines above the redrawn list. Lists now fit the window's real height and redraw when it is resized. Going back to the main menu or the registration list no longer stacks the previous page above it: what was written since is erased, and only text taller than the window stays in the scrollback.
+
+## [0.1.7] - 2026-10-25
+
 ### Added
 - **Agent role.** A card carries the role the user gave the agent, apart from the task it is doing now. Agents set it with `check_in`'s `role`; on the board, an agent's card offers Set role.
 - **Unregister concos.** On a registered client's row, or `concos setup --host <client> --remove`: it takes out only what concos wrote, the MCP entry and its hooks, and refuses a `concos` entry that runs something else. A file written over several lines comes back byte for byte.
@@ -18,14 +23,13 @@ All notable changes to this project will be documented in this file.
 - **Backups of earlier schemas go.** Before upgrading the room database, concos keeps only the backup it takes then, and removes that one too once it is a week old; the daily backups cover the last seven days.
 
 ### Fixed
-- A menu in a terminal shorter than it left a copy of its top lines above the redrawn list. Lists now fit the window's real height and redraw when it is resized. Going back to the main menu or the registration list no longer stacks the previous page above it: what was written since is erased, and only text taller than the window stays in the scrollback.
 - Registration added LF lines to a CRLF `config.toml` and space-indented entries to a tab-indented JSON file; added entries now follow the file's line endings and indentation.
 - The room database's backup cleanup would have deleted the newest migration backup once the schema version reached two digits (`bak-v10` sorted before `bak-v9` by name), and counted SQLite side files beside a backup as backups.
 
 ### Notes
 - Schema version 10 adds the agent role.
 - A session loads a tool list of about 7,900 characters and instructions of about 2,000.
-- 0.1.4 was unpublished from npm the day it came out, and 0.1.5 to 0.1.7 were release commits in the repository that were never published.
+- 0.1.4 was unpublished from npm the day it came out, and 0.1.5 and 0.1.6 were release commits in the repository that were never published.
 
 ## [0.1.4] - 2026-10-25 [YANKED]
 

@@ -123,7 +123,7 @@ concos setup --host <제품> [--apply]
 
 ## 10. 설치 및 사용 규칙
 
-아직 npm에 게시하지 않았으므로 저장소에서 전역 설치한 뒤 프로젝트 폴더에서 설정한다(2026-10-24 기준 기록. npm에 처음 남는 버전부터는 `npm install -g concos-mcp`로 설치하고, 명령은 `concos`다).
+아직 npm에 게시하지 않았으므로 저장소에서 전역 설치한 뒤 프로젝트 폴더에서 설정한다(2026-10-24 기준 기록. npm에 남는 첫 버전인 0.1.7부터는 `npm install -g concos-mcp`로 설치하고, 명령은 `concos`다).
 
 ```sh
 npm install -g .
