@@ -78,9 +78,20 @@ export function serveStdio(options: {
                 send(id, { result: toolError(`Tool ${String(params.name)} not found`) });
                 return;
             }
-            const check = checkArguments(tool.inputSchema, params.arguments);
+            // an argument meant for another tool says which one takes it, e.g. role belongs to check_in
+            const check = checkArguments(tool.inputSchema, params.arguments, (name) => {
+                const takers = options.tools.filter((other) => other.name != tool.name && Object.hasOwn(other.inputSchema.properties, name)).map((other) => other.name);
+                if(takers.length == 0) {
+                    return `${name} is not a ${tool.name} argument`;
+                }
+                return `${name} is not a ${tool.name} argument; ${takers.join(", ")} ${takers.length == 1 ? "takes" : "take"} it`;
+            });
             if(check.ok == false) {
-                send(id, { result: toolError(`Invalid arguments for tool ${tool.name}: ${check.problems.join("; ")}`) });
+                let text = `Invalid arguments for tool ${tool.name}: ${check.problems.join("; ")}`;
+                if(check.unknown.length > 0) {
+                    text += `. ${tool.name} takes ${Object.keys(tool.inputSchema.properties).join(", ")}`;
+                }
+                send(id, { result: toolError(text) });
                 return;
             }
             send(id, { result: options.callTool(tool.name, check.values) });

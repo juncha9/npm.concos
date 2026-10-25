@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Added
+- **`join` says when it merged cards.** When an earlier card of the session's name takes over the card the session-start hook made, the answer names that card under `merged_from`, so an agent_id other than the hook's no longer comes back unexplained.
+- **A card whose session ended shows `replaced_by`**: the live card of its name in its project, which messages sent to it reach. `check_in` and `inspect_agent` both show it.
+
+### Changed
+- **A tool call with an argument the tool does not take is refused** instead of having the argument dropped without a word. The error names the argument, the tools that take it (`role` belongs to `check_in`) and the tool's own arguments.
+- `check_in`'s description says to call it again for the rest of the room when `has_more` is set.
+
+### Notes
+- A session loads a tool list of about 8,200 characters and instructions of about 2,000.
+
 ## [0.1.8] - 2026-10-25
 
 ### Fixed

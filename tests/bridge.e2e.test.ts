@@ -428,12 +428,15 @@ describe("concos mcp over stdio", () => {
         expect((await answerTo(3)).error).toEqual({ code: -32601, message: "Method not found" });
 
         expect(await callTool(4, "no_such_tool", {})).toEqual({ content: [{ type: "text", text: "Tool no_such_tool not found" }], isError: true });
+        // an argument the tool does not take is refused, never dropped, and the answer lists what it takes
         const missing = await callTool(5, "join", { display_name: "", extra: true });
         expect(missing.isError).toBe(true);
-        expect(missing.content[0].text).toBe("Invalid arguments for tool join: client is required; working_directory is required; display_name must not be empty");
-        // `to` belongs to send_message, so check_in drops it instead of complaining
+        expect(missing.content[0].text).toBe("Invalid arguments for tool join: client is required; working_directory is required; display_name must not be empty; extra is not a join argument. join takes display_name, client, working_directory, workspace_root, resume_handle");
+        // one another tool takes names that tool: `role` belongs to check_in, `to` to send_message
+        const misplaced = await callTool(8, "join", { display_name: "Dev", client: "raw", working_directory: process.cwd(), role: "owner" });
+        expect(misplaced.content[0].text).toBe("Invalid arguments for tool join: role is not a join argument; check_in takes it. join takes display_name, client, working_directory, workspace_root, resume_handle");
         const wrongTypes = await callTool(6, "check_in", { status: "sleeping", received_message_ids: [1.5], to: 3 });
-        expect(wrongTypes.content[0].text).toBe("Invalid arguments for tool check_in: status must be one of working, waiting, idle, finished; received_message_ids[0] must be an integer");
+        expect(wrongTypes.content[0].text).toMatch(/^Invalid arguments for tool check_in: status must be one of working, waiting, idle, finished; received_message_ids\[0\] must be an integer; to is not a check_in argument; send_message takes it\. check_in takes handle, display_name, status, role, /);
         const withoutArguments = await callTool(7, "read_messages");
         expect(withoutArguments).toEqual({ content: [{ type: "text", text: "call join first" }], isError: true });
 

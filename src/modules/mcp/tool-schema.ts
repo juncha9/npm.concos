@@ -12,7 +12,8 @@ export interface InputSchema {
     required?: string[];
 }
 
-export type ArgumentCheck = { ok: true; values: Record<string, unknown> } | { ok: false; problems: string[] };
+/** `unknown` lists the given fields the schema does not name. */
+export type ArgumentCheck = { ok: true; values: Record<string, unknown> } | { ok: false; problems: string[]; unknown: string[] };
 
 const JSON_SCHEMA_DRAFT = "http://json-schema.org/draft-07/schema#";
 
@@ -119,17 +120,19 @@ function checkValue(schema: ValueSchema, value: unknown, path: string, problems:
 
 /**
  * Checks a tool call's arguments against the tool's input schema. Missing arguments count as an
- * empty object and fields the schema does not name are dropped, as the MCP SDK the tools were first
- * served with did.
+ * empty object. A field the schema does not name is a problem, described by `describeUnknown`:
+ * the MCP SDK the tools were first served with dropped such fields without a word, so a `role`
+ * given to `join` vanished while the call looked fine (2026-10-25 report).
  */
-export function checkArguments(schema: InputSchema, input: unknown): ArgumentCheck {
+export function checkArguments(schema: InputSchema, input: unknown, describeUnknown = (name: string) => `${name} is not an argument`): ArgumentCheck {
     const given = input ?? {};
     if(typeof given != "object" || Array.isArray(given) == true) {
-        return { ok: false, problems: ["arguments must be an object"] };
+        return { ok: false, problems: ["arguments must be an object"], unknown: [] };
     }
     const fields = given as Record<string, unknown>;
     const problems: string[] = [];
     const values: Record<string, unknown> = {};
+    const unknown = Object.keys(fields).filter((name) => Object.hasOwn(schema.properties, name) == false);
     // only an absent field is missing; null is a value of the wrong type, as the schema tells clients
     for(const name of schema.required ?? []) {
         if(fields[name] === undefined) {
@@ -144,8 +147,9 @@ export function checkArguments(schema: InputSchema, input: unknown): ArgumentChe
         checkValue(propertySchema, value, name, problems);
         values[name] = value;
     }
+    problems.push(...unknown.map(describeUnknown));
     if(problems.length > 0) {
-        return { ok: false, problems: problems };
+        return { ok: false, problems: problems, unknown: unknown };
     }
     return { ok: true, values: values };
 }

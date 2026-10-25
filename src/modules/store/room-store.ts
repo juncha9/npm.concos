@@ -139,6 +139,8 @@ export interface JoinResult {
     room: string;
     workspace_id: string;
     resumed: boolean;
+    /** The card a session-start hook made, when an earlier card of the name took its session over; that agent_id is gone. */
+    merged_from?: string;
 }
 
 export interface InboxCounts {
@@ -187,6 +189,8 @@ export interface CompactCard {
     editing?: string[];
     checkpoint?: string;
     workspace_id?: string;
+    /** For a card whose session ended or left: the live card of its name in its project, which messages to it reach. */
+    replaced_by?: string;
     human?: true;
     offline?: true;
     stale?: true;
@@ -242,6 +246,8 @@ export interface FullCard {
     online: boolean;
     stale: boolean;
     left: boolean;
+    /** Same as `CompactCard.replaced_by`. */
+    replaced_by?: string;
 }
 
 export interface InspectResult {
@@ -625,6 +631,18 @@ export class RoomStore {
     }
 
     /**
+     * The live card that takes the messages sent to `card`: one of its name in its project, when
+     * `card`'s own session ended or left. Sending forwards to it and cards show it as `replaced_by`,
+     * so the two always agree.
+     */
+    private successorOf(card: AgentRow, nowMs: number): AgentRow | null {
+        if(card.is_human == 1 || (card.left_at == null && isEnded(card, nowMs) == false)) {
+            return null;
+        }
+        return this.liveCardNamed(card, nowMs);
+    }
+
+    /**
      * A session that joins under a name takes over the unread messages left on cards of that
      * name in the same project whose sessions ended: one session reaches others by its name, and
      * a reply to an id from an earlier session would otherwise wait on a card nobody reads.
@@ -799,7 +817,12 @@ export class RoomStore {
                     cardId = this.mergeIntoEarlierCard(resumed.id, input.displayName, workspaceId, nowText) ?? resumed.id;
                     this.adoptFromEndedCards(cardId, input.displayName, workspaceId, nowMs);
                 }
-                return { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
+                const result: JoinResult = { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
+                // the agent was told the hook card's id; say why another came back (2026-10-25 report)
+                if(cardId != resumed.id) {
+                    result.merged_from = resumed.id;
+                }
+                return result;
             }
 
             const agentId = newIdentifier("agt");
@@ -1409,6 +1432,10 @@ export class RoomStore {
             card.human = true;
             return card;
         }
+        const successor = this.successorOf(row, nowMs);
+        if(successor != null) {
+            card.replaced_by = successor.id;
+        }
         if(row.left_at != null) {
             card.left = true;
             return card;
@@ -1506,6 +1533,10 @@ export class RoomStore {
             },
             checkpoints: checkpointRows.slice(0, limit).map((row) => ({ id: row.id, at: row.created_at, text: row.body })),
         };
+        const successor = this.successorOf(target, nowMs);
+        if(successor != null) {
+            result.card.replaced_by = successor.id;
+        }
         if(checkpointRows.length > limit) {
             result.has_more_checkpoints = true;
         }
@@ -1590,12 +1621,10 @@ export class RoomStore {
                     }
                     // the user knows a session by its name: an ended card whose session goes on under
                     // that name in the same project hands the message to the live card
-                    if(recipient.is_human == 0 && (recipient.left_at != null || isEnded(recipient, nowMs) == true)) {
-                        const successor = this.liveCardNamed(recipient, nowMs);
-                        if(successor != null && successor.id != senderId) {
-                            forwarded.push({ from: recipient.id, to: successor.id });
-                            recipient = successor;
-                        }
+                    const successor = this.successorOf(recipient, nowMs);
+                    if(successor != null && successor.id != senderId) {
+                        forwarded.push({ from: recipient.id, to: successor.id });
+                        recipient = successor;
                     }
                     if(recipient.id == senderId) {
                         throw new RoomError("cannot send a message to yourself");

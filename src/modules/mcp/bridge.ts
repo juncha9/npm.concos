@@ -150,7 +150,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "join",
-        description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart.",
+        description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart. merged_from, when present, is the card your session-start hook made: your earlier card of this name took it over, so use the agent_id returned.",
         inputSchema: inputSchema({
             display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
@@ -175,7 +175,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "check_in",
-        description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes, messages to you, and new or edited posts since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing [].",
+        description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes, messages to you, and new or edited posts since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing []. When room.has_more is set, call check_in again without cursor for the rest. A card with replaced_by belongs to a session that ended; messages to it reach that agent_id.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },

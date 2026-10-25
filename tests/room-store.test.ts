@@ -96,7 +96,8 @@ describe("join", () => {
         const toHook = store.sendMessage(sender.agent_id, { to: hook.agent_id, kind: "note", text: "hello hook card", replyTo: null, requestId: null });
 
         const named = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: hook.handle });
-        expect(named).toMatchObject({ agent_id: earlier.agent_id, handle: hook.handle, resumed: true });
+        // the hook told the model its card's id; the answer says that card went into this one
+        expect(named).toMatchObject({ agent_id: earlier.agent_id, handle: hook.handle, resumed: true, merged_from: hook.agent_id });
         expect(store.requireAgentIdByHandle(hook.handle)).toBe(earlier.agent_id);
         expect(database.prepare("SELECT id FROM agent WHERE id = :id").get({ id: hook.agent_id })).toBeUndefined();
         expect(store.readMessages(earlier.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([missed.message_id, toHook.message_id]);
@@ -114,6 +115,7 @@ describe("join", () => {
         const hook = store.join({ room: "dev", displayName: "Claude Code · work", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, hookSession: { host: "claude", sessionId: "s1" } });
         const named = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: hook.handle });
         expect(named.agent_id).toBe(hook.agent_id);
+        expect(named.merged_from).toBeUndefined();
         const names = (database.prepare("SELECT id FROM agent WHERE display_name = :name").all({ name: "Dev / API 05" }) as { id: string }[]).map((row) => row.id);
         expect(names.sort()).toEqual([elsewhere.agent_id, otherSession.agent_id, hook.agent_id].sort());
     });
@@ -559,6 +561,11 @@ describe("ended sessions", () => {
         expect(store.readMessages(current.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([sent.message_id]);
         // naming both cards reaches the live one once
         expect(store.sendMessage(sender.agent_id, { to: [earlier.agent_id, current.agent_id], kind: "note", text: "both", replyTo: null, requestId: null }).recipient_count).toBe(1);
+        // the ended card shows where its messages go, in the room list and on inspection
+        const inspect = (agentId: string) => store.inspectAgent(sender.agent_id, { agentId: agentId, checkpointLimit: null, beforeCheckpointId: null }).card;
+        expect(emptyCheckIn(sender.agent_id).agents?.find((card) => card.agent_id == earlier.agent_id)?.replaced_by).toBe(current.agent_id);
+        expect(inspect(earlier.agent_id).replaced_by).toBe(current.agent_id);
+        expect(inspect(current.agent_id).replaced_by).toBeUndefined();
 
         // no single live card of that name in that project: stored for the ended card, as before
         const otherFolder = path.join(dataDirectory, "elsewhere");
@@ -567,6 +574,7 @@ describe("ended sessions", () => {
         store.disconnect([lonely.agent_id]);
         joinAgent("Lonely", "dev", otherFolder);
         expect(store.sendMessage(sender.agent_id, { to: lonely.agent_id, kind: "note", text: "x", replyTo: null, requestId: null })).toMatchObject({ inactive_recipients: [lonely.agent_id] });
+        expect(inspect(lonely.agent_id).replaced_by).toBeUndefined();
     });
 
     it("gives a session joining under a name the unread messages left on ended cards of that name", () => {
