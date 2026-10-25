@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 11 · first required by concos 0.1.10. Every table is a record, not a cache.
+// Schema version 12 · first required by concos 0.1.11. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, last_message_id (schema 9; message numbers are never given twice), created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
@@ -24,8 +24,10 @@ Table agent {
   display_name varchar [not null]
   client varchar [not null]
   is_human integer [not null, default: 0, note: '1 = person posting from the CLI']
-  workspace_id varchar [ref: > workspace.id]
-  working_directory varchar
+  workspace_id varchar [ref: > workspace.id, note: 'the project of the folder the session started in; a later join from another folder does not change it']
+  working_directory varchar [note: 'the folder the session started in: set by its session-start hook or its first join, fixed until the session starts again']
+  current_directory varchar [note: 'schema 12: the folder the agent works in now, when it is not working_directory; from check_in or a later join, cleared on leave or when a person takes the card down']
+  concos_version varchar [note: 'schema 12: the concos version of the MCP bridge that last joined or kept the card alive; null until a bridge from 0.1.11 on touches it. The board flags a live card whose bridge is older']
   status varchar [not null, default: 'working', note: 'working | waiting | idle | finished']
   role varchar [not null, default: '', note: 'schema 10: the standing role the user gave the agent, set by check_in or by the person at the board; task is what it is doing now']
   task varchar [not null, default: '']

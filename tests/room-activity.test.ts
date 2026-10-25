@@ -6,8 +6,9 @@ import type { Style } from "../src/modules/cli/prompter";
 const style: Style = { accent: (text) => text, success: (text) => text, warning: (text) => text, danger: (text) => text, dim: (text) => text, bold: (text) => text, inverse: (text) => text };
 const agent: RoomOverviewAgent = {
     agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting", role: "",
-    task: "storage", next_step: "review", blocker: "", editing: [], workspace_path: "/project",
+    task: "storage", next_step: "review", blocker: "", editing: [], workspace_path: "/project", current_directory: null,
     updated_at: "2026-10-25T00:00:00Z", online: true, stale: false, left: false, ended: false, pending_count: 0,
+    concos_version: null, issues: [],
 };
 const message: RoomOverviewMessage = {
     id: 1, at: agent.updated_at, from_name: "Server", from_client: "Codex", from_human: false,

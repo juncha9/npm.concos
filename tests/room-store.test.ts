@@ -106,6 +106,40 @@ describe("join", () => {
         expect(store.applyHookEvent({ kind: "prompt", host: "claude", sessionId: "s1", cwd: workDirectory, files: [] })?.agentId).toBe(earlier.agent_id);
     });
 
+    it("keeps a card with the project its session started in, and records the folder it works in now", () => {
+        const docs = path.join(workDirectory, "docs-repo");
+        fs.mkdirSync(docs);
+        const joined = joinAgent("Designer");
+        const inspect = () => store.inspectAgent(joined.agent_id, { agentId: joined.agent_id, checkpointLimit: null, beforeCheckpointId: null }).card;
+        // joining again from a repository inside the project used to move the card to that repository
+        const again = store.join({ room: "dev", displayName: "Designer", client: "test", workingDirectory: docs, workspaceRoot: null, resumeHandle: joined.handle });
+        expect(again).toMatchObject({ agent_id: joined.agent_id, workspace_id: joined.workspace_id });
+        expect(inspect()).toMatchObject({ working_directory: workDirectory, current_directory: docs, workspace: { id: joined.workspace_id } });
+        expect(store.getRoomOverview("main", 0).agents[0]).toMatchObject({ workspace_path: workDirectory, current_directory: docs });
+
+        // check_in reports it too; "" or the folder the session started in clears it
+        emptyCheckIn(joined.agent_id, { update: { currentDirectory: "" } });
+        expect(inspect().current_directory).toBeUndefined();
+        const watcher = joinAgent("Watcher");
+        emptyCheckIn(watcher.agent_id);
+        emptyCheckIn(joined.agent_id, { update: { currentDirectory: docs } });
+        expect(emptyCheckIn(watcher.agent_id).agents).toEqual([expect.objectContaining({ agent_id: joined.agent_id, current_directory: docs })]);
+        emptyCheckIn(joined.agent_id, { update: { currentDirectory: workDirectory } });
+        expect(inspect().current_directory).toBeUndefined();
+        expect(() => emptyCheckIn(joined.agent_id, { update: { currentDirectory: "docs-repo" } })).toThrow(/absolute/);
+    });
+
+    it("merges by the project the session started in, even when the model joins from another folder", () => {
+        const docs = path.join(workDirectory, "docs-repo");
+        fs.mkdirSync(docs);
+        const earlier = joinAgent("Dev / API 05");
+        const hook = store.join({ room: "dev", displayName: "Claude Code · work", client: "Claude Code", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, hookSession: { host: "claude", sessionId: "s1" } });
+        const named = store.join({ room: "dev", displayName: "Dev / API 05", client: "Claude Code", workingDirectory: docs, workspaceRoot: null, resumeHandle: hook.handle });
+        expect(named).toMatchObject({ agent_id: earlier.agent_id, merged_from: hook.agent_id, workspace_id: earlier.workspace_id });
+        expect(store.inspectAgent(earlier.agent_id, { agentId: earlier.agent_id, checkpointLimit: null, beforeCheckpointId: null }).card)
+            .toMatchObject({ working_directory: workDirectory, current_directory: docs });
+    });
+
     it("leaves cards apart when the earlier one is elsewhere, bound to another session, or named otherwise", () => {
         const otherFolder = path.join(dataDirectory, "other");
         fs.mkdirSync(otherFolder);
@@ -623,6 +657,60 @@ describe("ended sessions", () => {
         store.disconnect([old.agent_id]);
         const current = joinAgent("Dev / API 01");
         expect(store.findAgentInRoom("main", "dev / api 01")).toBe(current.agent_id);
+    });
+});
+
+describe("cards that look wrong", () => {
+    const overviewOf = (agentId: string) => store.getRoomOverview("main", 0).agents.find((agent) => agent.agent_id == agentId)!;
+    const setRow = (agentId: string, values: Record<string, string>) => {
+        const assignments = Object.keys(values).map((key) => `${key} = :${key}`).join(", ");
+        database.prepare(`UPDATE agent SET ${assignments} WHERE id = :id`).run({ ...values, id: agentId });
+    };
+
+    it("records the concos version of the bridge that joined or keeps the card alive, and flags an older one", () => {
+        const joined = store.join({ room: "dev", displayName: "Old", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, concosVersion: "0.1.11" });
+        expect(overviewOf(joined.agent_id)).toMatchObject({ concos_version: "0.1.11", issues: [] });
+        // a bridge left over from an earlier concos keeps beating the card
+        store.heartbeat([joined.agent_id], "0.0.1");
+        expect(overviewOf(joined.agent_id)).toMatchObject({ concos_version: "0.0.1", issues: [{ kind: "old_concos", version: "0.0.1" }] });
+        // a hook's join leaves the version as it is
+        store.heartbeat([joined.agent_id]);
+        expect(overviewOf(joined.agent_id).concos_version).toBe("0.0.1");
+    });
+
+    it("flags a card that says working but has not acted for an hour, and the older of two cards with one name", () => {
+        const quiet = joinAgent("Quiet");
+        emptyCheckIn(quiet.agent_id, { update: { status: "working" } });
+        setRow(quiet.agent_id, { last_call_at: new Date(Date.now() - 2 * 60 * 60_000).toISOString() });
+        expect(overviewOf(quiet.agent_id).issues).toEqual([{ kind: "stuck", since: expect.any(String) }]);
+
+        const older = joinAgent("Twin");
+        const newer = joinAgent("Twin");
+        setRow(older.agent_id, { last_call_at: new Date(Date.now() - 60_000).toISOString() });
+        expect(overviewOf(older.agent_id).issues).toEqual([{ kind: "duplicate", newer_agent_id: newer.agent_id }]);
+        expect(overviewOf(newer.agent_id).issues).toEqual([]);
+        // an ended card is folded away, not flagged
+        store.disconnect([older.agent_id]);
+        expect(overviewOf(older.agent_id).issues).toEqual([]);
+    });
+
+    it("takes a card down from the board, handing its unread messages to the live card of its name", () => {
+        const sender = joinAgent("sender");
+        const stale = joinAgent("Twin");
+        const live = joinAgent("Twin");
+        const waiting = store.sendMessage(sender.agent_id, { to: stale.agent_id, kind: "question", text: "still there?", replyTo: null, requestId: null });
+        emptyCheckIn(stale.agent_id, { update: { editing: ["src/a.ts"], currentDirectory: path.join(workDirectory, "sub") } });
+        expect(store.retireAgent(stale.agent_id)).toEqual({ moved_to: live.agent_id });
+        expect(overviewOf(stale.agent_id)).toMatchObject({ left: true, status: "finished", editing: [], current_directory: null });
+        expect(store.readMessages(live.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([waiting.message_id]);
+        // its bridge beating on does not bring it back; taking it down again changes nothing
+        store.heartbeat([stale.agent_id], "0.1.11");
+        expect(overviewOf(stale.agent_id).left).toBe(true);
+        expect(store.retireAgent(stale.agent_id)).toEqual({ moved_to: null });
+        // without a live card of its name the messages stay on record with it
+        const alone = joinAgent("Alone");
+        expect(store.retireAgent(alone.agent_id)).toEqual({ moved_to: null });
+        expect(() => store.retireAgent(store.ensureHumanParticipant("main", "Reviewer"))).toThrow(/person/);
     });
 });
 

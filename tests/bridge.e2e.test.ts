@@ -229,6 +229,32 @@ describe("concos mcp over stdio", () => {
         expect(receivedAt()).not.toBeNull();
     }, E2E_TIMEOUT_MS);
 
+    it("tells an agent with its first answer in a session to record what the thread settles in the docs", async () => {
+        const asker = await connectBridge();
+        const answerer = await connectBridge();
+        const asked = await callTool(asker, "join", { display_name: "asker", client: "test", working_directory: workDirectory });
+        const answering = await callTool(answerer, "join", { display_name: "answerer", client: "test", working_directory: workDirectory });
+        const question = await callTool(asker, "send_message", { to: answering.agent_id, kind: "question", text: "which port?" });
+        expect((await callTool(answerer, "send_message", { to: asked.agent_id, text: "looking into it" })).record_in_docs).toBeUndefined();
+        const first = await callTool(answerer, "send_message", { to: asked.agent_id, kind: "reply", reply_to: question.message_id, text: "8080, see docs/ports.md" });
+        expect(first.record_in_docs).toContain("project's docs");
+        const second = await callTool(answerer, "send_message", { to: asked.agent_id, kind: "reply", reply_to: question.message_id, text: "confirmed" });
+        expect(second.record_in_docs).toBeUndefined();
+    }, E2E_TIMEOUT_MS);
+
+    it("keeps a card in the project its session started in, and takes the folder it works in through check_in", async () => {
+        const docs = path.join(workDirectory, "docs-repo");
+        fs.mkdirSync(docs);
+        const client = await connectBridge();
+        const joined = await callTool(client, "join", { display_name: "Designer", client: "test", working_directory: workDirectory });
+        const again = await callTool(client, "join", { display_name: "Designer", client: "test", working_directory: docs, resume_handle: joined.handle });
+        expect(again).toMatchObject({ agent_id: joined.agent_id, workspace_id: joined.workspace_id });
+        await callTool(client, "check_in", { current_directory: "" });
+        expect((await callTool(client, "inspect_agent", { agent_id: joined.agent_id })).card.current_directory).toBeUndefined();
+        await callTool(client, "check_in", { current_directory: docs });
+        expect((await callTool(client, "inspect_agent", { agent_id: joined.agent_id })).card).toMatchObject({ working_directory: workDirectory, current_directory: docs });
+    }, E2E_TIMEOUT_MS);
+
     it("counts a message read in full as received when the session calls again through a restarted server", async () => {
         const writer = await connectBridge();
         const first = await connectBridge();

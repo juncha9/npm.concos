@@ -55,8 +55,15 @@ describe("registration menu", () => {
         expect(fs.existsSync(path.join(directory, ".codex"))).toBe(false);
     });
 
+    it("registers on Enter at the question, since yes is its default", async () => {
+        const output = await menu("setup\ngemini\n\nback\nquit\n");
+        expect(output).toContain("Register these settings? (Y/n)");
+        expect(output).toContain("MCP registered for Gemini CLI.");
+        expect(inspectSetup({ host: "gemini", home: path.join(directory, "user") }).registered).toBe(true);
+    });
+
     it.each([
-        "setup\ncodex\n\nback\nquit\n", // Enter defaults to not writing.
+        "setup\ncodex\nn\nback\nquit\n", // No at confirmation.
         "setup\ncodex\n", // EOF at confirmation.
         "setup\ncodex\nESC\nback\nquit\n", // Esc at confirmation.
         "setup\nESC\nquit\n", // Esc from the client list.
@@ -178,7 +185,8 @@ describe("room menu", () => {
         database.close();
 
         const output = await menu("status\nServer\nback\nback\nquit\n");
-        expect(output).toContain("Waiting room · 1 blocked");
+        // the status bar under the question: the bar, the counts and this concos's version
+        expect(output).toMatch(/\? Waiting room\n {2}(▓|!){16} {2}1 blocked {2}· {2}concos \d+\.\d+\.\d+\n/);
         expect(output).toContain("[Agents 1]  Messages 0");
         expect(output).toMatch(/1\) blocked +Server \(Codex\) · just now/);
         expect(output).toMatch(/ {10}Blocker  needs schema review/);
@@ -187,6 +195,48 @@ describe("room menu", () => {
         expect(output).toContain("Stored messages; retry dedupe remains.");
         expect(output).toContain("merged the storage layer");
         expect(output.lastIndexOf("concos · Shared waiting room")).toBeGreaterThan(output.indexOf("merged the storage layer"));
+    });
+
+    it("flags cards that look wrong and lets the person take them down, all flagged at once or one from its card", async () => {
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const join = (name: string) => store.join({ room: "dev", displayName: name, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const older = join("Twin");
+        const newer = join("Twin");
+        const solo = join("Solo");
+        database.prepare("UPDATE agent SET last_call_at = :at WHERE id = :id").run({ at: new Date(Date.now() - 60_000).toISOString(), id: older.agent_id });
+        database.close();
+
+        const flagged = await menu("status\nretire\ny\nback\nquit\n");
+        expect(flagged).toMatch(/ {10}Check {4}a newer card has this name · take this one down/);
+        expect(flagged).toContain("Take down flagged cards (1)");
+        expect(flagged).toContain("Take down Twin (Codex)? It leaves the room");
+        expect(flagged).toContain("Took down 1 card.");
+        const fromCard = await menu("status\nSolo\nretire\ny\nback\nquit\n");
+        expect(fromCard).toContain("Take down this card");
+        expect(fromCard).toContain("Took down 1 card.");
+
+        const check = await openDatabase(path.join(directory, "data"));
+        try {
+            const left = (id: string) => (check.prepare("SELECT left_at FROM agent WHERE id = :id").get({ id }) as { left_at: string | null }).left_at != null;
+            expect([left(older.agent_id), left(newer.agent_id), left(solo.agent_id)]).toEqual([true, false, true]);
+        }
+        finally { check.close(); }
+    });
+
+    it("keeps an agent under the project its session started in and shows the folder it works in now", async () => {
+        const agent = await seedRoom();
+        const docs = path.join(directory, "docs-repo");
+        fs.mkdirSync(docs);
+        const database = await openDatabase(path.join(directory, "data"));
+        new RoomStore(database).checkIn(agent.agent_id, {
+            cursor: null, expectedRevision: null, update: { task: "design notes", currentDirectory: docs }, checkpoint: null, receivedMessageIds: [],
+        });
+        database.close();
+
+        const output = await menu("status\nback\nquit\n");
+        expect(output).toContain(`${path.basename(directory)}  ${directory}`);
+        expect(output).toMatch(/ {10}Folder {3}docs-repo\n +Task {5}design notes/);
     });
 
     it("shows an agent's role on its row and lets the person at the board set it", async () => {
@@ -602,6 +652,14 @@ describe("message groups on the board", () => {
         // another name that only starts the same way, and a lead with nothing after it, stay
         expect(list).toContain("[Alphabet] stays as written");
         expect(list).toMatch(/\n +\[Alpha\]\n/);
+    });
+
+    it("opens message search from the Messages tab and comes back to the board", async () => {
+        await seedMessages([["Alpha", []]]);
+        const output = await menu("status\nmessages\nsearch\nback\nback\nquit\n");
+        expect(output).toMatch(/\d+\) Search messages +by text, topic or sender/);
+        expect(output).toContain("Search messages by");
+        expect(output.lastIndexOf("[Messages 1]")).toBeGreaterThan(output.indexOf("Search messages by"));
     });
 
     it("draws sender rules on a terminal and inverts the selected block's header", async () => {

@@ -73,17 +73,21 @@ function fullyDeliveredMessageIds(toolName: string, result: unknown): number[] {
 }
 
 const SERVER_INSTRUCTIONS = [
-    "concos is one shared local waiting room for this user. Agents across projects leave their status and messages here; working_directory identifies each agent's project.",
-    "Call join once when you start a task, passing your absolute working directory and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available.",
+    "concos is one shared local waiting room for this user. Agents across projects leave their status and messages here; the folder each session started in identifies its project.",
+    "Call join once when you start a task, passing the absolute folder this session started in and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available. When you work in another folder, report it with check_in current_directory; your card stays with the project you started in.",
     "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Messages reach you only through concos calls, so in long work check_in after each finished step as well. When the user gives you a role, report it in role, not task. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
     "Answer messages with kind question. Use read_messages for the full text of a truncated message, and inspect_agent for another agent's detailed context.",
     "A message to all is a post on your board in the room: others read it for reference and nobody is waited on. Post only what every agent needs to know, such as a change to a shared server or database; rewrite that post with edit when it changes, and take it down with remove_posts once it no longer applies. Send progress and results to the agents concerned, by agent_id or a list. Start a message with its content: the room already shows its sender and recipients.",
-    "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits. Durable project knowledge belongs in the project's docs, not in messages.",
+    "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits.",
+    "Messages are short-lived: one is deleted an hour after it was read, and within a day in any case. When an exchange settles a design, a decision, a contract or a plan, write it into the project's docs (the file that owns it) before you answer, and cite that path in the thread; durable project knowledge never lives only in messages.",
     "Call leave when your task is done. Do not call check_in on a timer.",
     "An inbox field on any response counts unread questions and other messages. A message whose full text reached you counts as received on your next call; use read_messages for truncated or unread ones.",
 ].join("\n");
 
 const HANDLE_PROPERTY: ValueSchema = { type: "string", description: "Handle from join. Omit to use the last one joined in this session." };
+
+/** Carried by an agent's first answer in a session: the thread goes, so what it settled belongs in the docs. */
+const RECORD_IN_DOCS = "This thread is deleted within a day. If your answer settles a design, a decision, a contract or a plan, write it into the project's docs (the file that owns it) and cite that path in the thread.";
 const ANY_INTEGER = { type: "integer", minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER } as const;
 const POSITIVE_INTEGER = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER } as const;
 
@@ -101,6 +105,8 @@ export async function runBridge(): Promise<void> {
     let lastHandle: string | null = null;
     let toolAgentId: string | null = null;
     const joinedAgentIds = new Set<string>();
+    /** Agents whose first answer through this bridge already carried `record_in_docs`. */
+    const agentsToldToRecord = new Set<string>();
 
     const resolveAgentId = (handle: string | undefined): string => {
         const effectiveHandle = handle ?? lastHandle;
@@ -149,7 +155,7 @@ export async function runBridge(): Promise<void> {
         inputSchema: inputSchema({
             display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role. Rename later with check_in display_name." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
-            working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder you work in." },
+            working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder this session started in. It keeps your card with its project; joining again from another folder records that folder as current_directory." },
             workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory." },
             resume_handle: { type: "string", description: "Handle from an earlier join, to come back as the same agent." },
         }, ["display_name", "client", "working_directory"]),
@@ -161,6 +167,7 @@ export async function runBridge(): Promise<void> {
             workingDirectory: args.working_directory,
             workspaceRoot: args.workspace_root ?? null,
             resumeHandle: args.resume_handle ?? null,
+            concosVersion: CONCOS_VERSION,
         });
         lastHandle = result.handle;
         toolAgentId = result.agent_id;
@@ -183,6 +190,7 @@ export async function runBridge(): Promise<void> {
             references: { type: "array", items: { type: "string", maxLength: MAX_LIST_ITEM_LENGTH }, maxItems: MAX_LIST_ITEMS, description: `Relevant files, commits or docs; up to ${MAX_LIST_ITEMS}.` },
             editing: { type: "array", items: { type: "string", maxLength: MAX_LIST_ITEM_LENGTH }, maxItems: MAX_LIST_ITEMS, description: `Files or folders you are editing now, up to ${MAX_LIST_ITEMS}; [] when done.` },
             checkpoint: { type: "string", maxLength: MAX_CHECKPOINT_LENGTH, description: "A short work record worth keeping: result, decision, what remains." },
+            current_directory: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute folder you work in now, when it is not the one this session started in; \"\" when you are back. Your card stays in its project." },
             received_message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Optional, up to ${MAX_RECEIVED_IDS}: messages you read. Full-text deliveries are acknowledged on your next call anyway.` },
             expected_revision: { ...ANY_INTEGER, description: "Reject the update if your card moved past this revision." },
             cursor: { type: "string", description: "Omit to continue from the last delivered position; repeat a previous cursor to receive again." },
@@ -190,7 +198,7 @@ export async function runBridge(): Promise<void> {
     }, (values) => runTool("check_in", () => {
         const args = values as {
             handle?: string; display_name?: string; status?: AgentStatus; role?: string; task?: string; summary?: string; next_step?: string; blocker?: string;
-            references?: string[]; editing?: string[]; checkpoint?: string; received_message_ids?: number[]; expected_revision?: number; cursor?: string;
+            references?: string[]; editing?: string[]; checkpoint?: string; current_directory?: string; received_message_ids?: number[]; expected_revision?: number; cursor?: string;
         };
         const agentId = resolveAgentId(args.handle);
         const result = store.checkIn(agentId, {
@@ -206,6 +214,7 @@ export async function runBridge(): Promise<void> {
                 blocker: args.blocker,
                 references: args.references,
                 editing: args.editing,
+                currentDirectory: args.current_directory,
             },
             checkpoint: args.checkpoint ?? null,
             receivedMessageIds: args.received_message_ids ?? [],
@@ -238,7 +247,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "send_message",
-        description: `Leave a message for one agent or several, or post one to the whole room. Success means stored, not read. A post to all is there for reference: nobody receives it or is waited on, the room keeps your newest ${POSTS_PER_AGENT}, edit rewrites one when it changes, and remove_posts takes it down. Send to the agents concerned unless everyone needs it.`,
+        description: `Leave a message for one agent or several, or post one to the whole room. Success means stored, not read. A post to all is there for reference: nobody receives it or is waited on, the room keeps your newest ${POSTS_PER_AGENT}, edit rewrites one when it changes, and remove_posts takes it down. Send to the agents concerned unless everyone needs it. Messages are deleted within a day: write what an exchange settles into the project's docs and cite the path.`,
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             to: {
@@ -267,7 +276,7 @@ export async function runBridge(): Promise<void> {
             }
             return store.editPost(agentId, { messageId: args.edit, text: args.text, kind: args.kind, topics: args.topics });
         }
-        return store.sendMessage(agentId, {
+        const sent = store.sendMessage(agentId, {
             to: args.to,
             kind: args.kind ?? "note",
             text: args.text,
@@ -275,6 +284,14 @@ export async function runBridge(): Promise<void> {
             requestId: args.request_id ?? null,
             topics: args.topics ?? [],
         });
+        // An answer is where a design question gets settled between agents, and the thread is gone
+        // within a day; the first answer an agent sends through this bridge says where the outcome
+        // belongs (2026-10-26 report: agents settled designs in messages and left the docs behind)
+        if(args.kind == "reply" && agentsToldToRecord.has(agentId) == false) {
+            agentsToldToRecord.add(agentId);
+            return { ...sent, record_in_docs: RECORD_IN_DOCS };
+        }
+        return sent;
     }));
 
     registerTool({
@@ -331,7 +348,8 @@ export async function runBridge(): Promise<void> {
 
     const heartbeatTimer = setInterval(() => {
         try {
-            store.heartbeat([...joinedAgentIds]);
+            // the version shows on the board, so a session still on an older concos can be found
+            store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
             // every running bridge sweeps on its heartbeat, so residue is cleared while anyone is connected
             const removed = store.cleanUp();
             if(removed.messages + removed.agents + removed.checkpoints + removed.workspaces > 0) {

@@ -113,6 +113,7 @@ concos: question #17 from concos development is unread. Read it with read_messag
 - 서브에이전트에서 온 입력(`agent_id` 포함)은 무시한다(기존). `--agent`로 시작한 Claude Code 세션은 `agent_type`만 넣고 `agent_id`는 넣지 않으므로 정상으로 기록된다(0단계 V8).
 - 모델이 `resume_handle` 없이 `join`하면 별도 참가자가 생긴다. 같은 폴더라는 이유로 합치는 추정은 하지 않는다(기존 결정 유지). 대신 주입 문구로 `join` 방법을 분명히 알린다.
 - 훅이 만든 참가자의 기본 이름은 `Claude Code · npm.concos`처럼 클라이언트와 폴더 이름이다. 모델이 `join`하면 세션 이름으로 바뀐다.
+- 새 세션의 SessionStart `cwd`가 세션을 시작한 폴더이고 카드의 프로젝트를 정한다(2026-10-26). 모델이 다른 폴더로 `join`하거나 재개·압축의 SessionStart가 다른 `cwd`로 와도 프로젝트는 그대로고, 그 폴더는 `current_directory`로 남는다. Claude Code는 `cd`로 옮긴 폴더를 훅 `cwd`로 보낼 수 있기 때문이다.
 - 훅 설치 전에 시작한 세션은 첫 UserPromptSubmit에서 같은 세션 키로 카드를 만들고, 핸들과 `resume_handle`을 쓰는 `join` 방법을 알린다.
 - 카드가 없는 상태의 다른 이벤트와 `leave` 뒤의 이벤트는 무시한다.
 

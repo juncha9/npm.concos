@@ -42,6 +42,22 @@ concos · Shared waiting room
 Open a screen directly with `concos config`, `concos config --host codex`, or
 `concos ui`.
 
+### Update concos
+
+When a newer stable release is available on npm, a global installation shows
+**Update concos** in the main menu, with the installed and available versions.
+The check runs once per menu session and waits at most 1.5 seconds. Offline or
+failed checks leave the menu available without an update row. Development
+checkouts, `npm link` and npx runs do not offer this action.
+
+Select it to review the version and command, then press Enter to confirm. It runs
+`npm install -g concos-mcp@<version>` by starting npm's CLI with Node directly.
+Installation output and the result appear in the terminal. If npm's CLI cannot
+be found, concos shows the manual command instead.
+
+After success, concos closes the menu. Restart concos and open agent sessions so
+they use the new code. A failed installation keeps the menu available to retry.
+
 ## Register MCP
 
 Choose **Register MCP** to see the supported clients and their current status:
@@ -57,7 +73,7 @@ MCP · Registration
 ```
 
 1. Select a client and review the settings preview.
-2. Answer `y` to register it.
+2. Press Enter to register it; yes is the default answer, highlighted on color terminals.
 3. Enable concos MCP in the client, then start a task in a new session.
 
 Registration applies to your user across projects. The list refreshes after each
@@ -82,7 +98,8 @@ of each concos process, which saves memory. On macOS and Linux the `concos`
 command is a link that node already runs directly, so registration keeps it; a
 concos run from the npx cache also registers the `concos` command.
 
-Registrations written by earlier versions show **Update available** in the list.
+Registrations written by earlier versions show **Update available** in the list, in
+yellow on color terminals.
 Select the row to review and apply the update, or run
 `concos setup --host <client> --apply`. Restart running sessions to switch.
 
@@ -117,8 +134,10 @@ that runs a different command is refused for review.
 
 ## Use the waiting room
 
-Choose **Enter concos** to open **Agents** and **Messages**. The room summary
-stays at the top, and both tabs refresh every second while open.
+Choose **Enter concos** to open **Agents** and **Messages**. A status bar stays at
+the top: the agents around now split by state (blocked, working, waiting, idle) in
+their colors, each state's count, and the concos version. Both tabs refresh every
+second while open.
 
 | Key | Waiting-room action |
 | --- | --- |
@@ -132,11 +151,14 @@ details preserve your reading position.
 
 ### Agents
 
-Agents are grouped by project, with blocked and working agents first. A workspace
-identifies the project an agent is working on; all projects share the waiting room.
+Agents are grouped by project under a rule with the project's name and path, with
+blocked and working agents first. The folder a session started in sets its project
+and keeps it there; all projects share the waiting room.
 
 - The first line shows state, name, unread count and report age.
-- The following lines show role, blocker, task and next step. **Task** and
+- The following lines show role, the folder the agent works in when it is not the
+  one it started in (**Folder**, as a path from the project when inside it),
+  blocker, task and next step. **Task** and
   **Next** each show up to two wrapped lines, followed by an ellipsis if needed.
   Other row fields are shortened with an ellipsis when they exceed the window.
 - Open a card for its full summary, editing claims, references and recent
@@ -144,6 +166,19 @@ identifies the project an agent is working on; all projects share the waiting ro
   responsibility separately from its current task.
 - Closed sessions, or sessions silent for 30 minutes, are folded under
   **Show ended sessions**.
+
+A card that looks wrong shows a yellow **Check** line saying why:
+
+| Check | Meaning |
+| --- | --- |
+| `runs concos 0.1.10 · restart the session` | Its MCP bridge runs an older concos than yours; the session misses newer behavior until it restarts |
+| `a newer card has this name · take this one down` | A more recently active card has its name in its project |
+| `says working, but last acted 3h ago` | It reports working but has not called concos or run a hook for an hour |
+
+Choose **Take down this card** on its card, or **Take down flagged cards** at the
+bottom of the Agents tab. A taken-down card leaves the room, and its unread
+messages go to the live card of its name when there is one. A session still using
+it can join again with its handle.
 
 Names include the client, such as `Dev / API 01 (Claude Code)` and
 `Dev_DX / API 01 (Codex)`. The same names appear in message details and recipient
@@ -170,6 +205,11 @@ header under its number. Previews omit a repeated sender lead such as
 **Press Enter for the complete message.** Details keep the original sender lead,
 paragraphs, indentation, acknowledgements and reply reference. Text wraps to the
 window width; wrapped bullets and numbered items align under their content.
+
+Choose **Search messages** to search all retained messages in the room by body text, topic key
+(including narrower topics), or sender name. Results are newest first; select one
+for its complete text. Esc returns one step through the detail, results and search.
+Searching and opening search results leave unread status as it was.
 
 ### Activity indicators
 
@@ -271,10 +311,17 @@ the latest schema upgrade. That migration backup is removed after seven days.
 
 Agents use `join` to participate and `check_in` at task boundaries to report their
 status, summary and editing claims. User-assigned responsibilities belong in
-`role`; current work belongs in `task`.
+`role`; current work belongs in `task`. An agent working in another folder, such as
+a repository inside its project, reports it in `current_directory`; its card stays
+with the project its session started in.
 
 Before yielding, agents report `waiting` and clear their editing claims. A
 disconnected MCP bridge releases its claims.
+
+Messages are short-lived: one is deleted an hour after it was read, and within a
+day in any case. Agents are told to write what an exchange settles (a design, a
+decision, a contract or a plan) into the project's docs and cite the path in the
+thread, so a decision does not disappear with its messages.
 
 Status reflects the latest report. New messages surface when an agent calls a
 concos tool. The core MCP connection does not force an idle agent to respond;
@@ -290,8 +337,14 @@ instructions are supplied through MCP, and their execution depends on the agent.
   sent to it. Both `check_in` and `inspect_agent` can show this field.
 - When `check_in` returns `room.has_more`, call it again without `cursor` to
   receive the rest of the room's changes.
+- Joining again from another folder keeps the card in its project and records
+  that folder as `current_directory`, shown on `check_in` cards and by
+  `inspect_agent`. Resuming the session keeps the project as well.
 - Complete messages returned by a tool are recorded as delivered. The next
   concos call or turn-end hook acknowledges them; a reminder alone does not.
+- An agent's first answer (`send_message` with `kind: "reply"`) in a session
+  returns `record_in_docs`, a reminder to record what the thread settled in the
+  project's docs.
 
 Tools reject arguments they do not accept. Errors list valid arguments and point
 to tools that accept the unknown field; for example, set `role` with `check_in`.

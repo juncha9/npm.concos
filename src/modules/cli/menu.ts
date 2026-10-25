@@ -10,6 +10,8 @@ import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
 import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, resolveHooksPath, UPDATED_MESSAGE } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
+import { checkForSelfUpdate, showSelfUpdate } from "./self-update";
+import type { AvailableUpdate, SelfUpdateOptions } from "./self-update";
 
 export interface MenuOptions {
     input: Readable;
@@ -17,6 +19,8 @@ export interface MenuOptions {
     home?: string;
     host?: string;
     startWithSetup?: boolean;
+    /** Registry and npm discovery overrides for isolated tests; false skips the lookup. */
+    selfUpdate?: SelfUpdateOptions | false;
 }
 
 type SetupDraft = SetupTarget;
@@ -37,7 +41,7 @@ function hookSummary(draft: SetupTarget): string {
     catch { return "Hooks need attention"; }
 }
 
-function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "success" } {
+function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "success"; hintWarning?: string } {
     try {
         if(inspectSettings(draft).length > 0) {
             return { hint: "Settings file needs fixing" };
@@ -46,11 +50,12 @@ function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "
         if(status.registered == false) {
             return { hint: "Not registered" };
         }
-        const update = planUpdate(draft).length > 0 ? " · Update available" : "";
+        // in yellow after the green status, so a registration that works still shows it can be updated
+        const update = planUpdate(draft).length > 0 ? { hintWarning: "Update available" } : {};
         if(hasHooks(draft.host) == false) {
-            return { hint: `MCP registered${update}`, hintStatus: "success" };
+            return { hint: "MCP registered", hintStatus: "success", ...update };
         }
-        return { hint: `MCP registered · ${hookSummary(draft)}${update}`, hintStatus: "success" };
+        return { hint: `MCP registered · ${hookSummary(draft)}`, hintStatus: "success", ...update };
     }
     catch { return { hint: "Configuration needs attention" }; }
 }
@@ -186,7 +191,8 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
                 continue;
             }
             previewChanges(prompter, changes);
-            if(!await prompter.askYesNo("Register these settings?", false)) continue;
+            // choosing an unregistered client already asks for it; Enter goes on with the preview just shown
+            if(!await prompter.askYesNo("Register these settings?", true)) continue;
             applySetup(changes);
             let registered = "MCP";
             if(hasHooks(draft.host) && changes.some((change) => change.path == resolveHooksPath(draft))) {
@@ -305,17 +311,22 @@ export async function runMenu(options: MenuOptions): Promise<void> {
     if(options.host != null) getMcpClient(options.host);
     const draft: SetupDraft = { host: options.host ?? "codex", home: options.home };
     const prompter = new Prompter(options.input, options.output);
-    let selected: "setup" | "status" | "say" | "quit" = "setup";
+    let selected: "setup" | "status" | "say" | "update" | "quit" = "setup";
     let startWithSetup = options.startWithSetup ?? false;
+    let update: AvailableUpdate | null | undefined;
     const top = prompter.mark();
     try {
         for(;;) {
             try {
                 prompter.eraseTo(top);
-                const action: "setup" | "status" | "say" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
+                if(!startWithSetup && update === undefined) {
+                    update = options.selfUpdate === false ? null : await checkForSelfUpdate(options.selfUpdate);
+                }
+                const action: "setup" | "status" | "say" | "update" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
                     { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
                     { value: "status", label: "Enter concos", hint: "Agents · Messages" },
                     { value: "say", label: "Send a message" },
+                    ...(update != null ? [{ value: "update" as const, label: "Update concos", hint: `${update.currentVersion} → ${update.latestVersion}` }] : []),
                     { separator: true },
                     { value: "quit", label: "Quit" },
                 ], { defaultValue: selected, cancelValue: "quit" });
@@ -324,6 +335,9 @@ export async function runMenu(options: MenuOptions): Promise<void> {
                 selected = action;
                 if(action == "setup") await editSetup(prompter, draft);
                 else if(action == "status") await showStatus(prompter, options);
+                else if(action == "update") {
+                    if(update != null && await showSelfUpdate(prompter, update, options.selfUpdate || undefined)) return;
+                }
                 else await sendFromMenu(prompter);
             }
             catch(error) {

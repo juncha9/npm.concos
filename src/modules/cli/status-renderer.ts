@@ -1,5 +1,6 @@
+import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import type { InspectResult, RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
+import type { AgentIssue, InspectResult, RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth } from "./prompter";
 
 export interface StatusRenderOptions {
@@ -141,6 +142,31 @@ export function age(isoText: string, nowMs: number, english: boolean): string {
     return english ? `${Math.floor(hours / 24)}d ago` : `${Math.floor(hours / 24)}일 전`;
 }
 
+/** Where an agent works now when it is not where its session started: under its project, the path from the project. */
+export function workFolder(agent: RoomOverviewAgent): string {
+    if(agent.current_directory == null) {
+        return "";
+    }
+    if(agent.workspace_path != null) {
+        const relative = path.relative(agent.workspace_path, agent.current_directory);
+        if(relative != "" && relative.startsWith("..") == false && path.isAbsolute(relative) == false) {
+            return relative.replaceAll(path.sep, "/");
+        }
+    }
+    return agent.current_directory;
+}
+
+/** Why a card looks wrong, and what to do about it, in one line. */
+export function issueText(issue: AgentIssue, nowMs: number, english: boolean): string {
+    if(issue.kind == "old_concos") {
+        return english ? `runs concos ${issue.version} · restart the session` : `concos ${issue.version}로 실행 중 · 세션을 다시 시작하세요`;
+    }
+    if(issue.kind == "duplicate") {
+        return english ? "a newer card has this name · take this one down" : "같은 이름의 새 카드가 있음 · 이 카드를 내리세요";
+    }
+    return english ? `says working, but last acted ${age(issue.since, nowMs, true)}` : `작업 중이지만 마지막 활동은 ${age(issue.since, nowMs, false)}`;
+}
+
 export function renderRoomStatus(overview: {
     agents: RoomOverviewAgent[];
     messages: RoomOverviewMessage[];
@@ -234,7 +260,11 @@ export function renderRoomStatus(overview: {
             if(agent.stale && !agent.left && !agent.human) {
                 add(english ? "Stale report" : "오래된 상태 보고", "    ", (text) => paint(text, 33));
             }
+            for(const issue of agent.issues) {
+                add(`${english ? "Check" : "확인"}  ${issueText(issue, nowMs, english)}`, "    ", (text) => paint(text, 33));
+            }
             field(english ? "Role" : "역할", agent.role);
+            field(english ? "Folder" : "폴더", workFolder(agent));
             field(english ? "Task" : "작업", agent.task);
             field(english ? "Next" : "다음", agent.next_step);
             field(english ? "Blocker" : "막힘", agent.blocker, true);
@@ -337,12 +367,17 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
     else if(card.online == false) {
         connection = english ? "offline" : "연결 끊김";
     }
-    add([card.client, connection, `${english ? "updated" : "갱신"} ${age(card.updated_at, nowMs, english)}`, card.agent_id].join(" · "), "", 2);
+    const version = agent.concos_version == null ? [] : [`concos ${agent.concos_version}`];
+    add([card.client, connection, `${english ? "updated" : "갱신"} ${age(card.updated_at, nowMs, english)}`, ...version, card.agent_id].join(" · "), "", 2);
     if(card.workspace != null) {
         add(card.workspace.path, "", 2);
     }
     lines.push(paint((unicode ? "─" : "-").repeat(width), 2));
+    for(const issue of agent.issues) {
+        field(english ? "Check" : "확인", issueText(issue, nowMs, english), 33);
+    }
     field(english ? "Role" : "역할", card.role);
+    field(english ? "Folder" : "폴더", workFolder(agent));
     field(english ? "Blocker" : "막힘", card.blocker, 31);
     field(english ? "Task" : "작업", card.task);
     field(english ? "Summary" : "요약", card.summary);

@@ -218,4 +218,14 @@ export const SCHEMA_STEPS: readonly string[] = [
     -- that restarted used to forget it, and the message stayed unread.
     ALTER TABLE message_receipt ADD COLUMN delivered_at TEXT;
     `,
+    `
+    -- The folder the agent works in now, when it is not the one its session started in. The
+    -- started folder (working_directory, workspace_id) stays put, so the card stays with its
+    -- project; agents that joined again from a subfolder's repository used to move to it.
+    ALTER TABLE agent ADD COLUMN current_directory TEXT;
+    -- The concos version of the MCP bridge that last joined or kept the card alive, so the board
+    -- can point at sessions still running an older concos after an upgrade. Null until a bridge
+    -- from this version on touches the card.
+    ALTER TABLE agent ADD COLUMN concos_version TEXT;
+    `,
 ];

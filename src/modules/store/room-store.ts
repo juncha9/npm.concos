@@ -34,6 +34,7 @@ import {
     WAKE_HOURLY_LIMIT,
 } from "../../_defs";
 import type { AgentStatus, MessageKind } from "../../_defs";
+import { CONCOS_VERSION } from "../../_libs/version";
 import { runInTransaction } from "./database";
 import { RoomError } from "./room-error";
 import type { HookEvent } from "../hooks/types";
@@ -45,7 +46,12 @@ interface AgentRow {
     client: string;
     is_human: number;
     workspace_id: string | null;
+    /** The folder the session first started in; with `workspace_id`, fixed for the card's life. */
     working_directory: string | null;
+    /** The folder the agent works in now, when it is another one; null otherwise. */
+    current_directory: string | null;
+    /** The concos version of the MCP bridge that last joined or kept it alive; null before 0.1.11. */
+    concos_version: string | null;
     status: AgentStatus;
     role: string;
     task: string;
@@ -61,6 +67,8 @@ interface AgentRow {
     updated_at: string;
     editing_updated_at: string | null;
     last_seen_at: string;
+    /** When the agent itself last acted: a concos call or a hook event, never a bridge heartbeat. */
+    last_call_at: string | null;
     disconnected_at: string | null;
     left_at: string | null;
 }
@@ -113,10 +121,10 @@ export interface EditResult {
 }
 
 const AGENT_COLUMNS = `
-    id, room, display_name, client, is_human, workspace_id, working_directory,
+    id, room, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
     status, role, task, summary, next_step, blocker, reference_list, editing_list,
     revision, changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
-    last_seen_at, disconnected_at, left_at
+    last_seen_at, last_call_at, disconnected_at, left_at
 `;
 
 export interface CardUpdate {
@@ -131,6 +139,8 @@ export interface CardUpdate {
     editing?: string[];
     /** The card's name; renaming needs no new join. Empty or blank keeps the current name. */
     displayName?: string;
+    /** Absolute folder the agent works in now; empty, or the folder its session started in, clears it. */
+    currentDirectory?: string;
 }
 
 export interface JoinResult {
@@ -189,6 +199,8 @@ export interface CompactCard {
     editing?: string[];
     checkpoint?: string;
     workspace_id?: string;
+    /** The folder the agent works in now, when it is not the one its session started in. */
+    current_directory?: string;
     /** For a card whose session ended or left: the live card of its name in its project, which messages to it reach. */
     replaced_by?: string;
     human?: true;
@@ -239,7 +251,10 @@ export interface FullCard {
     editing: string[];
     editing_updated_at: string | null;
     workspace: { id: string; path: string; verified: boolean } | null;
+    /** The folder the session started in, which keeps the card with its project. */
     working_directory: string | null;
+    /** Same as `CompactCard.current_directory`. */
+    current_directory?: string;
     revision: number;
     updated_at: string;
     last_seen_at: string;
@@ -284,6 +299,8 @@ export interface RoomOverviewAgent {
     blocker: string;
     editing: string[];
     workspace_path: string | null;
+    /** The folder the agent works in now, when it is not the one its session started in. */
+    current_directory: string | null;
     updated_at: string;
     online: boolean;
     stale: boolean;
@@ -291,7 +308,21 @@ export interface RoomOverviewAgent {
     /** Closed or silent past ENDED_AFTER_MS; the board folds these away. */
     ended: boolean;
     pending_count: number;
+    /** The concos version of its MCP bridge, when one from 0.1.11 on has touched the card. */
+    concos_version: string | null;
+    /** Why a live card looks wrong, for the person at the board to take it down; empty when it does not. */
+    issues: AgentIssue[];
 }
+
+/**
+ * Why a live card looks wrong. `old_concos`: its bridge runs an older concos than the one
+ * reading, so it misses newer behaviour until the session restarts. `duplicate`: a more recently
+ * active card has its name in its project. `stuck`: it says working but has not acted for an hour.
+ */
+export type AgentIssue =
+    | { kind: "old_concos"; version: string }
+    | { kind: "duplicate"; newer_agent_id: string }
+    | { kind: "stuck"; since: string };
 
 export interface RoomOverviewParticipant {
     name: string;
@@ -328,6 +359,23 @@ export interface RoomOverviewMessage {
     kind: MessageKind;
     reply_to: number | null;
     text: string;
+}
+
+export interface MessageSearchInput {
+    /** Literal substring of the body, ignoring ASCII case. */
+    text?: string;
+    /** A topic or its leading words, including narrower topics as in readMessages. */
+    topic?: string;
+    /** Literal substring of the sender's display name, ignoring ASCII case. */
+    sender?: string;
+    /** Most recent matches to return, from 1 to 100; defaults to 50. */
+    limit?: number;
+}
+
+export interface MessageSearchResult {
+    /** Newest first; the full text is available for the detail view. */
+    messages: RoomOverviewMessage[];
+    has_more?: true;
 }
 
 function preview(text: string, length: number): string {
@@ -391,6 +439,20 @@ const ACTIVE_AGENT_CONDITION = `(
     A.left_at IS NULL
     AND (A.is_human = 1 OR (A.disconnected_at IS NULL AND A.last_seen_at >= :active_since))
 )`;
+
+/** Orders two `x.y.z` versions by their numbers; a missing or unreadable part counts as 0. */
+function compareVersions(left: string, right: string): number {
+    const parts = (version: string) => version.split(/[.+-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+    const leftParts = parts(left);
+    const rightParts = parts(right);
+    for(let index = 0; index < 3; index += 1) {
+        const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+        if(difference != 0) {
+            return difference;
+        }
+    }
+    return 0;
+}
 
 /** The `:active_since` value for `ACTIVE_AGENT_CONDITION`; stored times are ISO UTC, so text order is time order. */
 function activeSince(nowMs: number): string {
@@ -509,8 +571,26 @@ function resolveWorkspacePath(rawPath: string): { displayPath: string; comparePa
     }
 }
 
+/**
+ * Where a card says the agent works now: null for no folder or the folder its session started
+ * in, so the card carries a current folder only while it differs.
+ */
+function currentDirectoryOf(directory: string | null, startedIn: string | null): string | null {
+    const trimmed = directory?.trim() ?? "";
+    if(trimmed == "") {
+        return null;
+    }
+    if(path.isAbsolute(trimmed) == false) {
+        throw new RoomError("current_directory must be an absolute path");
+    }
+    if(startedIn != null && resolveWorkspacePath(trimmed).comparePath == resolveWorkspacePath(startedIn).comparePath) {
+        return null;
+    }
+    return path.resolve(trimmed);
+}
+
 function applyCardUpdate(current: AgentRow, update: CardUpdate): {
-    values: Pick<AgentRow, "status" | "role" | "task" | "summary" | "next_step" | "blocker" | "reference_list" | "editing_list">;
+    values: Pick<AgentRow, "status" | "role" | "task" | "summary" | "next_step" | "blocker" | "reference_list" | "editing_list" | "current_directory">;
     cardChanged: boolean;
     editingChanged: boolean;
 } {
@@ -523,7 +603,11 @@ function applyCardUpdate(current: AgentRow, update: CardUpdate): {
         blocker: update.blocker?.trim() ?? current.blocker,
         reference_list: current.reference_list,
         editing_list: current.editing_list,
+        current_directory: current.current_directory,
     };
+    if(update.currentDirectory != null) {
+        values.current_directory = currentDirectoryOf(update.currentDirectory, current.working_directory);
+    }
     if(update.references != null) {
         values.reference_list = JSON.stringify(update.references);
     }
@@ -538,7 +622,8 @@ function applyCardUpdate(current: AgentRow, update: CardUpdate): {
         || values.summary != current.summary
         || values.next_step != current.next_step
         || values.blocker != current.blocker
-        || values.reference_list != current.reference_list;
+        || values.reference_list != current.reference_list
+        || values.current_directory != current.current_directory;
     return { values: values, cardChanged: cardChanged, editingChanged: editingChanged };
 }
 
@@ -742,6 +827,8 @@ export class RoomStore {
         workspaceRoot: string | null;
         resumeHandle: string | null;
         hookSession?: { host: string; sessionId: string };
+        /** The joining MCP bridge's concos version; hooks leave the card's as it is. */
+        concosVersion?: string;
     }): JoinResult {
         const room = SHARED_ROOM;
         if(path.isAbsolute(input.workingDirectory) == false) {
@@ -790,12 +877,24 @@ export class RoomStore {
                 if(resumed.room != room) {
                     throw new RoomError("resume_handle belongs to another room");
                 }
+                // The folder the session first started in keeps the card with its project for good
+                // (2026-10-26 user decision, a card had moved to a repository inside its project).
+                // Joining again from another folder, by the model or by a session start that resumes
+                // or compacts the session from where it has moved, records that folder instead.
+                let startedIn = { workspaceId: workspaceId, directory: workingDirectory };
+                let currentDirectory: string | null = null;
+                if(resumed.workspace_id != null && resumed.working_directory != null) {
+                    startedIn = { workspaceId: resumed.workspace_id, directory: resumed.working_directory };
+                    currentDirectory = currentDirectoryOf(workingDirectory, resumed.working_directory);
+                }
                 this.prepare(`
                     UPDATE agent
                     SET display_name = :display_name,
                         client = :client,
                         workspace_id = :workspace_id,
                         working_directory = :working_directory,
+                        current_directory = :current_directory,
+                        concos_version = COALESCE(:concos_version, concos_version),
                         changed_seq = :changed_seq,
                         last_seen_at = :now,
                         last_call_at = :now,
@@ -807,18 +906,20 @@ export class RoomStore {
                     id: resumed.id,
                     display_name: session == null ? input.displayName : resumed.display_name,
                     client: session == null ? input.client : resumed.client,
-                    workspace_id: workspaceId,
-                    working_directory: workingDirectory,
+                    workspace_id: startedIn.workspaceId,
+                    working_directory: startedIn.directory,
+                    current_directory: currentDirectory,
+                    concos_version: input.concosVersion ?? null,
                     changed_seq: seq,
                     now: nowText,
                 });
                 // the model naming the card its session-start hook made, or coming back by its handle
                 let cardId = resumed.id;
                 if(session == null) {
-                    cardId = this.mergeIntoEarlierCard(resumed.id, input.displayName, workspaceId, nowText) ?? resumed.id;
-                    this.adoptFromEndedCards(cardId, input.displayName, workspaceId, nowMs);
+                    cardId = this.mergeIntoEarlierCard(resumed.id, input.displayName, startedIn.workspaceId, nowText) ?? resumed.id;
+                    this.adoptFromEndedCards(cardId, input.displayName, startedIn.workspaceId, nowMs);
                 }
-                const result: JoinResult = { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
+                const result: JoinResult = { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: startedIn.workspaceId, resumed: true };
                 // the agent was told the hook card's id; say why another came back (2026-10-25 report)
                 if(cardId != resumed.id) {
                     result.merged_from = resumed.id;
@@ -830,11 +931,11 @@ export class RoomStore {
             const handle = session == null ? randomBytes(24).toString("base64url") : this.hookHandle(session.host, session.sessionId);
             this.prepare(`
                 INSERT INTO agent (
-                    id, room, handle_hash, display_name, client, is_human, workspace_id, working_directory,
+                    id, room, handle_hash, display_name, client, is_human, workspace_id, working_directory, concos_version,
                     changed_seq, joined_at, updated_at, last_seen_at, last_call_at, host, host_session_id
                 )
                 VALUES (
-                    :id, :room, :handle_hash, :display_name, :client, 0, :workspace_id, :working_directory,
+                    :id, :room, :handle_hash, :display_name, :client, 0, :workspace_id, :working_directory, :concos_version,
                     :changed_seq, :now, :now, :now, :now, :host, :host_session_id
                 )
             `).run({
@@ -845,6 +946,7 @@ export class RoomStore {
                 client: input.client,
                 workspace_id: workspaceId,
                 working_directory: workingDirectory,
+                concos_version: input.concosVersion ?? null,
                 changed_seq: seq,
                 host: session?.host ?? null,
                 host_session_id: session?.sessionId ?? null,
@@ -871,12 +973,12 @@ export class RoomStore {
      */
     private mergeIntoEarlierCard(hookCardId: string, displayName: string, workspaceId: string, nowText: string): string | null {
         const hook = this.prepare(`
-            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, status
+            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, current_directory, concos_version, status
             FROM agent
             WHERE id = :id
         `).get({ id: hookCardId }) as {
             handle_hash: string; host: string | null; host_session_id: string | null; hook_nudged_seq: number; wake_generation: number;
-            woken_at_list: string; client: string; working_directory: string | null; status: AgentStatus;
+            woken_at_list: string; client: string; working_directory: string | null; current_directory: string | null; concos_version: string | null; status: AgentStatus;
         };
         if(hook.host_session_id == null) {
             return null;
@@ -919,6 +1021,8 @@ export class RoomStore {
                 woken_at_list = :woken_at_list,
                 client = :client,
                 working_directory = :working_directory,
+                current_directory = :current_directory,
+                concos_version = COALESCE(:concos_version, concos_version),
                 status = :status,
                 changed_seq = :changed_seq,
                 last_seen_at = :now,
@@ -934,6 +1038,8 @@ export class RoomStore {
             woken_at_list: hook.woken_at_list,
             client: hook.client,
             working_directory: hook.working_directory,
+            current_directory: hook.current_directory,
+            concos_version: hook.concos_version,
             status: hook.status,
             changed_seq: this.nextSeq(),
             now: nowText,
@@ -1249,6 +1355,7 @@ export class RoomStore {
                     blocker = :blocker,
                     reference_list = :reference_list,
                     editing_list = :editing_list,
+                    current_directory = :current_directory,
                     revision = :revision,
                     changed_seq = :changed_seq,
                     updated_at = :now,
@@ -1444,6 +1551,9 @@ export class RoomStore {
         if(row.workspace_id != null) {
             card.workspace_id = row.workspace_id;
         }
+        if(row.current_directory != null) {
+            card.current_directory = row.current_directory;
+        }
         if(row.is_human == 1) {
             card.human = true;
             return card;
@@ -1549,6 +1659,9 @@ export class RoomStore {
             },
             checkpoints: checkpointRows.slice(0, limit).map((row) => ({ id: row.id, at: row.created_at, text: row.body })),
         };
+        if(target.current_directory != null) {
+            result.card.current_directory = target.current_directory;
+        }
         const successor = this.successorOf(target, nowMs);
         if(successor != null) {
             result.card.replaced_by = successor.id;
@@ -1905,6 +2018,119 @@ export class RoomStore {
         return [...posters.values()];
     }
 
+    /** Retained messages visible on the board, newest first, without delivery or receipt changes. */
+    searchMessages(input: MessageSearchInput): MessageSearchResult {
+        const limit = input.limit ?? 50;
+        if(Number.isInteger(limit) == false || limit < 1 || limit > 100) {
+            throw new RoomError("message search limit must be an integer from 1 to 100");
+        }
+        let topic = "";
+        if(input.topic != null && input.topic.trim() != "") {
+            topic = normalizeTopicPrefix(input.topic);
+        }
+        const rows = this.prepare(`
+            SELECT
+                M.id, M.created_at, M.edited_at, M.recipient_agent_id, M.recipient_scope,
+                M.kind, M.reply_to_message_id, M.body,
+                S.display_name AS from_name, S.client AS from_client, S.is_human AS from_is_human,
+                R.display_name AS to_name, R.client AS to_client, R.is_human AS to_is_human,
+                ${MESSAGE_TOPICS_COLUMN},
+                (
+                    SELECT json_group_array(json_object('name', G.display_name, 'client', G.client, 'human', G.is_human) ORDER BY G.display_name)
+                    FROM message_receipt AS GR
+                    JOIN agent AS G ON G.id = GR.agent_id
+                    WHERE GR.message_id = M.id
+                ) AS group_participants,
+                (
+                    SELECT json_group_array(json_object('name', A.display_name, 'client', A.client, 'human', A.is_human) ORDER BY A.display_name)
+                    FROM message_receipt AS MR
+                    JOIN agent AS A ON A.id = MR.agent_id
+                    WHERE MR.message_id = M.id AND MR.received_at IS NULL AND ${AWAITED_CONDITION}
+                ) AS waiting_on
+            FROM message AS M
+            JOIN agent AS S ON S.id = M.sender_agent_id
+            LEFT JOIN agent AS R ON R.id = M.recipient_agent_id
+            WHERE M.room = :room
+                AND (:text = '' OR instr(lower(M.body), lower(:text)) > 0)
+                AND (:sender = '' OR instr(lower(S.display_name), lower(:sender)) > 0)
+                AND (:topic = '' OR EXISTS (
+                    SELECT 1 FROM message_topic AS T
+                    WHERE T.message_id = M.id
+                        AND (T.topic_key = :topic OR substr(T.topic_key, 1, length(:topic) + 1) = :topic || '_')
+                ))
+            ORDER BY M.seq DESC
+            LIMIT :limit
+        `).all({
+            room: SHARED_ROOM,
+            text: input.text?.trim() ?? "",
+            sender: input.sender?.trim() ?? "",
+            topic: topic,
+            limit: limit + 1,
+            awaited_since: awaitedSince(Date.now()),
+        }) as {
+            id: number;
+            created_at: string;
+            edited_at: string | null;
+            recipient_agent_id: string | null;
+            recipient_scope: "direct" | "group" | "all";
+            kind: MessageKind;
+            reply_to_message_id: number | null;
+            body: string;
+            from_name: string;
+            from_client: string;
+            from_is_human: number;
+            to_name: string | null;
+            to_client: string | null;
+            to_is_human: number | null;
+            topics: string;
+            group_participants: string;
+            waiting_on: string;
+        }[];
+        const participants = (json: string): RoomOverviewParticipant[] => {
+            const people = JSON.parse(json) as { name: string; client: string; human: number }[];
+            return people.map((person) => ({ ...person, human: person.human == 1 }));
+        };
+        const messages = rows.slice(0, limit).map((row): RoomOverviewMessage => {
+            let recipients: RoomOverviewParticipant[] = [];
+            if(row.recipient_scope == "group") {
+                recipients = participants(row.group_participants);
+            }
+            else if(row.recipient_scope == "direct" && row.to_name != null && row.to_client != null) {
+                recipients = [{ name: row.to_name, client: row.to_client, human: row.to_is_human == 1 }];
+            }
+            const waitingOn = participants(row.waiting_on);
+            let toName = row.to_name;
+            if(row.recipient_scope == "group") {
+                toName = recipients.map((recipient) => recipient.name).join(", ");
+            }
+            return {
+                id: row.id,
+                at: row.created_at,
+                from_name: row.from_name,
+                from_client: row.from_client,
+                from_human: row.from_is_human == 1,
+                to_name: toName,
+                recipients: recipients,
+                to_agent_id: row.recipient_agent_id,
+                to_human: row.to_is_human == 1,
+                topics: parseList(row.topics),
+                posted: row.recipient_scope == "all",
+                edited_at: row.edited_at,
+                resolved: waitingOn.length == 0,
+                waiting_on: waitingOn.map((person) => person.name),
+                waiting_on_participants: waitingOn,
+                kind: row.kind,
+                reply_to: row.reply_to_message_id,
+                text: row.body,
+            };
+        });
+        const result: MessageSearchResult = { messages: messages };
+        if(rows.length > limit) {
+            result.has_more = true;
+        }
+        return result;
+    }
+
     /**
      * Full message text. With ids: those messages, and for each id that cannot be shown, why.
      * With a topic: the newest messages under that topic or its narrower topics. Otherwise: the
@@ -2045,6 +2271,44 @@ export class RoomStore {
     }
 
     /**
+     * The person at the board takes down a card that looks wrong (`AgentIssue`): it leaves as with
+     * `leave`, without a final word, and its unread messages go to the live card of its name in
+     * its project when there is one, as for a session that ended. A running bridge cannot bring it
+     * back by heartbeat; only a `join` with its handle does. Returns that live card's id, if any.
+     */
+    retireAgent(agentId: string): { moved_to: string | null } {
+        return runInTransaction(this.database, () => {
+            const current = this.requireAgent(agentId);
+            if(current.is_human == 1) {
+                throw new RoomError("a person has no card to take down");
+            }
+            if(current.left_at != null) {
+                return { moved_to: null };
+            }
+            const nowMs = Date.now();
+            const nowText = new Date(nowMs).toISOString();
+            this.prepare(`
+                UPDATE agent
+                SET status = 'finished',
+                    editing_list = '[]',
+                    current_directory = NULL,
+                    revision = revision + 1,
+                    changed_seq = :changed_seq,
+                    updated_at = :now,
+                    editing_updated_at = :now,
+                    left_at = :now
+                WHERE id = :id
+            `).run({ changed_seq: this.nextSeq(), now: nowText, id: agentId });
+            const successor = this.successorOf(this.requireAgent(agentId), nowMs);
+            if(successor == null || current.workspace_id == null) {
+                return { moved_to: null };
+            }
+            this.adoptFromEndedCards(successor.id, current.display_name, current.workspace_id, nowMs);
+            return { moved_to: successor.id };
+        });
+    }
+
+    /**
      * The person at the board sets an agent's role. The card's revision and change sequence move,
      * so the agent and others see it on their next check_in; the agent's own activity times stay,
      * since a person's edit says nothing about whether the agent is at work.
@@ -2078,11 +2342,13 @@ export class RoomStore {
             if(current.left_at != null) {
                 return;
             }
+            // a participant that left works nowhere: its editing claim and current folder go
             const { values } = applyCardUpdate(current, {
                 status: "finished",
                 summary: input.summary ?? undefined,
                 nextStep: input.nextStep ?? undefined,
                 editing: [],
+                currentDirectory: "",
             });
             this.prepare(`
                 UPDATE agent
@@ -2094,6 +2360,7 @@ export class RoomStore {
                     blocker = :blocker,
                     reference_list = :reference_list,
                     editing_list = :editing_list,
+                    current_directory = :current_directory,
                     revision = revision + 1,
                     changed_seq = :changed_seq,
                     updated_at = :now,
@@ -2345,15 +2612,15 @@ export class RoomStore {
         `).run({ now: new Date().toISOString(), agent_id: agentId });
     }
 
-    /** Liveness only: never creates a change event for other agents. */
-    heartbeat(agentIds: string[]): void {
+    /** Liveness only: never creates a change event for other agents. A bridge also leaves its concos version. */
+    heartbeat(agentIds: string[], concosVersion?: string): void {
         if(agentIds.length == 0) {
             return;
         }
         this.prepare(`
-            UPDATE agent SET last_seen_at = :now
+            UPDATE agent SET last_seen_at = :now, concos_version = COALESCE(:concos_version, concos_version)
             WHERE id IN (SELECT value FROM json_each(:agent_ids)) AND left_at IS NULL AND disconnected_at IS NULL
-        `).run({ now: new Date().toISOString(), agent_ids: JSON.stringify(agentIds) });
+        `).run({ now: new Date().toISOString(), concos_version: concosVersion ?? null, agent_ids: JSON.stringify(agentIds) });
     }
 
     /** Bridge shutdown: releases editing claims at once (a visible change) and marks the agents disconnected. */
@@ -2456,7 +2723,7 @@ export class RoomStore {
         const agentRows = this.prepare(`
             SELECT ${AGENT_COLUMNS} FROM agent WHERE room = :room ORDER BY left_at IS NOT NULL, joined_at
         `).all({ room: room }) as unknown as AgentRow[];
-        const agents = agentRows.map((row) => {
+        const agents: RoomOverviewAgent[] = agentRows.map((row) => {
             let workspacePath: string | null = null;
             if(row.workspace_id != null) {
                 const workspaceRow = this.prepare(`
@@ -2476,14 +2743,36 @@ export class RoomStore {
                 blocker: row.blocker,
                 editing: parseList(row.editing_list),
                 workspace_path: workspacePath,
+                current_directory: row.current_directory,
                 updated_at: row.updated_at,
                 online: isOnline(row, nowMs),
                 stale: isStale(row, nowMs),
                 left: row.left_at != null,
                 ended: isEnded(row, nowMs),
                 pending_count: this.countPending(row.id),
+                concos_version: row.concos_version,
+                issues: [],
             };
         });
+
+        // (issues) live cards only; ended and left ones are folded away on the board anyway
+        const live = agentRows.map((row, index) => ({ row, agent: agents[index] }))
+            .filter(({ agent }) => agent.human == false && agent.left == false && agent.ended == false);
+        const actedAt = (row: AgentRow) => row.last_call_at ?? row.updated_at;
+        for(const { row, agent } of live) {
+            if(agent.online == true && row.concos_version != null && compareVersions(row.concos_version, CONCOS_VERSION) < 0) {
+                agent.issues.push({ kind: "old_concos", version: row.concos_version });
+            }
+            if(row.status == "working" && nowMs - Date.parse(actedAt(row)) > STALE_CARD_MS) {
+                agent.issues.push({ kind: "stuck", since: actedAt(row) });
+            }
+            const newer = live.find((other) => other.row.id != row.id
+                && other.agent.name == agent.name && other.agent.workspace_path == agent.workspace_path
+                && actedAt(other.row) > actedAt(row));
+            if(newer != null) {
+                agent.issues.push({ kind: "duplicate", newer_agent_id: newer.row.id });
+            }
+        }
 
         const messageRows = this.prepare(`
             SELECT

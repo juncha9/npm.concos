@@ -52,6 +52,51 @@ describe("terminal prompts", () => {
         finally { prompter.close(); vi.useRealTimers(); vi.unstubAllEnvs(); }
     });
 
+    it("colors the answer Enter gives, and a warning after a row's hint, on a color terminal", async () => {
+        vi.stubEnv("NO_COLOR", undefined);
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const confirmed = prompter.askYesNo("Register these settings?", true);
+            await press(tty.input, ["\r"]);
+            expect(await confirmed).toBe(true);
+            // Y in bold accent color between dim parentheses
+            expect(tty.screen()).toContain("\u001b[2m(\u001b[22m\u001b[1m\u001b[36mY\u001b[39m\u001b[22m\u001b[2m/n)\u001b[22m");
+            const picked = prompter.select("Clients", [
+                { value: "claude", label: "Claude Code", hint: "MCP registered", hintStatus: "success", hintWarning: "Update available" },
+            ]);
+            await press(tty.input, ["\r"]);
+            expect(await picked).toBe("claude");
+            expect(tty.screen()).toContain("\u001b[33m · Update available\u001b[39m");
+        }
+        finally { prompter.close(); vi.unstubAllEnvs(); }
+    });
+
+    it("draws a banner line under the question, styled on a color terminal and as plain text off one", async () => {
+        vi.stubEnv("NO_COLOR", undefined);
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const picked = prompter.select("Room", [{ value: "a", label: "Agent" }], {
+                banner: [{ text: "██", paint: prompter.paint.success }, { text: "  2 working" }],
+            });
+            await press(tty.input, ["\r"]);
+            expect(await picked).toBe("a");
+            expect(tty.screen()).toContain("\u001b[32m██\u001b[39m  2 working");
+        }
+        finally { prompter.close(); vi.unstubAllEnvs(); }
+
+        const output = new PassThrough();
+        let text = "";
+        output.on("data", (chunk) => { text += chunk.toString(); });
+        const lines = new Prompter(Readable.from(["1\n"]), output);
+        try {
+            expect(await lines.select("Room", [{ value: "a", label: "Agent" }], { banner: [{ text: "##" }, { text: "  2 working" }] })).toBe("a");
+        }
+        finally { lines.close(); }
+        expect(text).toContain("? Room\n  ##  2 working\n");
+    });
+
     it("keeps reduced-motion frames static", async () => {
         vi.useFakeTimers();
         vi.stubEnv("CONCOS_REDUCED_MOTION", "1");

@@ -32,6 +32,8 @@ export interface SelectChoice<T extends string> {
     hint?: string;
     /** Completed state: a check mark, with green text on color terminals. */
     hintStatus?: "success";
+    /** Text after the hint that asks for attention (e.g. Update available), yellow on color terminals. */
+    hintWarning?: string;
     /**
      * Draws the row itself instead of label and hint: one array of styled parts per screen
      * line, each cut to the terminal width. The pointer column is still drawn in front of the
@@ -81,7 +83,9 @@ export interface SelectOptions<T extends string> {
      * TTY only: reloads the question, items and tabs every `intervalMs` while the list is open.
      * The cursor stays on the same value, and the list redraws only when its lines change.
      */
-    refresh?: { intervalMs: number; load: () => { question: string; items: SelectItem<T>[]; tabs?: SelectTabs<T> } };
+    refresh?: { intervalMs: number; load: () => { question: string; banner?: LinePart[]; items: SelectItem<T>[]; tabs?: SelectTabs<T> } };
+    /** A styled line under the question, such as a status bar; its plain text off a TTY. */
+    banner?: LinePart[];
     /**
      * Tab / → and Shift+Tab / ← finish the list with the next or previous tab's value, so the
      * caller can show that tab's list in its place. Line mode accepts a tab's key or label.
@@ -499,13 +503,15 @@ export class Prompter {
      * @throws {PromptClosedError} If the input closes before a line arrives.
      */
     async askYesNo(question: string, defaultValue: boolean): Promise<boolean> {
-        let hint = "y/N";
+        // the answer Enter gives stands out in color
+        const highlight = (letter: string) => this.style.bold(this.style.accent(letter));
+        let hint = `${this.style.dim("(y/")}${highlight("N")}${this.style.dim(")")}`;
         if(defaultValue == true) {
-            hint = "Y/n";
+            hint = `${this.style.dim("(")}${highlight("Y")}${this.style.dim("/n)")}`;
         }
 
         for(;;) {
-            const prompt = `${this.style.accent(this.symbols.question)} ${this.style.bold(question)} ${this.style.dim(`(${hint})`)} `;
+            const prompt = `${this.style.accent(this.symbols.question)} ${this.style.bold(question)} ${hint} `;
             const line = await this.readAnswer(prompt, false);
 
             const normalized = line.trim().toLowerCase();
@@ -553,11 +559,11 @@ export class Prompter {
         }
 
         if(this.interactive == true) {
-            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation);
+            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation, options?.banner);
             return picked;
         }
 
-        const picked = await this.selectWithLines(question, items, startIndex, options?.cancelValue, options?.tabs);
+        const picked = await this.selectWithLines(question, items, startIndex, options?.cancelValue, options?.tabs, options?.banner);
         return picked;
     }
 
@@ -664,11 +670,15 @@ export class Prompter {
         startIndex: number,
         cancelValue: T | undefined,
         tabs: SelectTabs<T> | undefined,
+        banner: LinePart[] | undefined,
     ): Promise<T> {
         const choices = items.filter((item): item is SelectChoice<T> => "value" in item);
         const labelWidths = groupLabelWidths(items);
 
         this.output.write(`${this.symbols.question} ${question}\n`);
+        if(banner != null) {
+            this.output.write(`  ${banner.map((part) => part.text).join("")}\n`);
+        }
         if(tabs != null) {
             const bar = tabs.items.map((tab) => {
                 if(tab.value === tabs.active) {
@@ -713,6 +723,9 @@ export class Prompter {
             let line = `${numbering}${padToWidth(item.label, labelWidths[index])}`;
             if(item.hint != null && item.hint !== "") {
                 line += `  ${item.hintStatus == "success" ? `${this.symbols.tick} ` : ""}${item.hint}`;
+            }
+            if(item.hintWarning != null) {
+                line += item.hint != null && item.hint !== "" ? ` · ${item.hintWarning}` : `  ${item.hintWarning}`;
             }
             this.output.write(`${line.trimEnd()}\n`);
         }
@@ -964,9 +977,11 @@ export class Prompter {
         refresh: SelectOptions<T>["refresh"],
         initialTabs: SelectTabs<T> | undefined,
         animation: SelectOptions<T>["animation"],
+        initialBanner: LinePart[] | undefined,
     ): Promise<T> {
         const ttyInput = this.input as TtyInput;
         let question = initialQuestion;
+        let banner = initialBanner;
         let items = initialItems;
         let tabs = initialTabs;
         let selectableIndexes: number[] = [];
@@ -1041,6 +1056,9 @@ export class Prompter {
                 { text: " " },
                 { text: question, paint: this.style.bold },
             ], width)];
+            if(banner != null) {
+                header.push(this.fitLine([{ text: "  " }, ...banner], width));
+            }
             if(tabs != null) {
                 // inactive tabs are padded to the bracket width, so switching never shifts the bar
                 const bar: LinePart[] = [{ text: " " }];
@@ -1124,6 +1142,10 @@ export class Prompter {
                     if(item.hint != null && item.hint !== "") {
                         const hint = item.hintStatus == "success" ? `${this.symbols.tick} ${item.hint}` : item.hint;
                         parts.push({ text: `  ${hint}`, paint: item.hintStatus == "success" ? this.style.success : this.style.dim });
+                    }
+                    if(item.hintWarning != null) {
+                        const lead = item.hint != null && item.hint !== "" ? " · " : "  ";
+                        parts.push({ text: `${lead}${item.hintWarning}`, paint: this.style.warning });
                     }
                     lines.push(this.fitLine(parts, width));
                 }
@@ -1220,6 +1242,9 @@ export class Prompter {
             try {
                 const next = refresh!.load();
                 question = next.question;
+                if(next.banner != null) {
+                    banner = next.banner;
+                }
                 items = next.items;
                 if(next.tabs != null) {
                     tabs = next.tabs;

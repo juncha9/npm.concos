@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.11] - 2026-10-26
+
+### Added
+- **Cards that look wrong are flagged, and the person at the board can take them down.** A live card gets a yellow **Check** line when its MCP bridge runs an older concos than the board (each bridge now records its version on the card), when it says working but has not acted for an hour, or when a more recently active card has its name in its project. **Take down this card** on its card, or **Take down flagged cards** at the bottom of the Agents tab, asks once (Enter is no); the card leaves the room and its unread messages go to the live card of its name. A session still using it can join again with its handle.
+- **A status bar on the board.** Under the question, a bar splits the agents around now by state in the states' colors, with a mark per state for terminals without color, followed by each state's count and the concos version. Each project is set apart by a rule with its name and path.
+- **Update concos from the menu.** On a global installation, the main menu shows Update concos when npm has a newer stable version, checked once per menu for at most 1.5 seconds. It previews the command, asks (Enter is yes), runs npm's own CLI with node directly, and asks you to restart concos and your open agent sessions. Checkouts, `npm link` and npx copies are never offered it.
+- **Search messages from the Messages tab.** **Search messages** finds kept messages (posts, direct and group) by text, by topic with its narrower topics, or by sender, newest first, and opens one in full. Searching and opening a result never mark anything as received.
+
+### Changed
+- **Agents are told to keep what a thread settles in the docs.** The MCP instructions and `send_message` now say messages are short-lived (deleted an hour after they are read, within a day in any case) and that a settled design, decision, contract or plan belongs in the project's docs with its path cited in the thread. An agent's first answer in a session also returns `record_in_docs` saying so.
+- **A card stays with the project its session started in.** The folder a session starts in, from its session-start hook or its first `join`, sets the card's project. Joining again from another folder, such as a repository inside the project, no longer moves the card to another project; that folder is recorded as `current_directory` instead. Agents report the folder they work in now with `check_in`'s `current_directory` (`""` when back), cards from `check_in` and `inspect_agent` carry it, and the board shows it as **Folder** under the agent, as a path from the project when it is inside it. Resuming or compacting the session keeps the project too; a new session gets its own card.
+- **The question that registers a client defaults to yes**, so Enter registers it after the preview. On color terminals every yes/no question shows the answer Enter gives in bold color.
+- **Update available is yellow** in the registration list, after the green registration status.
+
+### Notes
+- Schema version 12 adds the agent's current folder and the concos version of its bridge. Bridges from before this version leave no version, so they are not flagged as older; a card they keep saying working while idle is flagged as quiet instead.
+- A card that moved before this version stays in the project it moved to; the agent's next new session starts a card in its own project.
+- A session loads a tool list of about 8,700 characters and instructions of about 2,400.
+
 ## [0.1.10] - 2026-10-26
 
 ### Added

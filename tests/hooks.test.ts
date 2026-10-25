@@ -80,6 +80,22 @@ describe("hook lifecycle", () => {
         expect(store.inspectAgent(joined.agent_id, { agentId: joined.agent_id, checkpointLimit: null, beforeCheckpointId: null }).checkpoints).toHaveLength(1);
     });
 
+    it("keeps the folder a session first started in through joins and resumes from other folders", () => {
+        const joined = start();
+        const docs = path.join(directory, "docs-repo");
+        fs.mkdirSync(docs);
+        store.join({ room: "main", displayName: "Designer", client: "Claude Code", workingDirectory: docs, workspaceRoot: null, resumeHandle: joined.handle });
+        expect(card(joined.agent_id)).toMatchObject({ working_directory: directory, current_directory: docs });
+        // resumed or compacted after a cd: the session start's folder is where it works now
+        store.applyHookEvent(event("session-start", { cwd: docs }), "dev");
+        expect(card(joined.agent_id)).toMatchObject({ working_directory: directory, workspace: { path: directory }, current_directory: docs });
+        store.applyHookEvent(event("session-start"), "dev");
+        expect(card(joined.agent_id).current_directory).toBeUndefined();
+        // a new session is a new card, with the folder it starts in
+        const fresh = start({ sessionId: "session-2", cwd: docs });
+        expect(card(fresh.agent_id)).toMatchObject({ working_directory: docs });
+    });
+
     it("does not create participants on late events or revive an explicitly left participant", () => {
         expect(store.applyHookEvent(event("turn-end"), "dev")).toBeNull();
         expect(store.applyHookEvent(event("file-edited", { files: ["x.ts"] }), "dev")).toBeNull();
