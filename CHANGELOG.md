@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [Unreleased]
+## [0.1.8] - 2026-10-25
 
 ### Fixed
 - A menu in a terminal shorter than it left a copy of its top lines above the redrawn list. Lists now fit the window's real height and redraw when it is resized. Going back to the main menu or the registration list no longer stacks the previous page above it: what was written since is erased, and only text taller than the window stays in the scrollback.
