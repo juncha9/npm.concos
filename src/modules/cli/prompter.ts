@@ -286,8 +286,8 @@ export interface LinePart {
  * Prompts over any stream pair, with one `data` listener owning the input.
  *
  * On a TTY, choices are an arrow-key list, text fields are a small line editor of their own,
- * and every answered prompt collapses to a single `✔ question · answer` line, so the
- * transcript reads as a summary of what was set. Off a TTY — a pipe, a test, Git Bash's
+ * and every answered prompt collapses to a single `✔ question · answer` line, so a view
+ * reads as a summary of what was set there. Off a TTY — a pipe, a test, Git Bash's
  * mintty without winpty — every prompt is a plain line read and a list is numbered, which is
  * what lets the whole UI run over scripted stdin.
  *
@@ -325,6 +325,14 @@ export class Prompter {
     transient = false;
 
     private readonly interactive: boolean;
+    /**
+     * Rows the lasting output (`write`, answered lines) has moved the cursor down, a long line
+     * counting every row it wraps onto; `mark` and `eraseTo` measure from it. Prompts erase
+     * themselves and add nothing.
+     */
+    private writtenRows = 0;
+    /** Columns already used on the row being written, when the output so far does not end in a newline. */
+    private openRowWidth = 0;
     private readonly style: Style;
     private readonly symbols: { question: string; pointer: string; tick: string; rule: string; ellipsis: string };
 
@@ -362,6 +370,51 @@ export class Prompter {
 
     write(text: string): void {
         this.output.write(text);
+        this.countRows(text);
+    }
+
+    /** Where the lasting output stands now, for `eraseTo`. */
+    mark(): number {
+        return this.writtenRows;
+    }
+
+    /**
+     * Erases what was written after `mark`, so a list comes back where it was drawn instead of
+     * below the views it led to. The cursor cannot climb above the window: rows that scrolled
+     * past its top stay in the scrollback, where a long preview can still be read. No-op off a TTY.
+     */
+    eraseTo(mark: number): void {
+        if(this.interactive == false) {
+            return;
+        }
+        const wrappedRows = this.openRowWidth > 0 ? Math.floor((this.openRowWidth - 1) / this.columns()) : 0;
+        const rowsUp = this.writtenRows + wrappedRows - mark;
+        if(rowsUp <= 0 && this.openRowWidth == 0) {
+            return;
+        }
+        this.output.write(`${rowsUp > 0 ? `${ESC}[${rowsUp}A` : ""}\r${ESC}[J`);
+        this.writtenRows = Math.min(this.writtenRows, mark);
+        this.openRowWidth = 0;
+    }
+
+    /** Adds the rows `text` moves the cursor down, wrapped at the terminal's width, to `writtenRows`. */
+    private countRows(text: string): void {
+        if(this.interactive == false) {
+            return;
+        }
+        const columns = this.columns();
+        const lines = text.replace(ANSI_PATTERN, "").split("\n");
+        lines.forEach((line, index) => {
+            // a carriage return starts the row over
+            const returned = line.lastIndexOf("\r");
+            const width = (returned >= 0 ? 0 : this.openRowWidth) + displayWidth(line.slice(returned + 1));
+            if(index == lines.length - 1) {
+                this.openRowWidth = width;
+                return;
+            }
+            this.writtenRows += Math.max(1, Math.ceil(width / columns));
+            this.openRowWidth = 0;
+        });
     }
 
     /**
@@ -374,6 +427,8 @@ export class Prompter {
             return;
         }
         this.output.write(`${ESC}[${lineCount}A\r${ESC}[J`);
+        this.writtenRows = Math.max(0, this.writtenRows - lineCount);
+        this.openRowWidth = 0;
     }
 
     /** Styling for callers that print around the prompts; plain text off a TTY. */
@@ -433,7 +488,7 @@ export class Prompter {
                 return answer;
             }
 
-            this.output.write(`  ${this.style.dim("A value is required.")}\n`);
+            this.write(`  ${this.style.dim("A value is required.")}\n`);
         }
     }
 
@@ -474,7 +529,7 @@ export class Prompter {
                 return answer;
             }
 
-            this.output.write(`  ${this.style.dim("Answer y or n.")}\n`);
+            this.write(`  ${this.style.dim("Answer y or n.")}\n`);
         }
     }
 
@@ -713,9 +768,10 @@ export class Prompter {
 
     // ── TTY rendering ──────────────────────────────────────────────────────
 
+    /** The terminal's real size; a guess only when it reports none, since a guess larger than the window breaks every redraw. */
     private columns(): number {
         const columns = (this.output as TtyOutput).columns;
-        if(columns == null || columns < 20) {
+        if(columns == null || columns < 1) {
             return 80;
         }
 
@@ -724,7 +780,7 @@ export class Prompter {
 
     private rows(): number {
         const rows = (this.output as TtyOutput).rows;
-        if(rows == null || rows < 6) {
+        if(rows == null || rows < 1) {
             return 24;
         }
 
@@ -771,7 +827,7 @@ export class Prompter {
             return;
         }
 
-        this.output.write(`${this.style.success(this.symbols.tick)} ${question} ${this.style.dim("·")} ${this.style.accent(answer)}\n`);
+        this.write(`${this.style.success(this.symbols.tick)} ${question} ${this.style.dim("·")} ${this.style.accent(answer)}\n`);
     }
 
     /**
@@ -1091,8 +1147,10 @@ export class Prompter {
             if(refreshError != null) {
                 trailerCount = 2;
             }
-            // question and tab lines, footer lines, and one spare row so the last line never scrolls the screen
-            const height = Math.max(3, this.rows() - header.length - trailerCount - 1);
+            // question and tab lines, footer lines, and one spare row so the last line never scrolls the screen;
+            // a short terminal still gets a list that fits, down to one body line, since the cursor cannot
+            // climb above the window to redraw the part that would not
+            const height = Math.max(1, this.rows() - header.length - trailerCount - 1);
             viewportHeight = height;
             bodyLineCount = lines.length;
             if(refreshOffset != null) {
@@ -1197,6 +1255,11 @@ export class Prompter {
         return new Promise<T>((resolve, reject) => {
             let timer: NodeJS.Timeout | null = null;
             let animationTimer: NodeJS.Timeout | null = null;
+            const onResize = (): void => {
+                followSelection = true;
+                redraw();
+            };
+            this.output.on("resize", onResize);
             if(refresh != null) {
                 timer = setInterval(reload, refresh.intervalMs);
                 this.timers.add(timer);
@@ -1217,6 +1280,7 @@ export class Prompter {
                     clearInterval(animationTimer);
                     this.timers.delete(animationTimer);
                 }
+                this.output.off("resize", onResize);
                 this.keyHandler = null;
                 ttyInput.setRawMode?.(false);
                 draw([]);

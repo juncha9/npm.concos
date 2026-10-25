@@ -1,6 +1,7 @@
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { Prompter, PromptBackError, PromptClosedError, displayWidth } from "../src/modules/cli/prompter";
+import { TerminalScreen } from "./terminal-screen";
 
 function terminal() {
     const raw: boolean[] = [];
@@ -157,6 +158,70 @@ describe("terminal prompts", () => {
             expect(frame).not.toContain("below");
             await press(tty.input, ["\r"]);
             expect(await pending).toBe("agent7");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("keeps a list inside a terminal shorter than it, so redrawing leaves no copy above", async () => {
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 4 });
+        const screen = new TerminalScreen(60, 4);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const pending = prompter.select("concos · Shared waiting room", [
+                { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
+                { value: "status", label: "Enter concos", hint: "Agents · Messages" },
+                { value: "say", label: "Send a message" },
+                { separator: true },
+                { value: "quit", label: "Quit" },
+            ]);
+            await press(tty.input, ["\u001b[B", "\u001b[A"]);
+            expect(screen.transcript().filter((line) => line.includes("Shared waiting room"))).toHaveLength(1);
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Register MCP/);
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("setup");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("erases back to a mark, wrapped lines included, and leaves rows above the window in the scrollback", async () => {
+        const tty = terminal();
+        Object.assign(tty.output, { columns: 40, rows: 10 });
+        const screen = new TerminalScreen(40, 10);
+        screen.write("$ concos\n");
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const top = prompter.mark();
+            // 100 columns: three rows at 40
+            prompter.write(`${"wide ".repeat(20)}\nshort\n`);
+            prompter.eraseTo(top);
+            expect(screen.visible().filter((line) => line != "")).toEqual(["$ concos"]);
+
+            prompter.write(Array.from({ length: 25 }, (_, index) => `preview ${index}\n`).join(""));
+            prompter.eraseTo(top);
+            prompter.write("list\n");
+            expect(screen.visible()[0]).toBe("list");
+            expect(screen.transcript()).toContain("preview 0");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("redraws a list to fit when the terminal is resized", async () => {
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 20 });
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const pending = prompter.select("Room", Array.from({ length: 6 }, (_, index) => ({ value: `a${index}`, label: `Agent ${index}` })));
+            Object.assign(tty.output, { rows: 5 });
+            tty.output.emit("resize");
+            const lastFrame = tty.screen().slice(tty.screen().lastIndexOf("\u001b[J") + 3).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+            expect(lastFrame.split("\n").length).toBeLessThanOrEqual(4);
+            expect(lastFrame).toMatch(/[❯>] Agent 0/);
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("a0");
+            expect(tty.output.listenerCount("resize")).toBe(0);
         }
         finally { prompter.close(); }
     });

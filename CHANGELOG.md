@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 - **Backups of earlier schemas go.** Before upgrading the room database, concos keeps only the backup it takes then, and removes that one too once it is a week old; the daily backups cover the last seven days.
 
 ### Fixed
+- A menu in a terminal shorter than it left a copy of its top lines above the redrawn list. Lists now fit the window's real height and redraw when it is resized. Going back to the main menu or the registration list no longer stacks the previous page above it: what was written since is erased, and only text taller than the window stays in the scrollback.
 - Registration added LF lines to a CRLF `config.toml` and space-indented entries to a tab-indented JSON file; added entries now follow the file's line endings and indentation.
 - The room database's backup cleanup would have deleted the newest migration backup once the schema version reached two digits (`bak-v10` sorted before `bak-v9` by name), and counted SQLite side files beside a backup as backups.
 

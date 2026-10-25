@@ -136,8 +136,11 @@ async function applyStep(prompter: Prompter, step: { plan: () => SetupChange[]; 
 }
 
 async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
+    // the list comes back where it was drawn, not below the client's page it returns from
+    const top = prompter.mark();
     for(;;) {
         try {
+            prompter.eraseTo(top);
             prompter.write("\nUser-wide registration · One shared waiting room\n");
             const host = await prompter.select("MCP · Registration", [
                 ...MCP_CLIENTS.map((adapter) => ({
@@ -289,9 +292,11 @@ export async function runMenu(options: MenuOptions): Promise<void> {
     const prompter = new Prompter(options.input, options.output);
     let selected: "setup" | "status" | "say" | "quit" = "setup";
     let startWithSetup = options.startWithSetup ?? false;
+    const top = prompter.mark();
     try {
         for(;;) {
             try {
+                prompter.eraseTo(top);
                 const action: "setup" | "status" | "say" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
                     { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
                     { value: "status", label: "Enter concos", hint: "Agents · Messages" },

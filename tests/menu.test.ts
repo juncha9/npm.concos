@@ -9,6 +9,7 @@ import type { MenuOptions } from "../src/modules/cli/menu";
 import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup } from "../src/modules/cli/setup";
 import { openDatabase } from "../src/modules/store/database";
 import { RoomStore } from "../src/modules/store/room-store";
+import { TerminalScreen } from "./terminal-screen";
 
 let directory: string;
 const cli = path.resolve("dist/cli.js");
@@ -98,6 +99,33 @@ describe("registration menu", () => {
         expect(output).not.toContain("Claude Code · Hooks");
         expect(fs.readFileSync(hookFile, "utf8")).toBe(broken);
         expect(fs.readdirSync(path.dirname(hookFile))).toEqual(["settings.json"]);
+    });
+
+    it("brings each list back where it was drawn, without the pages it led to, and quits leaving the shell's screen as it was", async () => {
+        applySetup(planRegistration({ host: "claude", home: path.join(directory, "user") }, { wake: true }));
+        const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+        const output = Object.assign(new PassThrough(), { isTTY: true, columns: 100, rows: 30 });
+        const screen = new TerminalScreen(100, 30);
+        screen.write("C:\\Users\\me>concos\n");
+        output.on("data", (chunk) => screen.write(chunk.toString()));
+        const running = runMenu({ input, output, home: path.join(directory, "user") });
+        const views: string[] = [];
+        // menu: Register MCP; list: Claude Code; its hooks: Esc; the list again; Esc to the menu; Esc quits
+        for(const step of ["\r", "1", "\r", "\u001b", "look", "\u001b", "look", "\u001b"]) {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            if(step == "look") views.push(screen.visible().join("\n"));
+            else input.write(step);
+        }
+        await running;
+
+        const [list, mainMenu] = views;
+        expect(list.match(/User-wide registration/g)).toHaveLength(1);
+        expect(list).not.toContain("already has the same registration");
+        expect(list).toMatch(/[❯>] Claude Code/);
+        expect(mainMenu).toContain("concos · Shared waiting room");
+        expect(mainMenu).not.toContain("User-wide registration");
+        expect(mainMenu).not.toMatch(/[✔√] concos · Shared waiting room/);
+        expect(screen.transcript().join("\n").trim()).toBe("C:\\Users\\me>concos");
     });
 
     it("lists all supported clients with registration status without an intermediate field editor", async () => {
