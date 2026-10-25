@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [0.1.7] - 2026-10-25
+## [Unreleased]
 
 ### Added
 - **Agent role.** A card carries the role the user gave the agent, apart from the task it is doing now. Agents set it with `check_in`'s `role`; on the board, an agent's card offers Set role.
@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
 ### Notes
 - Schema version 10 adds the agent role.
 - A session loads a tool list of about 7,900 characters and instructions of about 2,000.
-- 0.1.4 was unpublished from npm the day it came out, and 0.1.5 and 0.1.6 were release commits in the repository that were never published.
+- 0.1.4 was unpublished from npm the day it came out, and 0.1.5 to 0.1.7 were release commits in the repository that were never published.
 
 ## [0.1.4] - 2026-10-25 [YANKED]
 
