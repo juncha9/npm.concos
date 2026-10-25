@@ -852,6 +852,36 @@ describe("backup residue", () => {
         expect(fs.existsSync(`${daily("08")}-wal`)).toBe(true);
         expect(fs.existsSync(`${daily("01")}-wal`) || fs.existsSync(`${daily("01")}-shm`)).toBe(false);
     });
+
+    it("keeps the newest migration backup by time, v10 after v9, until it is a week old", async () => {
+        const stamp = (daysAgo: number) => new Date(Date.now() - daysAgo * 86_400_000).toISOString().replace(/[:.]/g, "-");
+        const backup = (version: number, daysAgo: number) => path.join(dataDirectory, `concos.db.bak-v${version}-${stamp(daysAgo)}`);
+        const migrationBackups = () => fs.readdirSync(dataDirectory).filter((name) => name.includes(".bak-v"));
+        // the day's housekeeping runs when today's daily copy is missing
+        const reopenForTheDay = async () => {
+            database.close();
+            for(const name of fs.readdirSync(dataDirectory).filter((name) => /bak-daily-\d{4}-\d{2}-\d{2}$/.test(name))) {
+                fs.rmSync(path.join(dataDirectory, name));
+            }
+            database = await openDatabase(dataDirectory);
+            store = new RoomStore(database);
+        };
+        const newest = backup(10, 1);
+        for(const file of [newest, backup(9, 2), backup(8, 10)]) fs.writeFileSync(file, "copy");
+        await reopenForTheDay();
+        expect(migrationBackups()).toEqual([path.basename(newest)]);
+
+        // past the daily backups' week it goes, even as the only one
+        fs.rmSync(newest);
+        fs.writeFileSync(backup(10, 8), "copy");
+        await reopenForTheDay();
+        expect(migrationBackups()).toEqual([]);
+
+        // a name without a time is left to the count
+        fs.writeFileSync(path.join(dataDirectory, "concos.db.bak-v10-no-time"), "copy");
+        await reopenForTheDay();
+        expect(migrationBackups()).toEqual(["concos.db.bak-v10-no-time"]);
+    });
 });
 
 describe("opening the database", () => {

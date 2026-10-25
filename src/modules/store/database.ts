@@ -9,8 +9,11 @@ import { SCHEMA_STEPS } from "./schema";
 export const DATABASE_FILE_NAME = "concos.db";
 const MIGRATION_BACKUP_MARKER = ".bak-v";
 const DAILY_BACKUP_MARKER = ".bak-daily-";
-const MIGRATION_BACKUP_KEEP_COUNT = 3;
+/** Only the copy taken before the latest migration; backups of earlier schemas go. */
+const MIGRATION_BACKUP_KEEP_COUNT = 1;
 const DAILY_BACKUP_KEEP_COUNT = 7;
+/** A migration backup goes after the daily backups' week, by which time those cover the new schema. */
+const MIGRATION_BACKUP_MAX_AGE_MS = DAILY_BACKUP_KEEP_COUNT * 24 * 60 * 60 * 1000;
 
 /**
  * Runs `work` inside BEGIN IMMEDIATE so the write lock is taken up front;
@@ -62,13 +65,20 @@ const STALE_TEMPORARY_BACKUP_MS = 60 * 60 * 1000;
 /** SQLite's companion files, left beside a backup that something opened. */
 const SQLITE_SIDE_FILE = /-(wal|shm|journal)$/;
 
+/** The time a migration backup's name carries (`2026-10-24T21-22-54-161Z`) in milliseconds; NaN for any other form. */
+function stampTimeMs(stamp: string): number {
+    const match = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/.exec(stamp);
+    return match == null ? Number.NaN : Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`);
+}
+
 /**
  * Keeps the newest `keepCount` backups under `marker`, newest by the time in the name: a
  * migration backup's name starts with its schema version, and by name alone `v10` would sort
- * before `v9`. SQLite side files do not count as backups; they go with theirs, or when theirs
- * is already gone.
+ * before `v9`. With `maxAgeMs`, a backup whose name time is older than that goes too; a name
+ * without a readable time is judged by count alone. SQLite side files do not count as
+ * backups; they go with theirs, or when theirs is already gone.
  */
-function pruneBackups(dataDirectory: string, marker: string, keepCount: number): void {
+function pruneBackups(dataDirectory: string, marker: string, keepCount: number, maxAgeMs?: number): void {
     const prefix = `${DATABASE_FILE_NAME}${marker}`;
     const names = fs.readdirSync(dataDirectory).filter((name) => name.startsWith(prefix) == true);
     const timeOf = (name: string) => {
@@ -79,8 +89,9 @@ function pruneBackups(dataDirectory: string, marker: string, keepCount: number):
         .filter((name) => name.includes(".tmp-") == false && SQLITE_SIDE_FILE.test(name) == false)
         // ISO times compare as plain strings; a locale-aware compare may weigh the hyphens otherwise
         .sort((left, right) => (timeOf(left) < timeOf(right) ? 1 : timeOf(left) > timeOf(right) ? -1 : 0));
-    const kept = new Set(backupNames.slice(0, keepCount));
-    for(const name of backupNames.slice(keepCount)) {
+    const tooOld = (name: string) => maxAgeMs != null && Date.now() - stampTimeMs(timeOf(name)) > maxAgeMs;
+    const kept = new Set(backupNames.slice(0, keepCount).filter((name) => tooOld(name) == false));
+    for(const name of backupNames.filter((name) => kept.has(name) == false)) {
         fs.rmSync(path.join(dataDirectory, name), { force: true });
     }
     for(const name of names.filter((name) => SQLITE_SIDE_FILE.test(name) == true && name.includes(".tmp-") == false)) {
@@ -162,7 +173,7 @@ export async function openDatabase(dataDirectory: string, options: { busyTimeout
                 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
                 const backupPath = path.join(dataDirectory, `${DATABASE_FILE_NAME}${MIGRATION_BACKUP_MARKER}${currentVersion}-${stamp}`);
                 await backupDatabase(database, backupPath, true);
-                pruneBackups(dataDirectory, MIGRATION_BACKUP_MARKER, MIGRATION_BACKUP_KEEP_COUNT);
+                pruneBackups(dataDirectory, MIGRATION_BACKUP_MARKER, MIGRATION_BACKUP_KEEP_COUNT, MIGRATION_BACKUP_MAX_AGE_MS);
             }
             for(let version = currentVersion + 1; version <= expectedVersion; version++) {
                 runInTransaction(database, () => {
@@ -193,6 +204,8 @@ export async function openDatabase(dataDirectory: string, options: { busyTimeout
         if(fs.existsSync(dailyBackupPath) == false) {
             await backupDatabase(database, dailyBackupPath);
             pruneBackups(dataDirectory, DAILY_BACKUP_MARKER, DAILY_BACKUP_KEEP_COUNT);
+            // once a day, so a migration backup goes a week on even when no migration follows
+            pruneBackups(dataDirectory, MIGRATION_BACKUP_MARKER, MIGRATION_BACKUP_KEEP_COUNT, MIGRATION_BACKUP_MAX_AGE_MS);
         }
         return database;
     }

@@ -404,7 +404,7 @@ describe("schema migration", () => {
         finally { upgraded.close(); }
     });
 
-    it("keeps the three newest migration backups by time, with v10 after v9", async () => {
+    it("keeps only the backup taken before this migration, removing earlier schemas' backups", async () => {
         const oldDirectory = path.join(directory, "many-backups");
         fs.mkdirSync(oldDirectory);
         const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
@@ -415,13 +415,11 @@ describe("schema migration", () => {
         for(const name of earlier) fs.writeFileSync(path.join(oldDirectory, name), "copy");
         const upgraded = await openDatabase(oldDirectory);
         upgraded.close();
-        const kept = fs.readdirSync(oldDirectory).filter((name) => name.includes(".bak-v")).sort();
-        expect(kept).toHaveLength(3);
-        expect(kept).toContain(earlier[0]);
-        expect(kept).toContain(earlier[1]);
-        expect(kept.some((name) => name.startsWith("concos.db.bak-v9-"))).toBe(true);
+        const kept = fs.readdirSync(oldDirectory).filter((name) => name.includes(".bak-v"));
+        expect(kept).toHaveLength(1);
+        expect(kept[0]).toMatch(/^concos\.db\.bak-v9-/);
         // every name carries only characters every file system accepts
-        expect(kept.every((name) => /^[\w.-]+$/.test(name))).toBe(true);
+        expect(kept[0]).toMatch(/^[\w.-]+$/);
     });
 
     it("does not change version 1 when its migration backup cannot be completed", async () => {

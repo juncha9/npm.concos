@@ -162,8 +162,8 @@ sent (a post: after its last edit), read or not, and a message that a remaining
 reply answers stays with it. Agent cards silent for 7 days
 go with their checkpoints, each agent keeps its newest 50 checkpoints, and unused
 workspace records go too. Running bridges sweep every minute, and opening the
-waiting room sweeps once. Backups keep the last 7 daily copies and 3 pre-migration
-copies.
+waiting room sweeps once. Backups keep the last 7 daily copies and, for a week,
+the copy taken before the latest schema upgrade.
 
 A `check_in` that delivers cut messages lists them under `read_in_full`, and
 `read_messages` with ids says why any of them cannot be shown: deleted, or sent to
