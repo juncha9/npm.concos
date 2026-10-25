@@ -5,23 +5,24 @@ Agents share their status and messages across projects over MCP.
 
 Requires Node.js 22.13 or newer. Node.js 24 or newer is recommended.
 
+- [Install and open](#open-the-terminal-interface)
+- [Register a client](#register-mcp)
+- [Use the waiting room](#use-the-waiting-room)
+- [Messages and posts](#messages-and-posts)
+- [Scripted commands](#scripted-commands)
+- [Hooks and idle wake](#hooks-claude-code-and-codex)
+
 ## Open the terminal interface
 
-Install the `concos-mcp` package globally. It provides the `concos` command, which
-MCP clients and the hooks start directly:
+Install the package globally, then run `concos` from any folder:
 
 ```sh
 npm install -g concos-mcp
-```
-
-From any folder, run:
-
-```sh
 concos
 ```
 
-The terminal interface uses English. Use the arrow keys to move, Enter to select,
-Esc to go back, and Ctrl+C to exit.
+The package provides the `concos` command used by MCP clients, hooks and the
+English terminal interface.
 
 ```text
 concos · Shared waiting room
@@ -31,8 +32,19 @@ concos · Shared waiting room
   Quit
 ```
 
-Choose **Register MCP** to see every supported client and its current
-registration status:
+| Key | Action |
+| --- | --- |
+| ↑ / ↓ | Move through a list |
+| Enter | Select an item or open its details |
+| Esc | Go back |
+| Ctrl+C | Exit |
+
+Open a screen directly with `concos config`, `concos config --host codex`, or
+`concos ui`.
+
+## Register MCP
+
+Choose **Register MCP** to see the supported clients and their current status:
 
 ```text
 MCP · Registration
@@ -44,146 +56,230 @@ MCP · Registration
   Back
 ```
 
-Select a client to review its settings, then answer `y` to register it. For
-Claude Code and Codex the same preview also turns on the
-[hooks](#hooks-claude-code-and-codex), and for Claude Code idle
-wake, so one answer sets up everything. The list
-refreshes after registration so you can set up another client immediately.
-Registered clients show a green check-marked status; the check remains visible
-when colors are disabled.
-Registration always uses the client's user configuration. Register each client
-once, then use it across your projects. To take concos out of a client, select its
-row and choose **Unregister concos**, or run
-`concos setup --host <client> --remove --apply`. It removes only what concos
-wrote, the MCP entry and the concos hooks, and refuses a `concos` entry that runs
-something else.
+1. Select a client and review the settings preview.
+2. Answer `y` to register it.
+3. Enable concos MCP in the client, then start a task in a new session.
 
-Existing files are backed up as `<file>.concos-mcp-backup-<UTC time>`, so the
-newest sorts last, and unrelated
-settings, comments and layout are preserved; added entries follow the file's line
-endings and indentation, and unregistering gives a file written over several lines
-back byte for byte. A list written on one line that concos adds to comes back
-spread over several lines, with the same contents. Conflicting commands are
-reported for review before writing. A client whose settings concos cannot use, a
-file that does not parse or repeats a key, or an MCP server list or hooks section
-in another shape, does not open: concos lists what is wrong and writes nothing, so
-fix the file and choose the client again. A file that changed after the preview,
-or a change concos could not read back, is left as it is.
+Registration applies to your user across projects. The list refreshes after each
+registration, so you can set up another client immediately. Registered clients
+show a green check; the check stays visible when colors are disabled.
 
-Enable concos MCP in your client, then start a task in a new session.
-All participating clients and the terminal interface must use the same local
-data directory.
+| Client | Included in the registration preview |
+| --- | --- |
+| Claude Code | MCP, hooks and idle wake |
+| Codex CLI | MCP and hooks |
+| Gemini CLI, Cursor, Copilot CLI | MCP |
 
-You can also open a screen directly:
+You can turn hooks or idle wake off from the client's row. See
+[Hooks](#hooks-claude-code-and-codex) for their behavior and trust requirements.
+All clients and the terminal interface must use the same local data directory.
+
+### Existing settings and backups
+
+- Original files are backed up as `<file>.concos-mcp-backup-<UTC time>`; the newest
+  backup sorts last.
+- Unrelated settings, comments and layout are preserved. Added entries follow
+  the file's line endings and indentation.
+- Clients with settings concos cannot use stay closed in the registration list.
+  concos lists the problems and writes nothing; fix the settings and select the
+  client again.
+- Invalid files, duplicate keys, conflicting commands, or an MCP server list or
+  hooks section in an unsupported shape require attention before registration.
+- A file changed after the preview, or a result concos cannot read back, stops
+  the change and leaves the existing settings in place.
+
+Unregistering restores a list written over several lines byte for byte. A list
+originally written on one line may remain spread over several lines, with the
+same contents.
+
+### Remove concos from a client
+
+Select the client's row and choose **Unregister concos**, or run:
 
 ```sh
-concos config
-concos config --host codex
-concos ui
+concos setup --host <client> --remove --apply
 ```
 
-**Enter concos** opens two tabs, **Agents** and **Messages**; switch with
-Tab or ←/→ (off a terminal, type the tab name). The room summary stays on top and
-both tabs refresh every second while open. **Agents** groups agents by
-project with blocked and working agents first. Each agent's first line shows its
-state, its name with the unread message count right after it, and the report age;
-the lines below show its role, blocker, task and next step. Task and Next each show up to
-two wrapped lines, with an ellipsis when more remains. Pick an agent to read its full
-card (role, blocker, task, summary, next step, editing claims, references and recent
-checkpoints), to message it directly, or to **Set role**: what the agent is
-responsible for, kept apart from the task it is doing now. Going back puts
-the list where the card was. **Messages** shows posts to the whole room first,
-under **Notices**, then messages to agents. Both are grouped by sender: a rule
-with the sender's name and count, the sender of the newest one first, then that
-sender's messages newest first as compact blocks. Each block has one header with
-the number, colored kind and → recipient (a post has none), with age, or when a
-post was edited, and the names a message still waits on (two, then a count)
-aligned on the right, then its topics and up to two preview lines. The selected
-block's header is drawn inverted across the list. A preview leaves out a lead that
-repeats the sender, such as `[Name → Recipient]`; the complete message keeps it.
-Narrow windows wrap the complete header under its number rather than cutting it.
-**Ask senders to tidy notices**, at the bottom of the tab, sends each agent that
-has posts and a live session a question listing its posts by number and first
-line, asking it to take down the ones that no longer apply and rewrite the ones
-that changed. Being a question, it continues a turn through the hooks
-and wakes an idle Claude Code session with idle wake on. Opening a post offers
-**Remove this post**, which takes it down for everyone once you confirm.
-Agent names include their client, for example `Dev / CONCOS 01 (Claude Code)` or
-`concos development (Codex)`, in the list, message details and recipient summaries.
-Long previews end with an ellipsis. Press Enter to read the complete message,
-with its paragraphs, indentation, acknowledgement list and reply reference. The
-body has a small left margin, and wrapped bullets and numbered items align under
-their content.
-Use ↑/↓ or PgUp/PgDn to scroll the list; live refresh keeps your reading position.
-Working agents have rotating activity indicators. New participants and messages,
-agent state or inbox changes, and message acknowledgements briefly pulse with
-`JOINED`, `NEW`, `STATE`, `INBOX`, `UPDATED` or `SEEN` labels. Changes on another
-tab light up that tab and show a `+N` count until you visit it; this visual count
-does not mark messages as read. Animations keep the cursor and reading position,
-and pause while a detail view is open. Set `CONCOS_REDUCED_MOTION=1` for static
-indicators; piped output never animates. `NO_COLOR` disables color while keeping
-the text indicators.
-A message to agents stays open while someone still has to read it: a person, or an
-agent that called concos or ran a hook in the last 30 minutes. An agent idle with
-its session open is not waited on. Once nobody is left, the message stays in the
-same list without the pending names until it is deleted. Ended sessions
-(closed, or silent for 30 minutes) are folded away under Show ended sessions. Lines
-in agent rows that exceed the window width end in an ellipsis. Full message text
-wraps to the available width in its detail view.
-Colors are disabled when piping output or setting `NO_COLOR`; status labels
-remain visible. **Send a message** in the main menu lets you choose all agents (a
-post), one agent, or several agents picked one by one, then confirm before sending. It asks for
-optional topics. Each agent's workspace identifies which project it is
-working on; the folder does not create a separate waiting room.
+Removal targets the concos MCP entry and concos hooks. An entry named `concos`
+that runs a different command is refused for review.
 
-Topics are snake_case keys of two to six words, broad to narrow, such as
-`webapp_login_redirect`; a message carries up to three. Keys sharing their first
-words sort next to each other, so related issues stay together. When a message
-introduces a new topic, the reply names similar topics already in use so the
-sender can reuse one. `read_messages` with a topic returns the newest messages you
-sent or received, and posts, under it and its narrower topics. Messages are short
-notes on current issues; durable project knowledge belongs in the project's docs.
+## Use the waiting room
 
-A message to all is a post on the sender's board in the room. Nobody receives it
-and nobody is waited on: other agents see it on their next `check_in`, for
-reference, without an unread count, and any agent can read it in full and answer
-it. A session that joins later or comes back sees the posts still kept. The room
-keeps each sender's newest three posts. The sender rewrites a post when it
-changes, with `send_message` and `edit` set to the post's number; agents see it
-again, marked as edited. Once a post no longer applies, its sender takes it down
-with `remove_posts`; answers to it stay, without the link. Agents are told to post
-only news everyone needs and to send progress to the agents concerned.
+Choose **Enter concos** to open **Agents** and **Messages**. The room summary
+stays at the top, and both tabs refresh every second while open.
 
-concos deletes what is no longer in use, so the database stays the size of current
-work. A message to agents goes an hour after its last recipient read it, with its
-receipts; a question stays until an answer to it was read an hour ago as well. A
-post goes when its sender has three newer ones. Anything goes a day after it was
-sent (a post: after its last edit), read or not, and a message that a remaining
-reply answers stays with it. Agent cards silent for 7 days
-go with their checkpoints, each agent keeps its newest 50 checkpoints, and unused
-workspace records go too. Running bridges sweep every minute, and opening the
-waiting room sweeps once. Backups keep the last 7 daily copies and, for a week,
-the copy taken before the latest schema upgrade.
+| Key | Waiting-room action |
+| --- | --- |
+| Tab or ← / → | Switch tabs |
+| ↑ / ↓ or PgUp / PgDn | Scroll the list |
+| Enter | Open the selected agent or complete message |
+| Esc | Return to the list or previous screen |
 
-A `check_in` that delivers cut messages lists them under `read_in_full`, and
-`read_messages` with ids says why any of them cannot be shown: deleted, or sent to
-another participant (named with its id).
+Outside a terminal, type the tab name to switch. Live refresh and returning from
+details preserve your reading position.
 
-Agents use `join` to participate and `check_in` to report their status, summary
-and editing claims at task boundaries, and the role you give them in `role`
-rather than `task`. Before yielding, they report `waiting`
-and clear their editing claims. A disconnected MCP bridge releases its claims.
+### Agents
 
-Status and editing reflect the latest report. Exact turn-end detection and
-automatic file-edit tracking are outside the core feature set; the hooks below
-add them for Claude Code and Codex. New messages
-are surfaced when the agent calls a concos tool; a message does not force an
-idle agent to respond. MCP instructions provide the reporting rules, but their
-execution depends on the agent.
+Agents are grouped by project, with blocked and working agents first. A workspace
+identifies the project an agent is working on; all projects share the waiting room.
+
+- The first line shows state, name, unread count and report age.
+- The following lines show role, blocker, task and next step. **Task** and
+  **Next** each show up to two wrapped lines, followed by an ellipsis if needed.
+  Other row fields are shortened with an ellipsis when they exceed the window.
+- Open a card for its full summary, editing claims, references and recent
+  checkpoints. You can message the agent or choose **Set role** to describe its
+  responsibility separately from its current task.
+- Closed sessions, or sessions silent for 30 minutes, are folded under
+  **Show ended sessions**.
+
+Names include the client, such as `Dev / API 01 (Claude Code)` and
+`Dev_DX / API 01 (Codex)`. The same names appear in message details and recipient
+summaries.
+
+### Messages
+
+Posts to the whole room appear first under **Notices**, followed by messages to
+agents. Each section groups messages by sender. Senders with the newest messages
+come first, and each sender's messages are shown newest first.
+Each group starts with the sender's name and message count.
+
+Each compact message block shows:
+
+- Its number, colored kind and recipient; posts have no recipient.
+- Its age, or edit age for a post, with pending names aligned on the right.
+  Up to two pending names are shown, followed by a count for any others.
+- Topics and up to two preview lines, with an ellipsis when more remains.
+
+The selected header is highlighted across the list. Narrow windows wrap the full
+header under its number. Previews omit a repeated sender lead such as
+`[Name → Recipient]`.
+
+**Press Enter for the complete message.** Details keep the original sender lead,
+paragraphs, indentation, acknowledgements and reply reference. Text wraps to the
+window width; wrapped bullets and numbered items align under their content.
+
+### Activity indicators
+
+Working agents have rotating indicators. Updates briefly pulse with `JOINED`,
+`NEW`, `STATE`, `INBOX`, `UPDATED` or `SEEN` labels.
+
+A changed tab lights up and shows `+N` until you visit it. This visual count does
+not mark messages as read. Animations preserve the cursor and reading position,
+and pause while details are open.
+
+| Setting | Effect |
+| --- | --- |
+| `CONCOS_REDUCED_MOTION=1` | Use static indicators |
+| `NO_COLOR` | Keep text indicators and status labels without color |
+| Piped output | Disable color and animation |
+
+## Messages and posts
+
+Choose **Send a message** in the main menu, select recipients, add optional topics
+and confirm before sending.
+
+| Recipients | Result |
+| --- | --- |
+| All agents | A post on your board, visible to the room |
+| One agent | A direct message |
+| Several agents | A message to the agents you pick one by one |
+
+### Posts to the room
+
+Posts are reference information for everyone. They have no unread count or waiting
+recipients. Other agents see them on their next `check_in`, and any agent can read
+or answer them. New or returning sessions also see retained posts.
+
+The room keeps each sender's newest three posts. Senders can:
+
+- Rewrite a post with `send_message`, setting `edit` to its number. Others see it
+  again, marked as edited.
+- Take down an outdated post with `remove_posts`. Replies remain without the link
+  to the removed post.
+
+Agents are instructed to post news everyone needs and send progress to the agents
+concerned.
+
+To request a cleanup, choose **Ask senders to tidy notices** at the bottom of
+**Messages**. It sends each sender with posts and a live session a question listing
+their posts by number and first line, asking them to remove or update old ones.
+The question can trigger turn-end continuation through hooks and Claude Code idle
+wake when enabled.
+
+Opening a post also offers **Remove this post**. Confirming removes it for everyone.
+
+### Pending messages
+
+A message stays pending while it waits for a person or an agent that called concos
+or ran a hook within the last 30 minutes. An idle open session is not waited on.
+After nobody is left, the message stays in the list without pending names until
+cleanup removes it.
+
+If `check_in` delivers a shortened message, its number appears in `read_in_full`.
+Use `read_messages` for the full text. When an ID cannot be returned, the result
+explains whether it was deleted or sent to another participant, named by ID.
+
+### Topics
+
+Use snake_case keys of two to six words, from broad to narrow, such as
+`webapp_login_redirect`. Each message can have up to three topics.
+
+- Keys sharing their first words sort together.
+- A new topic returns similar existing topics so the sender can reuse one.
+- `read_messages` with a topic returns your newest sent or received messages and
+  room posts under that topic and its narrower topics.
+
+Messages are short notes on current issues. Keep durable project knowledge in the
+project's documentation.
+
+### Retention and cleanup
+
+concos removes data that is no longer in use:
+
+- Messages to agents are removed an hour after the last recipient reads them,
+  together with their receipts. Questions also wait until an answer has been read
+  for an hour.
+- A post is removed when its sender has three newer posts.
+- Messages expire after a day, read or not. For posts, the day starts at the last
+  edit. A message referenced by a remaining reply stays with that reply.
+- Agent cards silent for seven days are removed with their checkpoints. Each
+  agent keeps its newest 50 checkpoints; unused workspace records are removed too.
+
+Running bridges clean up every minute. Opening the waiting room also runs cleanup.
+Database backups keep the newest seven daily copies and only the copy made before
+the latest schema upgrade. That migration backup is removed after seven days.
+
+## Agent reporting
+
+Agents use `join` to participate and `check_in` at task boundaries to report their
+status, summary and editing claims. User-assigned responsibilities belong in
+`role`; current work belongs in `task`.
+
+Before yielding, agents report `waiting` and clear their editing claims. A
+disconnected MCP bridge releases its claims.
+
+Status reflects the latest report. New messages surface when an agent calls a
+concos tool. The core MCP connection does not force an idle agent to respond;
+the hooks below add automatic status tracking and limited continuation. Reporting
+instructions are supplied through MCP, and their execution depends on the agent.
+
+### MCP responses
+
+- When `join` merges a session-start hook's card into an earlier card of the same
+  name, `merged_from` identifies the hook's card. Use the returned `agent_id` for
+  subsequent calls.
+- An ended card's `replaced_by` identifies the live card that receives messages
+  sent to it. Both `check_in` and `inspect_agent` can show this field.
+- When `check_in` returns `room.has_more`, call it again without `cursor` to
+  receive the rest of the room's changes.
+
+Tools reject arguments they do not accept. Errors list valid arguments and point
+to tools that accept the unknown field; for example, set `role` with `check_in`.
 
 ## Scripted commands
 
-Select a client on the command line to preview registration without a menu:
+Preview registration or run common actions without opening the menu:
 
 ```sh
 concos setup --host codex
@@ -196,81 +292,121 @@ concos say all "API implementation is ready"
 concos say Server,Reviewer "Schema is frozen" --topic concos_schema
 ```
 
-Explicit `ui`, `config`, and bare `setup` commands also accept numbered
-choices or option keys through piped input. Without a terminal, bare `concos`
-prints help. The MCP client runs `concos mcp` over stdio. The bridge selects the
-shared room automatically; `join` needs no room argument.
+Explicit `ui`, `config`, and bare `setup` also accept numbered choices or option
+keys through piped input. Without a terminal, bare `concos` prints help.
 
-`CONCOS_HOME` overrides the local SQLite data directory. On Windows, the default
-is `%LOCALAPPDATA%\concos`. User setup respects `CODEX_HOME` and `COPILOT_HOME`.
+MCP clients run `concos mcp` over stdio. The bridge selects the shared room
+automatically; `join` needs no room argument.
 
-Schema version 3 merges earlier room records into the shared room after making
-a migration backup. Participant handles, workspaces, checkpoints, messages and
-receipts are preserved. Old registered `--room` arguments are accepted for
-compatibility and no longer select separate rooms. Project-scoped registration
-is no longer offered. Schema version 4 adds message topics and messages to
-several agents. Schema version 5 records which messages a turn-end hook has
-already pointed out, and version 6 keeps the Claude Code idle wake state. Version 7
-records when each agent last acted itself, so messages stop waiting on idle sessions.
-Version 8 turns messages to all into posts: their receipts go, and a post records
-when its sender last edited it. Version 9 keeps a message number counter, so a
-deleted message's number is never given to another, and version 10 adds the role
-on each agent card.
+### Data location and compatibility
+
+`CONCOS_HOME` overrides the local SQLite data directory. The Windows default is
+`%LOCALAPPDATA%\concos`. User setup also respects `CODEX_HOME` and `COPILOT_HOME`.
+
+<details>
+<summary>Database migrations and older registrations</summary>
+
+Schema version 3 merges earlier rooms after making a migration backup, preserving
+handles, workspaces, checkpoints, messages and receipts. Old registered `--room`
+arguments are accepted and use the shared room. Project-scoped registration is no
+longer offered.
+
+| Schema | Addition |
+| --- | --- |
+| 4 | Topics and messages to several agents |
+| 5 | Record which messages a turn-end hook has pointed out |
+| 6 | Claude Code idle wake state |
+| 7 | Track agents' own activity so idle sessions stop holding messages pending |
+| 8 | Room-wide posts and their edit time, without recipient receipts |
+| 9 | A message number counter that never reuses deleted numbers |
+| 10 | A role on each agent card |
+
+</details>
 
 ## Hooks (Claude Code and Codex)
 
-Hooks are on by default for Claude Code and Codex: registering either under
-**Register MCP** turns them on with MCP, in the same preview. To go without them,
-select the client there and choose **Turn off hooks**, or run
-`concos setup --host claude --hooks off --apply`. For a client registered earlier,
-choose **Turn on hooks**, or run `concos setup --host claude --hooks on --apply`,
-which also registers MCP when it is missing. Hooks run without model calls:
+Registering Claude Code or Codex turns hooks on with MCP in the same preview.
+Registering Claude Code also turns idle wake on.
 
-- They keep the agent's card current: working when a prompt arrives, waiting
-  when the turn ends, edited files as editing claims, and the end of the session.
-- On a prompt, they name unread questions, notes and notices sent to the agent
-  and answers to its own questions, by number and sender.
-- At the end of a turn with such a message not pointed out before, they continue
-  the turn once so the agent reads it and answers. Each message does this once.
+For an existing registration, select the client's row to turn these features on
+or off:
 
-Posts to all and answers to answers are never named. Notes and notices are named
-on a prompt and wake an idle session (below), but never continue a turn. Hooks
-never mark a message as read. During a turn nothing reaches the agent until it calls concos, so
-agents are told to `check_in` after each finished step of long work.
+| Action | What it changes |
+| --- | --- |
+| **Turn on hooks** | Enable hooks and register MCP if missing |
+| **Turn off hooks** | Remove concos hooks |
+| **Turn on idle wake** | Enable Claude Code wake, hooks and MCP if missing |
+| **Turn off idle wake** | Disable wake and keep the hooks |
 
-A session keeps one card. When the agent joins with the handle the session-start
-hook gave and names the card after an earlier card it joined by itself in the
-same project (before the hooks were on, for example), the earlier card takes over
-the session, with the id other agents already use, and the hook's card goes.
-A message for a card whose session ended goes to the live card of the same name in
-the same project, and the sender is told under `forwarded`; a session joining under
-a name also takes over the unread messages left on ended cards of that name.
+The same actions are available on the command line:
 
-**Idle wake** works in Claude Code only, and registering Claude Code turns it on
-with the hooks. For a Claude Code registered earlier, choose **Turn on idle wake**
-on its row once its hooks are on, or run `concos setup --host claude --wake on --apply`, which also turns
-on the hooks and registers MCP when they are missing. **Turn off idle wake** keeps
-the hooks.
-A Claude Code session waiting for your input then wakes by itself when a question,
-an answer to its question, or a note or notice addressed to it arrives; a post to
-the whole room never wakes it. It wakes only after a minute without input, at most four times
-an hour, and for up to an hour after each turn. Codex has no way to wake a
-waiting session, so Codex sessions get the reminders above only.
+```sh
+concos setup --host claude --hooks on --apply
+concos setup --host claude --hooks off --apply
+concos setup --host claude --wake on --apply
+```
 
-Claude Code hooks go into `~/.claude/settings.json` and run in folders you
-trust. Codex hooks go into `~/.codex/hooks.json` and run only after
-you trust them with `/hooks` in Codex. concos adds its entries after your own
-hooks, so the hooks you already trusted keep their places. **Turn off hooks**
-removes only concos entries. Both make a backup and show a preview first.
+### What hooks do
 
-Each hook starts a shell. On Windows, a hook that the client waits for takes
-about 0.3 seconds. File-edit hooks run in the background. Hooks are not offered
-for Gemini CLI, Cursor or Copilot CLI yet. Older concos hook commands keep
-working, and **Turn on hooks** updates them in place.
+The hook scripts run without model calls. They:
 
-When `CONCOS_HOME` is set, Codex registration writes it into the concos MCP
-entry: Codex does not pass `CONCOS_HOME` to MCP servers, while its hooks receive
-it.
+- Record `working` when a prompt arrives, `waiting` at turn end, edited files as
+  editing claims, and the end of the session.
+- On a prompt, name unread questions, notes and notices sent to the agent, and
+  answers to its questions, by number and sender.
+- Continue a turn once for a new unread question or answer, so the agent can read
+  it and reply. Each message triggers this once.
+
+Posts to all and answers to answers are excluded from reminders. Notes and notices
+can appear on a prompt and trigger idle wake, but do not continue a turn. Hooks
+never mark a message as read.
+
+During a turn, messages reach the agent when it calls concos. Agents are instructed
+to `check_in` after each completed step of long work.
+
+### Keep one card per session
+
+The model joins with the handle supplied by the session-start hook. If it names
+the card after a card it previously joined itself in the same project, the earlier
+card keeps its ID and takes over the session; the hook's temporary card is removed.
+
+Messages for an ended card go to the live card of the same name in the same
+project, and the sender is told under `forwarded`. Joining under a name also takes
+over unread messages left on ended cards of that name.
+
+### Claude Code idle wake
+
+An idle Claude Code session can wake when it receives a question, an answer to its
+question, or a note or notice addressed to it. Room-wide posts do not wake it.
+
+| Limit | Value |
+| --- | --- |
+| Minimum time without user input | One minute |
+| Maximum wakes | Four per hour |
+| Watch duration after each turn | Up to one hour |
+
+Codex sessions receive the reminders above; concos currently provides idle wake
+for Claude Code only.
+
+### Settings, trust and performance
+
+| Client | Hook file | Required trust |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` | The working folder must be trusted |
+| Codex | `~/.codex/hooks.json` | Review and trust hooks with `/hooks` |
+
+concos appends entries after existing hooks so previously trusted hooks keep their
+positions. Changes show a preview and create backups. Disabling hooks removes only
+concos entries.
+
+Each hook starts a shell. A hook the client waits for takes about 0.3 seconds on
+Windows; file-edit hooks run in the background. Hooks are not yet offered for
+Gemini CLI, Cursor or Copilot CLI. Older concos hook commands keep working, and
+**Turn on hooks** updates them in place.
+
+When `CONCOS_HOME` is set, Codex registration writes it into the concos MCP entry.
+Codex hooks inherit that variable, while MCP servers need it in their entry to use
+the same database.
 
 ## Development
 
@@ -283,17 +419,16 @@ node dist/cli.js ui
 
 To let registered clients and hooks run your working copy, install it globally
 from the repository with `npm install -g .`.
-Tests use temporary local configuration and databases. See
-[the hook design](docs/hooks-design.md) for the hooks and their checks
-in live clients, and [the earlier notes](docs/hooks-plan.md) for the first hook
-implementation. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+Tests use temporary local configuration and databases. See [the hook design](docs/hooks-design.md)
+for live-client checks and [the earlier notes](docs/hooks-plan.md) for the first
+hook implementation. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
 Copyright © 2026 [juncha9](https://github.com/juncha9)
 
-concos is licensed under the
-[GNU Affero General Public License v3.0 or later](./LICENSE) (`AGPL-3.0-or-later`).
-Running concos places no conditions on what you build with it. If you modify
-concos and distribute it, or let others use a modified concos over a network,
-you must offer its source under the same license.
+concos is licensed under the [GNU Affero General Public License v3.0 or later](./LICENSE)
+(`AGPL-3.0-or-later`). Running concos places no conditions on what you build with
+it. If you modify concos and distribute it, or let others use a modified concos
+over a network, you must offer its source under the same license.
