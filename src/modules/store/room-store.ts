@@ -31,7 +31,6 @@ import {
     SHARED_ROOM,
     STALE_CARD_MS,
     TOPIC_KEY_PATTERN,
-    WAKE_HOURLY_LIMIT,
 } from "../../_defs";
 import type { AgentStatus, MessageKind } from "../../_defs";
 import { CONCOS_VERSION } from "../../_libs/version";
@@ -299,6 +298,8 @@ export interface RoomOverviewAgent {
     blocker: string;
     editing: string[];
     workspace_path: string | null;
+    /** The folder the agent's session started in. */
+    working_directory: string | null;
     /** The folder the agent works in now, when it is not the one its session started in. */
     current_directory: string | null;
     updated_at: string;
@@ -1225,7 +1226,7 @@ export class RoomStore {
      *
      * Flow:
      *  1) stop: a newer watch or a prompt replaced this one, or the session ended or left
-     *  2) wait: still inside the quiet time, nothing new to point out, or woken enough this hour
+     *  2) wait: still inside the quiet time, or nothing new to point out
      *  3) wake: under the write lock, check again, then record the wake and the messages pointed
      *     out, and end this watch
      *
@@ -1249,12 +1250,15 @@ export class RoomStore {
             if(quietEnough == false) {
                 return { check: { state: "wait" }, woken: [] };
             }
-            // a note or notice named to the session wakes it too (2026-10-25 user decision)
+            // a note or notice named to the session wakes it too (2026-10-25 user decision). No hourly
+            // limit (2026-10-26 user decision): with one, a busy agent spent its wakes within minutes
+            // and then slept through its messages for the rest of the hour.
             const notices = this.hookNotices(watch.agentId, row.hook_nudged_seq, true);
-            const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
-            if(notices.length == 0 || woken.length >= WAKE_HOURLY_LIMIT) {
+            if(notices.length == 0) {
                 return { check: { state: "wait" }, woken: [] };
             }
+            // wake times of the last hour, kept on the card for diagnosis
+            const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
             return { check: { state: "wake", notices: notices }, woken: woken };
         };
         const first = look();
@@ -2743,6 +2747,7 @@ export class RoomStore {
                 blocker: row.blocker,
                 editing: parseList(row.editing_list),
                 workspace_path: workspacePath,
+                working_directory: row.working_directory,
                 current_directory: row.current_directory,
                 updated_at: row.updated_at,
                 online: isOnline(row, nowMs),

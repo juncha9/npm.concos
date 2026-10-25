@@ -349,18 +349,19 @@ describe("idle wake", () => {
         expect(store.startWakeWatch(event("watch", { sessionId: "never-started" }))).toBeNull();
     });
 
-    it("wakes a session at most four times an hour", () => {
+    it("wakes a session for every new message with no hourly limit, keeping the last hour's wake times", () => {
         const joined = start();
         const from = asker();
         const nowMs = Date.now();
-        for(let index = 0; index < 4; index += 1) {
+        for(let index = 0; index < 6; index += 1) {
             ask(from, joined.agent_id);
             expect(store.checkWakeWatch(watch(), true, nowMs + index * 1000).state).toBe("wake");
         }
         ask(from, joined.agent_id);
-        const capped = watch();
-        expect(store.checkWakeWatch(capped, true, nowMs + 5000).state).toBe("wait");
-        expect(store.checkWakeWatch(capped, true, nowMs + 60 * 60 * 1000 + 1000).state).toBe("wake");
+        expect(store.checkWakeWatch(watch(), true, nowMs + 60 * 60 * 1000 + 2500).state).toBe("wake");
+        // the wakes at +0, +1 and +2 seconds are over an hour old by then
+        const row = database.prepare("SELECT woken_at_list FROM agent WHERE id = ?").get(joined.agent_id) as { woken_at_list: string };
+        expect(JSON.parse(row.woken_at_list)).toHaveLength(4);
     });
 
     it("resolves the watch with the wake line when a question arrives, or with nothing when its time runs out", async () => {

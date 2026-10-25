@@ -8,7 +8,7 @@ import { participantName } from "./status-renderer";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
-import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, resolveHooksPath, UPDATED_MESSAGE } from "./setup";
+import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, pruneSettingsBackups, resolveHooksPath, resolveMcpPath, UPDATED_MESSAGE } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 import { checkForSelfUpdate, showSelfUpdate } from "./self-update";
 import type { AvailableUpdate, SelfUpdateOptions } from "./self-update";
@@ -222,7 +222,7 @@ async function showStatus(prompter: Prompter, options: MenuOptions): Promise<voi
     });
 }
 
-/** `presetTo` skips the recipient list, for sends started from an agent's detail view. */
+/** The board's send flow: `presetTo` skips the recipient list, for sends started from an agent's detail view. */
 async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void> {
     const room = (await readRoomOverviews())[0];
     // ended sessions are not offered: nothing reads their messages unless the session comes back
@@ -232,7 +232,7 @@ async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void
             prompter.write("\nNo agents have joined yet. Register MCP, then start a task in your client.\n");
         }
         else {
-            prompter.write("\nNo agent is active right now. Ended sessions are listed under Enter concos.\n");
+            prompter.write("\nNo agent is active right now. Ended sessions are on the Agents tab, under Show ended sessions.\n");
         }
         await prompter.pause();
         return;
@@ -309,9 +309,15 @@ async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void
 /** Keyboard menu and line-mode equivalent; setting previews always precede writes. */
 export async function runMenu(options: MenuOptions): Promise<void> {
     if(options.host != null) getMcpClient(options.host);
+    // backups of a client nobody registers again expire here, not only when concos writes its settings
+    pruneSettingsBackups(MCP_CLIENTS.flatMap((client) => {
+        const target = { host: client.id, home: options.home };
+        if(hasHooks(client.id)) return [resolveMcpPath(target), resolveHooksPath(target)];
+        return [resolveMcpPath(target)];
+    }));
     const draft: SetupDraft = { host: options.host ?? "codex", home: options.home };
     const prompter = new Prompter(options.input, options.output);
-    let selected: "setup" | "status" | "say" | "update" | "quit" = "setup";
+    let selected: "setup" | "status" | "update" | "quit" = "status";
     let startWithSetup = options.startWithSetup ?? false;
     let update: AvailableUpdate | null | undefined;
     const top = prompter.mark();
@@ -322,10 +328,10 @@ export async function runMenu(options: MenuOptions): Promise<void> {
                 if(!startWithSetup && update === undefined) {
                     update = options.selfUpdate === false ? null : await checkForSelfUpdate(options.selfUpdate);
                 }
-                const action: "setup" | "status" | "say" | "update" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
-                    { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
+                // the board first, where the cursor starts: registering is done once (2026-10-26 user decision)
+                const action: "setup" | "status" | "update" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
                     { value: "status", label: "Enter concos", hint: "Agents · Messages" },
-                    { value: "say", label: "Send a message" },
+                    { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
                     ...(update != null ? [{ value: "update" as const, label: "Update concos", hint: `${update.currentVersion} → ${update.latestVersion}` }] : []),
                     { separator: true },
                     { value: "quit", label: "Quit" },
@@ -338,7 +344,6 @@ export async function runMenu(options: MenuOptions): Promise<void> {
                 else if(action == "update") {
                     if(update != null && await showSelfUpdate(prompter, update, options.selfUpdate || undefined)) return;
                 }
-                else await sendFromMenu(prompter);
             }
             catch(error) {
                 if(error instanceof PromptClosedError) return;

@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 import { applyEdits, getNodeValue, modify, parseTree } from "jsonc-parser";
 import type { ParseError } from "jsonc-parser";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
-import { NODE_FLAGS, SHARED_ROOM, WAKE_HOURLY_LIMIT, WAKE_IDLE_MS, WAKE_WATCH_MS } from "../../_defs";
+import { NODE_FLAGS, SETTINGS_BACKUP_RETENTION_MS, SHARED_ROOM, WAKE_IDLE_MS, WAKE_WATCH_MS } from "../../_defs";
 import { getHostAdapter } from "../hooks/adapters";
 import type { HookRegistration, HostAdapter } from "../hooks/types";
 import { RoomError } from "../store/room-error";
@@ -724,8 +724,7 @@ function addWake(change: SetupChange, input: SetupTarget): void {
     setJson(change, ["hooks", item.event, groups.length], item.group, true);
     change.notes.push(
         `A waiting ${HOST_LABELS[input.host]} session wakes by itself when a question, an answer to its question, or a note or notice addressed to it arrives: `
-        + `after ${WAKE_IDLE_MS / 1000} seconds without input, at most ${WAKE_HOURLY_LIMIT} times an hour, `
-        + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn.`
+        + `after ${WAKE_IDLE_MS / 1000} seconds without input, for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn.`
         + (input.host == "codex" ? " concos sends one line to that session with codex queue to wake it." : ""),
     );
     if(input.host == "codex" && change.notes.includes(CODEX_HOOK_TRUST_NOTE) == false) {
@@ -857,6 +856,52 @@ function backupSettings(file: string, stamp: string): void {
     }
 }
 
+/**
+ * What follows a settings file's name in a concos backup of it: `.concos-mcp-backup-<UTC time>`
+ * with `-2`, `-3`, … for a taken name (groups: date, hours, minutes, seconds, milliseconds,
+ * attempt), or `.concos-backup-<uuid>` as concos named them before 0.1.7 (no groups).
+ */
+const SETTINGS_BACKUP_SUFFIX = /^\.concos-mcp-backup-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z(?:-(\d+))?$|^\.concos-backup-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+/**
+ * Keeps one concos backup of each settings file, the newest, until it is
+ * `SETTINGS_BACKUP_RETENTION_MS` old (2026-10-26 user decision). A backup is a full copy of the
+ * file, so it keeps other servers' secrets after the file itself dropped them. A backup's time is
+ * the one in its name; one named before 0.1.7 has none, so its file time stands in. Files that only
+ * look like backups stay, and one that cannot be removed is left for the next pass.
+ */
+export function pruneSettingsBackups(files: string[], nowMs: number = Date.now()): void {
+    for(const file of new Set(files)) {
+        const directory = path.dirname(file);
+        const name = path.basename(file);
+        let entries: string[];
+        try { entries = fs.readdirSync(directory); }
+        catch { continue; }
+        const backups: { entry: string; timeMs: number; attempt: number }[] = [];
+        for(const entry of entries) {
+            if(entry.startsWith(name) == false) continue;
+            const match = SETTINGS_BACKUP_SUFFIX.exec(entry.slice(name.length));
+            if(match == null) continue;
+            if(match[1] != null) {
+                backups.push({ entry, timeMs: Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`), attempt: Number(match[6] ?? 1) });
+                continue;
+            }
+            try { backups.push({ entry, timeMs: fs.statSync(path.join(directory, entry)).mtimeMs, attempt: 1 }); }
+            catch {
+                // removed by someone else since the listing
+            }
+        }
+        backups.sort((left, right) => right.timeMs - left.timeMs || right.attempt - left.attempt);
+        backups.forEach((backup, index) => {
+            if(index == 0 && nowMs - backup.timeMs < SETTINGS_BACKUP_RETENTION_MS) return;
+            try { fs.rmSync(path.join(directory, backup.entry), { force: true }); }
+            catch {
+                // open in another program; the next pass removes it
+            }
+        });
+    }
+}
+
 /** Never writes a settings file that concos itself could not read back. */
 function verifyReadable(change: SetupChange): void {
     if(change.path.endsWith(".toml")) {
@@ -900,6 +945,8 @@ export function applySetup(changes: SetupChange[]): void {
         if(recovery.length > 0) throw new RoomError(`${ex instanceof Error ? ex.message : String(ex)}\nSome files could not be restored; original backups were kept:\n${recovery.join("\n")}`);
         throw ex;
     }
+    // only after every file is written: a failed apply keeps all backups for recovery
+    pruneSettingsBackups(changes.map((change) => change.path));
 }
 
 function writeChanges(changes: SetupChange[]): void {

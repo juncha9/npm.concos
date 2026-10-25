@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.12] - 2026-10-26
+
+### Changed
+- **Idle wake has no hourly limit.** A waiting Claude Code or Codex session wakes for each question, answer to its question, or note or notice addressed to it, still once per message and only after a minute without input. Before, it woke at most four times an hour, so an agent many others report to could spend its wakes within minutes and miss its messages for the rest of the hour. Two agents that keep sending each other notes now keep waking each other; an answer to an answer still wakes no one.
+- **The main menu starts on Enter concos**, now its first item, followed by Register MCP. **Send a message** moved from the main menu to the board's Messages tab, where it still sends to all, several agents or one; an agent's card keeps its own Send a message for that agent.
+- **The Messages tab's actions sit above the messages**: Send a message, Search messages and, while agents have posts, Ask senders to tidy notices. The cursor still starts on the first message.
+- **An agent's Folder on the board is where it works now, from its project's root**: the folder it reported, else the one its session started in, with no Folder line at the project root. Before, Folder appeared only for a folder reported apart from the start folder, so a card whose session started inside its project showed none, and a card back at its project root showed that root as a full path, as if it were elsewhere.
+- **Settings backups are kept for a week, one per file.** A backup is a full copy of the settings file, so it kept other MCP servers' secrets after the file itself dropped them. concos now keeps only the newest `<file>.concos-mcp-backup-<UTC time>` of each file and removes it after seven days, when it writes settings and whenever its menu opens. Backups named `<file>.concos-backup-<id>` by versions before 0.1.7 go the same way.
+
+### Notes
+- No schema change. Hooks start the installed concos at every event, so idle wake follows the update from each session's next turn end; a watch already running keeps the hourly limit until it ends.
+
 ## [0.1.11] - 2026-10-26
 
 ### Added

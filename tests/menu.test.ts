@@ -55,6 +55,19 @@ describe("registration menu", () => {
         expect(fs.existsSync(path.join(directory, ".codex"))).toBe(false);
     });
 
+    it("clears concos settings backups that are no longer the newest, or a week old, when it opens", async () => {
+        const home = path.join(directory, "user");
+        fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+        const fresh = path.join(home, `.claude.json.concos-mcp-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+        const replaced = path.join(home, ".claude.json.concos-mcp-backup-2026-01-01T00-00-00-000Z");
+        const expired = path.join(home, ".codex", "hooks.json.concos-mcp-backup-2026-01-01T00-00-00-000Z");
+        for(const file of [fresh, replaced, expired]) fs.writeFileSync(file, "copy");
+        await menu("quit\n", { selfUpdate: false });
+        expect(fs.existsSync(fresh)).toBe(true);
+        expect(fs.existsSync(replaced)).toBe(false);
+        expect(fs.existsSync(expired)).toBe(false);
+    });
+
     it("registers on Enter at the question, since yes is its default", async () => {
         const output = await menu("setup\ngemini\n\nback\nquit\n");
         expect(output).toContain("Register these settings? (Y/n)");
@@ -117,8 +130,8 @@ describe("registration menu", () => {
         output.on("data", (chunk) => screen.write(chunk.toString()));
         const running = runMenu({ input, output, home: path.join(directory, "user") });
         const views: string[] = [];
-        // menu: Register MCP; list: Claude Code; its hooks: Esc; the list again; Esc to the menu; Esc quits
-        for(const step of ["\r", "1", "\r", "\u001b", "look", "\u001b", "look", "\u001b"]) {
+        // menu: Register MCP, the second row; list: Claude Code; its hooks: Esc; the list again; Esc to the menu; Esc quits
+        for(const step of ["2", "\r", "1", "\r", "\u001b", "look", "\u001b", "look", "\u001b"]) {
             await new Promise((resolve) => setTimeout(resolve, 30));
             if(step == "look") views.push(screen.visible().join("\n"));
             else input.write(step);
@@ -239,6 +252,27 @@ describe("room menu", () => {
         expect(output).toMatch(/ {10}Folder {3}docs-repo\n +Task {5}design notes/);
     });
 
+    it("shows where an agent works from its project's root: its start folder when inside, nothing at the root", async () => {
+        const docs = path.join(directory, "docs-repo");
+        fs.mkdirSync(docs);
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        // a session that started in a folder inside its project, as cards from before 0.1.11 can be
+        const agent = store.join({ room: "main", displayName: "Server", client: "Codex", workingDirectory: docs, workspaceRoot: directory, resumeHandle: null });
+        database.close();
+        expect(await menu("status\nback\nquit\n")).toMatch(/ {10}Folder {3}docs-repo\n/);
+
+        // then it moves up to the project root, which the project heading already names
+        const again = await openDatabase(path.join(directory, "data"));
+        new RoomStore(again).checkIn(agent.agent_id, {
+            cursor: null, expectedRevision: null, update: { currentDirectory: directory }, checkpoint: null, receivedMessageIds: [],
+        });
+        again.close();
+        const atRoot = await menu("status\nback\nquit\n");
+        expect(atRoot).toContain("Server (Codex)");
+        expect(atRoot).not.toContain("Folder");
+    });
+
     it("shows an agent's role on its row and lets the person at the board set it", async () => {
         const agent = await seedRoom();
         const database = await openDatabase(path.join(directory, "data"));
@@ -272,7 +306,7 @@ describe("room menu", () => {
         output.on("data", (chunk) => { screen += chunk.toString(); });
         const running = runMenu({ input, output, home: path.join(directory, "user") });
         // menu: Enter concos; board: the agent; card: Esc back; board: Esc; menu: Esc quits
-        for(const key of ["2", "\r", "\r", "\u001b", "\u001b", "\u001b"]) {
+        for(const key of ["1", "\r", "\r", "\u001b", "\u001b", "\u001b"]) {
             await new Promise((resolve) => setTimeout(resolve, 30));
             input.write(key);
         }
@@ -294,11 +328,13 @@ describe("room menu", () => {
         store.sendMessage(human, { to: agent.agent_id, kind: "question", text, replyTo: null, requestId: null });
         database.close();
 
-        const output = await menu("status\nmessages\n1\nback\nquit\n");
+        // the tab's actions take rows 1 and 2, above the messages
+        const output = await menu("status\nmessages\n3\nback\nquit\n");
         expect(output).toContain("Server (Codex) (1 unread)");
         expect(output).toContain(" Agents 1  [Messages 1]");
+        expect(output).toMatch(/1\) Send a message +to all, several agents or one\n[^\n]*2\) Search messages/);
         expect(output).toMatch(/\n {2}Reviewer {2}1 message\n/);
-        expect(output).toMatch(/1\) #1 QUESTION {2}(→|->) Server \(Codex\) +just now · Pending Server/);
+        expect(output).toMatch(/3\) #1 QUESTION {2}(→|->) Server \(Codex\) +just now · Pending Server/);
         const list = output.slice(output.indexOf("[Messages 1]"), output.indexOf("From  Reviewer"));
         // two preview lines, the second ending in an ellipsis
         expect(list).toMatch(/ {2}First line\n +Second line with details(…|\.\.\.)\n/);
@@ -325,9 +361,9 @@ describe("room menu", () => {
         output.on("data", (chunk) => { screen += chunk.toString(); });
         const running = runMenu({ input, output, home: path.join(directory, "user") });
         const frames: string[] = [];
-        // menu: Enter concos; board: Tab to Messages, open the message, Esc back to the
-        // tab, ← back to Agents; Esc twice leaves
-        for(const key of ["2", "\r", "\t", "SNAP", "\r", "\u001b", "SNAP", "\u001b[D", "SNAP", "\u001b", "\u001b"]) {
+        // menu: Enter concos; board: Tab to Messages, where the cursor starts on the message below
+        // the actions, open it, Esc back to the tab, ← back to Agents; Esc twice leaves
+        for(const key of ["1", "\r", "\t", "SNAP", "\r", "\u001b", "SNAP", "\u001b[D", "SNAP", "\u001b", "\u001b"]) {
             await new Promise((resolve) => setTimeout(resolve, 30));
             if(key == "SNAP") {
                 frames.push(screen.slice(screen.lastIndexOf("\u001b[J") + 3).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, ""));
@@ -360,10 +396,10 @@ describe("room menu", () => {
         finally { database.close(); }
     });
 
-    it("stores a message for the selected participant after confirmation", async () => {
+    it("stores a message sent from the Messages tab for the selected participant after confirmation", async () => {
         const agent = await seedRoom();
         // Enter at the topics prompt files the message under none
-        const output = await menu(`say\n${agent.agent_id}\n검증 메시지\n\ny\nquit\n`);
+        const output = await menu(`status\nmessages\nsend\n${agent.agent_id}\n검증 메시지\n\ny\nback\nquit\n`);
         expect(output).toContain("1 recipient(s)");
         const database = await openDatabase(path.join(directory, "data"));
         try {
@@ -374,7 +410,17 @@ describe("room menu", () => {
 
     it("does not store a message when confirmation is declined", async () => {
         const agent = await seedRoom();
-        await menu(`say\n${agent.agent_id}\n취소할 메시지\n\n\nquit\n`);
+        await menu(`status\nmessages\nsend\n${agent.agent_id}\n취소할 메시지\n\n\nback\nquit\n`);
+        const database = await openDatabase(path.join(directory, "data"));
+        try { expect(database.prepare("SELECT COUNT(*) AS count FROM message").get()).toMatchObject({ count: 0 }); }
+        finally { database.close(); }
+    });
+
+    it("returns to the board, sending nothing, when Esc is pressed inside the Messages tab's send flow", async () => {
+        const agent = await seedRoom();
+        const output = await menu(`status\nmessages\nsend\n${agent.agent_id}\nESC\nback\nquit\n`);
+        // the board again after the Message prompt, not the main menu
+        expect(output.lastIndexOf("[Messages 0]")).toBeGreaterThan(output.indexOf("? Message"));
         const database = await openDatabase(path.join(directory, "data"));
         try { expect(database.prepare("SELECT COUNT(*) AS count FROM message").get()).toMatchObject({ count: 0 }); }
         finally { database.close(); }
@@ -389,7 +435,7 @@ describe("room menu", () => {
         join("Third");
         database.close();
 
-        const output = await menu("say\nseveral\nFirst\nSecond\ndone\nreview the board\nboard\nConcos board, concos-ui\ny\nquit\n");
+        const output = await menu("status\nmessages\nsend\nseveral\nFirst\nSecond\ndone\nreview the board\nboard\nConcos board, concos-ui\ny\nback\nquit\n");
         expect(output).toContain("Recipients · First (Codex), Second (Codex)");
         expect(output).toContain(`topic "board" must be`);
         expect(output).toContain(`Recipient: First (Codex) (${first.agent_id}), Second (Codex) (${second.agent_id})`);
@@ -406,11 +452,12 @@ describe("room menu", () => {
         finally { check.close(); }
     });
 
-    it("uses English for menu labels, reports and empty-state guidance", async () => {
-        const output = await menu("status\nsay\nquit\n");
-        expect(output).toContain("Register MCP");
+    it("uses English for menu labels, reports and empty-state guidance, with the board first", async () => {
+        const output = await menu("status\nquit\n");
+        expect(output.indexOf("Enter concos")).toBeLessThan(output.indexOf("Register MCP"));
+        // sending lives on the board: the Messages tab and an agent's card
+        expect(output).not.toContain("Send a message");
         expect(output).toContain("No agents have joined the shared waiting room yet");
-        expect(output).toContain("No agents have joined yet");
         expect(output).not.toMatch(/[가-힣]/);
     });
 });
@@ -442,7 +489,7 @@ describe("ended sessions on the board", () => {
     it("offers only active agents as recipients and says when a picked card's session has ended", async () => {
         const { database, gone } = await seedWithEnded();
         database.close();
-        const listed = await menu("say\nback\nquit\n");
+        const listed = await menu("status\nmessages\nsend\nback\nback\nquit\n");
         const recipients = listed.slice(listed.indexOf("? Recipient"));
         expect(recipients).toContain("Live");
         expect(recipients).not.toContain("Gone");
@@ -469,7 +516,7 @@ describe("ended sessions on the board", () => {
         // seeing the list is not reading: only opening the message acknowledges it
         await menu("status\nmessages\nback\nquit\n");
         expect(await receivedAt()).toBeNull();
-        await menu("status\nmessages\n1\nback\nquit\n");
+        await menu(`status\nmessages\n#${sent.message_id}\nback\nquit\n`);
         expect(await receivedAt()).not.toBeNull();
     });
 
@@ -672,7 +719,7 @@ describe("message groups on the board", () => {
         const running = runMenu({ input, output, home: path.join(directory, "user") });
         let frame = "";
         // menu: Enter concos; board: Tab to Messages; Esc twice leaves
-        for(const key of ["2", "\r", "\t", "SNAP", "\u001b", "\u001b"]) {
+        for(const key of ["1", "\r", "\t", "SNAP", "\u001b", "\u001b"]) {
             await new Promise((resolve) => setTimeout(resolve, 30));
             if(key == "SNAP") {
                 frame = screen.slice(screen.lastIndexOf("\u001b[J") + 3);

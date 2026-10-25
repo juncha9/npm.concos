@@ -142,18 +142,24 @@ export function age(isoText: string, nowMs: number, english: boolean): string {
     return english ? `${Math.floor(hours / 24)}d ago` : `${Math.floor(hours / 24)}일 전`;
 }
 
-/** Where an agent works now when it is not where its session started: under its project, the path from the project. */
+/** Where an agent works now, as a path from its project's root when inside it; empty at the root itself. */
 export function workFolder(agent: RoomOverviewAgent): string {
-    if(agent.current_directory == null) {
+    // the folder it reported, else the one its session started in
+    const folder = agent.current_directory ?? agent.working_directory;
+    if(folder == null) {
         return "";
     }
     if(agent.workspace_path != null) {
-        const relative = path.relative(agent.workspace_path, agent.current_directory);
-        if(relative != "" && relative.startsWith("..") == false && path.isAbsolute(relative) == false) {
+        const relative = path.relative(agent.workspace_path, folder);
+        // the project root goes without saying: the card sits under it
+        if(relative == "") {
+            return "";
+        }
+        if(relative.startsWith("..") == false && path.isAbsolute(relative) == false) {
             return relative.replaceAll(path.sep, "/");
         }
     }
-    return agent.current_directory;
+    return folder;
 }
 
 /** Why a card looks wrong, and what to do about it, in one line. */

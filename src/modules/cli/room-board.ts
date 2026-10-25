@@ -6,7 +6,7 @@ import { openDatabase } from "../store/database";
 import { RoomStore } from "../store/room-store";
 import type { RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth, padToWidth, PromptBackError } from "./prompter";
-import type { LinePart, Prompter, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
+import type { LinePart, Prompter, SelectChoice, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
 import { age, issueText, plain, renderAgentDetail, renderMessageDetail, stateLabel, stateOf, workFolder, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
 import type { State, StatusRenderOptions } from "./status-renderer";
 import { showMessageSearch } from "./message-search";
@@ -34,14 +34,14 @@ const RECEDING_STATES: State[] = ["idle", "finished", "offline", "left"];
 const PEOPLE_GROUP = "\u0000people";
 
 export interface RoomBoardOptions extends StatusRenderOptions {
-    /** Opens the send flow with the recipient already chosen. */
-    send: (agentId: string) => Promise<void>;
+    /** Opens the send flow: to `agentId` when given (an agent's card), else asking for all, several agents or one (the Messages tab). */
+    send: (agentId?: string) => Promise<void>;
 }
 
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "tidy:posts" | "search:messages" | "retire:flagged" | "back";
+type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "tidy:posts" | "send:message" | "search:messages" | "retire:flagged" | "back";
 
 type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
@@ -55,6 +55,8 @@ interface BoardView {
     /** The status bar under the question: state shares, counts and this concos's version. */
     banner: LinePart[];
     items: SelectItem<BoardValue>[];
+    /** The row the cursor starts on until one of this tab is picked: on the Messages tab the first message, below the actions. */
+    defaultValue?: BoardValue;
     tabs: SelectTabs<BoardValue>;
     agents: RoomOverviewAgent[];
     messages: RoomOverviewMessage[];
@@ -136,8 +138,8 @@ function writtenLineCount(text: string): number {
 /**
  * The Agents tab, grouped by project with blocked and working agents first. Each agent is a
  * state column, its name with the unread count right after it, then its role, the folder it works
- * in when that is not where its session started, its blocker, task and next step on lines aligned
- * under the name.
+ * in when that is not its project's root, its blocker, task and next step on lines aligned under
+ * the name.
  */
 function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: boolean, nowMs: number, showEnded: boolean, activity: RoomActivity, unicode = true): {
     items: SelectItem<BoardValue>[];
@@ -461,11 +463,27 @@ function buildView(
     const agents = overview.agents.filter((agent) => agent.human == false && isInactive(agent) == false);
 
     let items: SelectItem<BoardValue>[];
+    let defaultValue: BoardValue | undefined;
     let inactiveCount = 0;
     let posters: Poster[] = [];
     if(tab == "tab:messages") {
-        items = buildMessageItems(overview.messages, style, options, nowMs, activity);
         posters = store.livePosters(nowMs);
+        // the actions sit above the list, which can run long (2026-10-26 user decision); the list opens with its own heading
+        items = [
+            { value: "send:message", key: "send", label: english ? "Send a message" : "메시지 보내기", hint: english ? "to all, several agents or one" : "전체·여러 에이전트·한 에이전트에게" },
+            { value: "search:messages", key: "search", label: english ? "Search messages" : "메시지 검색", hint: english ? "by text, topic or sender" : "내용·주제·보낸 이로" },
+        ];
+        if(posters.length > 0) {
+            items.push({
+                value: "tidy:posts",
+                key: "tidy",
+                label: english ? "Ask senders to tidy notices" : "공지 정리 요청",
+                hint: english ? `${posters.length} agent${posters.length == 1 ? "" : "s"}` : `에이전트 ${posters.length}명`,
+            });
+        }
+        const messageItems = buildMessageItems(overview.messages, style, options, nowMs, activity);
+        defaultValue = messageItems.find((item): item is SelectChoice<BoardValue> => "value" in item)?.value;
+        items.push(...messageItems);
     }
     else {
         const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true);
@@ -479,17 +497,6 @@ function buildView(
             toggleLabel = english ? "Hide ended sessions" : "종료된 세션 숨기기";
         }
         items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
-    }
-    if(tab == "tab:messages") {
-        items.push({ value: "search:messages", key: "search", label: english ? "Search messages" : "메시지 검색", hint: english ? "by text, topic or sender" : "내용·주제·보낸 이로" });
-    }
-    if(posters.length > 0) {
-        items.push({
-            value: "tidy:posts",
-            key: "tidy",
-            label: english ? "Ask senders to tidy notices" : "공지 정리 요청",
-            hint: english ? `${posters.length} agent${posters.length == 1 ? "" : "s"}` : `에이전트 ${posters.length}명`,
-        });
     }
     const flagged = agents.filter((agent) => agent.issues.length > 0);
     if(tab == "tab:agents" && flagged.length > 0) {
@@ -514,7 +521,7 @@ function buildView(
         ],
     };
     const banner = statusBanner(agents, style, english, options.unicode ?? true);
-    return { question: question, banner: banner, items: items, tabs: tabs, agents: overview.agents, messages: overview.messages, posters: posters };
+    return { question: question, banner: banner, items: items, defaultValue: defaultValue, tabs: tabs, agents: overview.agents, messages: overview.messages, posters: posters };
 }
 
 /** A list the board shows in place: no `✔ question · answer` line is left behind when it closes. */
@@ -780,7 +787,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             const picked: BoardValue = await selectInPlace<BoardValue>(prompter, display.question, view.items, {
                 tabs: display.tabs,
                 banner: view.banner,
-                defaultValue: selected[tab],
+                defaultValue: selected[tab] ?? view.defaultValue,
                 cancelValue: "back",
                 animation: { intervalMs: ANIMATION_FRAME_MS, frame },
                 refresh: {
@@ -808,6 +815,23 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             if(picked == "tidy:posts") {
                 selected[tab] = picked;
                 await askToTidyPosts(prompter, store, view.posters, english);
+                view = loadView();
+                continue;
+            }
+            if(picked == "send:message") {
+                selected[tab] = picked;
+                // the flow's prompts and result go once it is done, so the board comes back in place
+                const mark = prompter.mark();
+                try {
+                    await options.send();
+                }
+                catch(error) {
+                    // Esc inside the send flow is one level back: the board, not the main menu
+                    if(!(error instanceof PromptBackError)) throw error;
+                }
+                finally {
+                    prompter.eraseTo(mark);
+                }
                 view = loadView();
                 continue;
             }

@@ -30,7 +30,6 @@ export const WAKE_POLL_MS = 3 * 1000;
 export const WAKE_WATCH_MS = 60 * 60 * 1000;
 /** Node flags for the long-lived processes a client starts: a 1 MB young generation keeps an idle MCP server about 2 MB smaller (2026-10-26, 26.5 → 24.1 MB). */
 export const NODE_FLAGS = ["--max-semi-space-size=1"];
-export const WAKE_HOURLY_LIMIT = 4;
 export const MAX_REQUEST_ID_LENGTH = 100;
 
 export const CHECK_IN_MAX_AGENTS = 3;
@@ -73,4 +72,9 @@ export const AWAIT_AFTER_MS = 30 * 60 * 1000;
 export const AGENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Checkpoints kept per agent; older ones are deleted, so one long session cannot grow without bound. */
 export const CHECKPOINT_KEEP_PER_AGENT = 50;
+/**
+ * How long the newest concos backup of a client settings file stays; older backups of the file
+ * go at once. Each is a full copy of the file, other MCP servers' secrets included.
+ */
+export const SETTINGS_BACKUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 60 * 1000;

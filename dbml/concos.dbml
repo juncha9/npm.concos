@@ -41,7 +41,7 @@ Table agent {
   delivered_seq integer [not null, default: 0, note: 'position delivered by the last check_in']
   hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake has pointed out; each message is pointed out once']
   wake_generation integer [not null, default: 0, note: 'idle wake (Claude Code, Codex): the live watch; a newer watch or a prompt raises it and ends older ones']
-  woken_at_list varchar [not null, default: '[]', note: 'JSON array of ISO times this session was woken, for the hourly limit']
+  woken_at_list varchar [not null, default: '[]', note: 'JSON array of ISO times this session was woken in the last hour, kept for diagnosis; no hourly limit since 2026-10-26']
   joined_at varchar [not null]
   updated_at varchar [not null, note: 'last card or checkpoint change, not liveness']
   editing_updated_at varchar

@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseJson } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySetup, ensureUsableSettings, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, resolveMcpPath } from "../src/modules/cli/setup";
+import { applySetup, ensureUsableSettings, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, pruneSettingsBackups, resolveMcpPath } from "../src/modules/cli/setup";
 import { HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 
 let directory: string;
@@ -437,23 +437,48 @@ describe("unregistering", () => {
         expect(read(".codex/config.toml")).toBe(inline);
     });
 
-    it("names backups by time so the newest sorts last, and never overwrites one taken in the same millisecond", () => {
+    it("names backups by time, never overwrites one taken in the same millisecond, and keeps the newest", () => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(new Date("2026-10-25T06:30:00.123Z"));
         try {
             const original = '{"theme": "dark"}\n';
             write(".gemini/settings.json", original);
             const gemini = { host: "gemini", home: directory };
+            const backups = () => fs.readdirSync(path.join(directory, ".gemini")).filter((name) => name.includes(".concos-mcp-backup-"));
             applySetup(planSetup(gemini));
+            expect(backups()).toEqual(["settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z"]);
+            expect(read(".gemini/settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z")).toBe(original);
             const registered = read(".gemini/settings.json");
             applySetup(planUnregister(gemini));
-            const backups = fs.readdirSync(path.join(directory, ".gemini")).filter((name) => name.includes(".concos-mcp-backup-")).sort();
-            expect(backups).toEqual([
-                "settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z",
-                "settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z-2",
-            ]);
-            expect(read(`.gemini/${backups[0]}`)).toBe(original);
-            expect(read(`.gemini/${backups[1]}`)).toBe(registered);
+            // the second copy took the next name; the first went after it, no longer the newest
+            expect(backups()).toEqual(["settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z-2"]);
+            expect(read(".gemini/settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z-2")).toBe(registered);
+        }
+        finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("keeps one settings backup, the newest, for a week, also clearing those named before 0.1.7", () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-10-26T03:00:00.000Z"));
+        try {
+            write(".gemini/settings.json", '{"theme": "dark"}\n');
+            const folder = path.join(directory, ".gemini");
+            const lookAlikes = ["settings.json.bak", "settings.json.concos-mcp-backup-notes", "other.json.concos-mcp-backup-2026-10-20T01-00-00-000Z"];
+            const older = ["settings.json.concos-mcp-backup-2026-10-25T01-00-00-000Z", "settings.json.concos-backup-c12fb81e-eb07-42be-ae33-a73de00a30be"];
+            for(const name of [...lookAlikes, ...older]) fs.writeFileSync(path.join(folder, name), "copy");
+            // a name from before 0.1.7 carries no time; its file time counts
+            fs.utimesSync(path.join(folder, older[1]), new Date("2026-10-25T00:00:00Z"), new Date("2026-10-25T00:00:00Z"));
+            applySetup(planSetup({ host: "gemini", home: directory }));
+            const newest = "settings.json.concos-mcp-backup-2026-10-26T03-00-00-000Z";
+            expect(fs.readdirSync(folder).sort()).toEqual([...lookAlikes, newest, "settings.json"].sort());
+
+            const settings = path.join(folder, "settings.json");
+            pruneSettingsBackups([settings], Date.parse("2026-11-02T02:59:59.999Z"));
+            expect(fs.existsSync(path.join(folder, newest))).toBe(true);
+            pruneSettingsBackups([settings], Date.parse("2026-11-02T03:00:00.000Z"));
+            expect(fs.readdirSync(folder).sort()).toEqual([...lookAlikes, "settings.json"].sort());
         }
         finally {
             vi.useRealTimers();
