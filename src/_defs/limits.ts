@@ -23,11 +23,13 @@ export const MIN_TOPIC_KEY_LENGTH = 3;
 export const MAX_SIMILAR_TOPICS = 5;
 /** Unread messages a hook names in its one line; the rest are counted. */
 export const HOOK_NOTICES_SHOWN = 3;
-/** Claude Code idle wake: a session wakes only after this long without a prompt since its turn ended. */
+/** Idle wake: a session wakes only after this long without a prompt since its turn ended. */
 export const WAKE_IDLE_MS = 60 * 1000;
 export const WAKE_POLL_MS = 3 * 1000;
 /** One watch's life; the registered hook timeout adds a minute so the watch ends on its own first. */
 export const WAKE_WATCH_MS = 60 * 60 * 1000;
+/** Node flags for the long-lived processes a client starts: a 1 MB young generation keeps an idle MCP server about 2 MB smaller (2026-10-26, 26.5 → 24.1 MB). */
+export const NODE_FLAGS = ["--max-semi-space-size=1"];
 export const WAKE_HOURLY_LIMIT = 4;
 export const MAX_REQUEST_ID_LENGTH = 100;
 

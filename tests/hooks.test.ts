@@ -81,11 +81,29 @@ describe("hook lifecycle", () => {
     });
 
     it("does not create participants on late events or revive an explicitly left participant", () => {
-        expect(store.applyHookEvent(event("prompt"), "dev")).toBeNull();
+        expect(store.applyHookEvent(event("turn-end"), "dev")).toBeNull();
+        expect(store.applyHookEvent(event("file-edited", { files: ["x.ts"] }), "dev")).toBeNull();
         const joined = start();
         store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null });
         expect(store.applyHookEvent(event("file-edited", { files: ["x.ts"] }), "dev")).toBeNull();
+        expect(store.applyHookEvent(event("prompt"), "dev")).toBeNull();
         expect(card(joined.agent_id).left).toBe(true);
+    });
+
+    it("gives a session whose hooks came on after it started a card at its first prompt, which its own card can take over", () => {
+        // the model joined by itself while no hook knew the session
+        const earlier = store.join({ room: "main", displayName: "ADX/CONCOS02", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const prompt = event("prompt", { host: "codex", client: "Codex" });
+        const result = processHook(store, prompt, "dev");
+        expect(result?.context).toContain("this session's name as display_name");
+        const handle = /handle=([\w-]+)/.exec(result?.context ?? "")?.[1] ?? "";
+        // joining under the session's name with that handle: the earlier card takes the session over
+        const named = store.join({ room: "main", displayName: "ADX/CONCOS02", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: handle });
+        expect(named).toMatchObject({ agent_id: earlier.agent_id, merged_from: expect.any(String) });
+        expect(store.applyHookEvent(event("turn-end", { host: "codex" }), "dev")?.agentId).toBe(earlier.agent_id);
+        expect(card(earlier.agent_id).status).toBe("waiting");
+        // a session the hooks know: its prompt names only what is unread
+        expect(processHook(store, prompt, "dev")).toBeUndefined();
     });
 
     it("points at unread messages by number only, without acknowledging them or moving the MCP cursor", () => {
@@ -137,6 +155,21 @@ describe("turn end", () => {
         expect(card(joined.agent_id)).toMatchObject({ status: "waiting", editing: [] });
         const second = send(asker.agent_id, joined.agent_id);
         expect(turnEnd(true)?.continueFor?.map((notice) => notice.id)).toEqual([second]);
+    });
+
+    it("receives at the turn end what went out in full during the turn, and continues only for the rest", () => {
+        const joined = start();
+        const asker = joinOther("Asker");
+        const read = send(asker.agent_id, joined.agent_id);
+        const previewed = send(asker.agent_id, joined.agent_id);
+        // read_messages gave the first one whole; the second showed only as a cut preview
+        store.markDelivered(joined.agent_id, [read]);
+        expect(turnEnd(true)?.continueFor?.map((notice) => notice.id)).toEqual([previewed]);
+        expect(store.getInbox(joined.agent_id)).toEqual({ questions: 1, notes: 0 });
+        // a turn end that does not continue receives too
+        store.markDelivered(joined.agent_id, [previewed]);
+        turnEnd(false);
+        expect(store.getInbox(joined.agent_id)).toBeUndefined();
     });
 
     it("lets a turn the host is already continuing end, and points out its message at the next turn end", () => {
@@ -235,6 +268,49 @@ describe("idle wake", () => {
         expect(store.applyHookEvent(event("turn-end", { canContinue: true }), "dev")?.continueFor).toBeUndefined();
     });
 
+    it.each(["note", "notice"] as const)("receives a %s read as the woken turn's last call when its guarded Stop runs", async (kind) => {
+        const joined = start();
+        const from = asker();
+        const delivered = store.sendMessage(from, { to: joined.agent_id, kind, text: "read this whole message", replyTo: null, requestId: null }).message_id;
+        const reminded = store.sendMessage(from, { to: joined.agent_id, kind: "note", text: "only named by the reminder", replyTo: null, requestId: null }).message_id;
+        expect(store.checkWakeWatch(watch(), true)).toMatchObject({ state: "wake", notices: [{ id: delivered }, { id: reminded }] });
+        store.applyHookEvent(event("prompt"), "dev");
+
+        // The woken model reads one whole message, then makes no further MCP call. Its bridge
+        // records delivery; a separate Stop process must receive it even with stop_hook_active.
+        const bridge = await openDatabase(directory);
+        try {
+            const bridgeStore = new RoomStore(bridge);
+            const result = bridgeStore.readMessages(joined.agent_id, { messageIds: [delivered], limit: null });
+            expect(result.messages.map((message) => message.id)).toEqual([delivered]);
+            bridgeStore.markDelivered(joined.agent_id, result.messages.map((message) => message.id));
+        }
+        finally { bridge.close(); }
+        expect(store.getInbox(joined.agent_id)).toEqual({ questions: 0, notes: 2 });
+        const stop = getHostAdapter("claude").normalize("turn-end", {
+            session_id: "session-1", cwd: directory, stop_hook_active: true,
+        })!;
+        expect(stop.canContinue).toBe(false);
+        expect(processHook(store, stop, "dev")).toBeUndefined();
+        expect(card(joined.agent_id).status).toBe("waiting");
+        expect(store.getInbox(joined.agent_id)).toEqual({ questions: 0, notes: 1 });
+        expect(store.readMessages(joined.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([reminded]);
+        expect(store.checkWakeWatch(watch(), true)).toEqual({ state: "wait" });
+    });
+
+    it("keeps an answer to an answer unread without waking the session for it", () => {
+        const joined = start();
+        const from = asker();
+        const question = ask(joined.agent_id, from);
+        const answer = store.sendMessage(from, { to: joined.agent_id, kind: "reply", text: "answer", replyTo: question, requestId: null }).message_id;
+        const thanks = store.sendMessage(joined.agent_id, { to: from, kind: "reply", text: "thanks", replyTo: answer, requestId: null }).message_id;
+        const followUp = store.sendMessage(from, { to: joined.agent_id, kind: "reply", text: "acknowledged", replyTo: thanks, requestId: null }).message_id;
+        expect(store.hookNotices(joined.agent_id, 0, true).map((notice) => notice.id)).toEqual([answer]);
+        store.acknowledge(joined.agent_id, [answer]);
+        expect(store.readMessages(joined.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([followUp]);
+        expect(store.checkWakeWatch(watch(), true)).toEqual({ state: "wait" });
+    });
+
     it("wakes for a question the last turn end could not point out", () => {
         const joined = start();
         const question = ask(asker(), joined.agent_id);
@@ -278,6 +354,41 @@ describe("idle wake", () => {
         setTimeout(() => ask(from, joined.agent_id), 30);
         expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker\. Read them with read_messages/);
         expect(await watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 40 })).toBeNull();
+    });
+});
+
+describe("Codex idle wake", () => {
+    const codex = getHostAdapter("codex");
+    const THREAD_ID = "01a16d85-083e-7373-9dd6-6ae1676b6d7c";
+
+    it("watches in the background and hands the wake line to the session with codex queue", async () => {
+        expect(codex.wake).toEqual({ event: "Stop", kind: "watch", timeout: 3660, async: true });
+        // a stand-in codex first on PATH writes down what it was given
+        const bin = path.join(directory, "bin");
+        fs.mkdirSync(bin);
+        const record = path.join(bin, "args.json");
+        fs.writeFileSync(path.join(bin, "fake-codex.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));`);
+        if(process.platform == "win32") {
+            fs.writeFileSync(path.join(bin, "codex.cmd"), `@"${process.execPath}" "%~dp0fake-codex.cjs" %*\r\n`);
+        }
+        else {
+            fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/fake-codex.cjs" "$@"\n`, { mode: 0o755 });
+        }
+        const line = `concos: unread for you — question #7 from A&B "Ops" 100% [ops_deploy]. Read them with read_messages.`;
+        vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
+        try {
+            await codex.deliverWake!(THREAD_ID, line);
+        }
+        finally { vi.unstubAllEnvs(); }
+        // cmd.exe still reads " and % inside quotes, so on Windows the line goes without them
+        const delivered = process.platform == "win32"
+            ? `concos: unread for you — question #7 from A&B 'Ops' 100 [ops_deploy]. Read them with read_messages.`
+            : line;
+        expect(JSON.parse(fs.readFileSync(record, "utf8"))).toEqual(["queue", "--thread", THREAD_ID, "--message", delivered]);
+    });
+
+    it("refuses a session id that is not a Codex thread id, before running anything", async () => {
+        await expect(codex.deliverWake!("session-1 & calc", "line")).rejects.toThrow(/invalid Codex session id/);
     });
 });
 

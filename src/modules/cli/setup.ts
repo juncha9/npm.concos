@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 import { applyEdits, getNodeValue, modify, parseTree } from "jsonc-parser";
 import type { ParseError } from "jsonc-parser";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
-import { SHARED_ROOM, WAKE_HOURLY_LIMIT, WAKE_IDLE_MS, WAKE_WATCH_MS } from "../../_defs";
+import { NODE_FLAGS, SHARED_ROOM, WAKE_HOURLY_LIMIT, WAKE_IDLE_MS, WAKE_WATCH_MS } from "../../_defs";
 import { getHostAdapter } from "../hooks/adapters";
 import type { HookRegistration, HostAdapter } from "../hooks/types";
 import { RoomError } from "../store/room-error";
@@ -29,6 +29,72 @@ export interface HookStatus {
 }
 
 const HOOK_COMMAND_PREFIX = "concos hook ";
+const CODEX_HOOK_TRUST_NOTE = "Codex runs new or changed hooks only after you trust them: open /hooks in Codex.";
+export const UPDATED_MESSAGE = "Registration updated. Sessions started from now on use it; restart running sessions to switch.";
+
+/** What a client runs to start concos: the program, and what goes before concos's own arguments. */
+interface Launch {
+    command: string;
+    args: string[];
+}
+
+/**
+ * Node itself on the cli.js running now, with `NODE_FLAGS`, so no `concos` shim stands in front
+ * of each concos process: on Windows that is a cmd.exe (about 4 MB) for every MCP server, and a
+ * shell chain for every Claude Code hook. The `concos` command is kept where argv names no built
+ * cli.js: run through the link npm makes on macOS and Linux (which node already runs directly, and
+ * which follows the active node), from a copy npx unpacked into its cache, or not as the CLI.
+ */
+function currentLaunch(): Launch {
+    const script = process.argv[1] ?? "";
+    const builtCli = isConcosScript(script) && fs.existsSync(script);
+    if(builtCli == false || script.split(/[\\/]/).includes("_npx")) {
+        return { command: "concos", args: [] };
+    }
+    return { command: process.execPath, args: [...NODE_FLAGS, path.resolve(script)] };
+}
+
+const isConcosScript = (file: string) => path.basename(file) == "cli.js" && path.basename(path.dirname(file)) == "dist" && /concos/i.test(file);
+
+/** The concos arguments after node, its flags and a concos cli.js; null when `command` and `args` start something else. */
+function directArguments(command: unknown, args: unknown): string[] | null {
+    if(typeof command != "string" || /^node(\.exe)?$/i.test(path.basename(command)) == false || Array.isArray(args) == false) {
+        return null;
+    }
+    if(args.every((arg) => typeof arg == "string") == false) {
+        return null;
+    }
+    const words = args as string[];
+    const script = words.findIndex((word) => word.startsWith("--") == false);
+    if(script < 0 || isConcosScript(words[script]) == false) {
+        return null;
+    }
+    return words.slice(script + 1);
+}
+
+/** Whether a handler or server entry starts the way `expected` does: the same command, and the same `args` or none. */
+function sameStart(entry: unknown, expected: Record<string, unknown>): boolean {
+    const current = entry as { command?: unknown; args?: unknown } | null;
+    return current?.command == expected.command && JSON.stringify(current?.args ?? null) == JSON.stringify(expected.args ?? null);
+}
+
+/**
+ * Whether a registered handler or server entry should become `expected`: it starts otherwise,
+ * unless this run can only offer the `concos` command (a copy run through npx) and the entry
+ * starts node directly on a node and cli.js that are still there.
+ */
+function startOutdated(entry: unknown, expected: Record<string, unknown>, launch: Launch): boolean {
+    if(sameStart(entry, expected)) {
+        return false;
+    }
+    const current = entry as { command?: unknown; args?: unknown };
+    const rest = directArguments(current.command, current.args);
+    if(launch.command == "concos" && rest != null) {
+        const words = current.args as string[];
+        return fs.existsSync(current.command as string) == false || fs.existsSync(words[words.length - rest.length - 1]) == false;
+    }
+    return true;
+}
 
 export interface SetupTarget {
     host: string;
@@ -144,8 +210,17 @@ function compatibleServer(entry: unknown): boolean {
     if(entry == null || typeof entry != "object" || Array.isArray(entry)) return false;
     const server = entry as Record<string, unknown>;
     if(Object.hasOwn(server, "url") || (Object.hasOwn(server, "type") && server.type != "stdio")) return false;
-    if(server.command != "concos" || !Array.isArray(server.args) || server.args[0] != "mcp") return false;
+    // node started on a concos cli.js directly, as registration writes it since 2026-10-26
+    if(server.command != "concos") {
+        return JSON.stringify(directArguments(server.command, server.args)) == JSON.stringify(["mcp"]);
+    }
+    if(!Array.isArray(server.args) || server.args[0] != "mcp") return false;
     return server.args.length == 1 || (server.args.length == 3 && server.args[1] == "--room" && typeof server.args[2] == "string");
+}
+
+/** The server entry for `launch`. */
+function serverEntry(launch: Launch): { command: string; args: string[] } {
+    return { command: launch.command, args: [...launch.args, "mcp"] };
 }
 
 /** Inspection and registration must agree about conflicts, including null or malformed entries. */
@@ -213,6 +288,10 @@ function settingsProblems(file: string, parts: { servers: boolean; hooks: boolea
                     for(const [field, type] of HANDLER_FIELDS) {
                         if(handler[field] !== undefined) check(typeof handler[field] == type, `${at}.hooks[${handlerIndex}].${field}`, `a ${type}`);
                     }
+                    // a Claude Code handler in exec form
+                    if(handler.args !== undefined) {
+                        check(Array.isArray(handler.args) && handler.args.every((arg: unknown) => typeof arg == "string"), `${at}.hooks[${handlerIndex}].args`, "a list of strings");
+                    }
                 });
             });
         }
@@ -261,27 +340,31 @@ export function planSetup(input: SetupTarget & { room?: string }): SetupChange[]
     const config = adapter;
     const mcpFile = loadChange(resolveMcpPath(input));
     if(hasRegistration(mcpFile, config.mcpFormat)) return [];
-    const server: Record<string, unknown> = { command: "concos", args: ["mcp"] };
+    const server: Record<string, unknown> = serverEntry(currentLaunch());
     // Codex does not pass CONCOS_HOME to MCP servers, while its hooks receive it: a moved data
     // folder has to be named here, or MCP and hooks would use different databases
     if(config.id == "codex" && process.env.CONCOS_HOME) {
         server.env = { CONCOS_HOME: path.resolve(process.env.CONCOS_HOME) };
     }
     if(config.mcpFormat == "toml") {
-        // the appended table keeps the file's line endings, so a CRLF file does not turn mixed
-        const eol = mcpFile.after.includes("\r\n") ? "\r\n" : "\n";
-        const table = stringifyToml({ mcp_servers: { concos: server } }).replace(/\r?\n/g, eol);
-        mcpFile.after += `${mcpFile.after.endsWith("\n") || mcpFile.after == "" ? "" : eol}${eol}${table}`;
-        // Inline tables and dotted keys can make an appended table invalid; fail before any writes.
-        try { parseToml(mcpFile.after); }
-        catch { throw new RoomError(`${mcpFile.path}: cannot append concos to this TOML layout; add the server table manually`); }
-        mcpFile.additions.push({ key: "mcp_servers.concos", value: server });
+        appendTomlServer(mcpFile, server);
     }
     else {
         setJson(mcpFile, ["mcpServers", "concos"], adapter.id == "copilot" ? { ...server, tools: ["*"] }
             : adapter.id == "cursor" ? { type: "stdio", ...server } : server);
     }
     return mcpFile.additions.length > 0 ? [mcpFile] : [];
+}
+
+/** Appends `[mcp_servers.concos]` to a TOML change, in the file's line endings so a CRLF file does not turn mixed. */
+function appendTomlServer(change: SetupChange, server: Record<string, unknown>): void {
+    const eol = change.after.includes("\r\n") ? "\r\n" : "\n";
+    const table = stringifyToml({ mcp_servers: { concos: server } }).replace(/\r?\n/g, eol);
+    change.after += `${change.after.endsWith("\n") || change.after == "" ? "" : eol}${eol}${table}`;
+    // Inline tables and dotted keys can make an appended table invalid; fail before any writes.
+    try { parseToml(change.after); }
+    catch { throw new RoomError(`${change.path}: cannot append concos to this TOML layout; add the server table manually`); }
+    change.additions.push({ key: "mcp_servers.concos", value: server });
 }
 
 /** A line naming the concos server table, `[mcp_servers.concos]`, or with `subTable` one under it. */
@@ -377,10 +460,22 @@ function hookAdapter(host: string) {
     return getHostAdapter(host);
 }
 
-/** One concos handler in its own group, so each handler keeps its own trust. */
-function hookEntry(adapter: HostAdapter, registration: HookRegistration) {
-    const command = `${HOOK_COMMAND_PREFIX}${registration.kind} --host ${adapter.id}`;
-    const handler: Record<string, unknown> = { type: "command", command: command };
+/**
+ * One concos handler in its own group, so each handler keeps its own trust. Claude Code starts a
+ * handler with `args` itself, with no shell (exec form, checked on 2.1.310), so node starts
+ * directly; Codex runs every hook in the session's shell (PowerShell, cmd or sh), where only the
+ * plain `concos` command reads the same.
+ */
+function hookEntry(adapter: HostAdapter, registration: HookRegistration, launch = currentLaunch()) {
+    const words = ["hook", registration.kind, "--host", adapter.id];
+    const handler: Record<string, unknown> = { type: "command" };
+    if(adapter.id == "claude" && launch.command != "concos") {
+        handler.command = launch.command;
+        handler.args = [...launch.args, ...words];
+    }
+    else {
+        handler.command = `concos ${words.join(" ")}`;
+    }
     if(registration.timeout != null) {
         handler.timeout = registration.timeout;
     }
@@ -395,7 +490,7 @@ function hookEntry(adapter: HostAdapter, registration: HookRegistration) {
         group.matcher = registration.matcher;
     }
     group.hooks = [handler];
-    return { event: registration.event, kind: registration.kind, command: command, handler: handler, group: group };
+    return { event: registration.event, kind: registration.kind, handler: handler, group: group };
 }
 
 /** What concos registers for one client. */
@@ -404,24 +499,36 @@ function expectedHooks(host: string) {
     return adapter.registrations.map((registration) => hookEntry(adapter, registration));
 }
 
-/** The idle wake handler, for the one client that can wake a waiting session. */
+/** The idle wake handler for a client that can wake a waiting session. */
 function expectedWake(host: string) {
     const adapter = hookAdapter(host);
     if(adapter.wake == null) {
-        throw new RoomError("Idle wake is available for Claude Code only.");
+        const clients = HOOK_CLIENTS.filter((id) => getHostAdapter(id).wake != null).map((id) => HOST_LABELS[id]);
+        throw new RoomError(`Idle wake is available for ${clients.join(" and ")}.`);
     }
     return hookEntry(adapter, adapter.wake);
 }
 
-const commandOf = (handler: unknown) => (handler as { command?: unknown } | null)?.command;
-
-/** A concos hook handler; with `kind`, one for that event, in any older form (e.g. with --room). */
-function isConcosHandler(handler: unknown, kind?: string): boolean {
-    const command = (handler as { command?: unknown } | null)?.command;
-    if(typeof command != "string" || command.startsWith(HOOK_COMMAND_PREFIX) == false) {
-        return false;
+/**
+ * The event a concos hook handler runs (`hook <kind>`), in any form: `concos hook …`, also an
+ * older one (e.g. with --room), or node started directly on a concos cli.js. Null for any other handler.
+ */
+function concosHookKind(handler: unknown): string | null {
+    const current = handler as { command?: unknown; args?: unknown } | null;
+    let words = directArguments(current?.command, current?.args);
+    if(words == null && typeof current?.command == "string" && current.command.startsWith(HOOK_COMMAND_PREFIX) == true) {
+        words = current.command.split(/\s+/).slice(1);
     }
-    return kind == null || command.startsWith(`${HOOK_COMMAND_PREFIX}${kind} `);
+    if(words == null || words[0] != "hook" || words[1] == null) {
+        return null;
+    }
+    return words[1];
+}
+
+/** A concos hook handler; with `kind`, one for that event. */
+function isConcosHandler(handler: unknown, kind?: string): boolean {
+    const found = concosHookKind(handler);
+    return found != null && (kind == null || found == kind);
 }
 
 function handlersOf(group: unknown): unknown[] {
@@ -493,13 +600,13 @@ function removeHandlers(change: SetupChange, hooks: Record<string, unknown[]>, m
     return shifted;
 }
 
-/** Reads only concos entries; other hooks are neither shown nor changed. */
+/** Reads only concos entries; other hooks are neither shown nor changed. A handler in an older form counts; `planUpdate` rewrites it. */
 export function inspectHooks(input: SetupTarget): HookStatus {
     const expected = expectedHooks(input.host);
     const file = loadChange(resolveHooksPath(input));
     const hooks = hookLists(json(file), file.path);
     const present = expected.filter((item) => (hooks[item.event] ?? [])
-        .some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))).length;
+        .some((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)))).length;
     let state: HookStatus["state"] = "partial";
     if(present == expected.length) {
         state = "on";
@@ -536,7 +643,7 @@ export function planHooks(input: SetupTarget, mode: "on" | "off"): SetupChange[]
     return change.additions.length + change.removals.length > 0 ? [change] : [];
 }
 
-/** Whether the client can wake a waiting session (Claude Code). */
+/** Whether the client can wake a waiting session. */
 export function hasWake(host: string): boolean {
     return hookAdapter(host).wake != null;
 }
@@ -545,11 +652,11 @@ export function inspectWake(input: SetupTarget): boolean {
     const item = expectedWake(input.host);
     const file = loadChange(resolveHooksPath(input));
     return (hookLists(json(file), file.path)[item.event] ?? [])
-        .some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command));
+        .some((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)));
 }
 
 /**
- * Claude Code idle wake, kept apart from the other hooks: it goes on only over hooks that are
+ * Idle wake, kept apart from the other hooks: it goes on only over hooks that are
  * on, and turning hooks off removes it too.
  */
 export function planWake(input: SetupTarget, mode: "on" | "off"): SetupChange[] {
@@ -562,7 +669,10 @@ export function planWake(input: SetupTarget, mode: "on" | "off"): SetupChange[] 
         addWake(change, input);
     }
     else {
-        removeHandlers(change, hookLists(json(change), change.path), (handler) => isConcosHandler(handler, "watch"));
+        const shifted = removeHandlers(change, hookLists(json(change), change.path), (handler) => isConcosHandler(handler, "watch"));
+        if(shifted && input.host == "codex") {
+            change.notes.push("Hooks listed after the removed ones move up; Codex will ask you to trust them again in /hooks.");
+        }
     }
     return change.additions.length + change.removals.length > 0 ? [change] : [];
 }
@@ -579,7 +689,7 @@ function addHooks(change: SetupChange, input: SetupTarget): void {
             setJson(change, ["hooks", item.event], [item.group]);
             continue;
         }
-        if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
+        if(groups.some((group) => handlersOf(group).some((handler) => sameStart(handler, item.handler)))) {
             continue;
         }
         const groupIndex = groups.findIndex((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)));
@@ -591,34 +701,45 @@ function addHooks(change: SetupChange, input: SetupTarget): void {
         setJson(change, ["hooks", item.event, groups.length], item.group, true);
     }
     if(change.additions.length > before && input.host == "codex") {
-        change.notes.push("Codex runs new or changed hooks only after you trust them: open /hooks in Codex.");
+        change.notes.push(CODEX_HOOK_TRUST_NOTE);
     }
     if(change.additions.length > before && input.host == "claude") {
         change.notes.push("Claude Code runs them in folders you have trusted.");
     }
 }
 
-/** Adds the idle wake handler to `change`, the client's hooks file, after the other hooks. */
+/** Adds the idle wake handler to `change`, the client's hooks file, after the other hooks; an older form is rewritten where it stands. */
 function addWake(change: SetupChange, input: SetupTarget): void {
     const item = expectedWake(input.host);
     const groups = hookLists(json(change), change.path)[item.event] ?? [];
-    if(groups.some((group) => handlersOf(group).some((handler) => commandOf(handler) == item.command))) {
+    if(groups.some((group) => handlersOf(group).some((handler) => sameStart(handler, item.handler)))) {
+        return;
+    }
+    const groupIndex = groups.findIndex((group) => handlersOf(group).some((handler) => isConcosHandler(handler, item.kind)));
+    if(groupIndex >= 0) {
+        const handlerIndex = handlersOf(groups[groupIndex]).findIndex((handler) => isConcosHandler(handler, item.kind));
+        setJson(change, ["hooks", item.event, groupIndex, "hooks", handlerIndex], item.handler);
         return;
     }
     setJson(change, ["hooks", item.event, groups.length], item.group, true);
     change.notes.push(
-        `A waiting Claude Code session wakes by itself when a question, an answer to its question, or a note or notice addressed to it arrives: `
+        `A waiting ${HOST_LABELS[input.host]} session wakes by itself when a question, an answer to its question, or a note or notice addressed to it arrives: `
         + `after ${WAKE_IDLE_MS / 1000} seconds without input, at most ${WAKE_HOURLY_LIMIT} times an hour, `
-        + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn. Codex sessions do not wake.`,
+        + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn.`
+        + (input.host == "codex" ? " concos sends one line to that session with codex queue to wake it." : ""),
     );
+    if(input.host == "codex" && change.notes.includes(CODEX_HOOK_TRUST_NOTE) == false) {
+        change.notes.push(CODEX_HOOK_TRUST_NOTE);
+    }
 }
 
 /**
  * Everything a client gets at once, in one preview: MCP unless it is already registered, the
- * hooks for Claude Code and Codex, and with `wake` Claude Code's idle wake. The hooks and idle
+ * hooks for Claude Code and Codex, and with `wake` their idle wake. The hooks and idle
  * wake share one change, since both go into the hooks file.
  */
 export function planRegistration(input: SetupTarget, options: { wake: boolean }): SetupChange[] {
+    if(options.wake == true) expectedWake(input.host);
     const changes = inspectSetup(input).registered ? [] : planSetup(input);
     if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
         return changes;
@@ -630,6 +751,66 @@ export function planRegistration(input: SetupTarget, options: { wake: boolean })
     }
     if(hooks.additions.length > 0) {
         changes.push(hooks);
+    }
+    return changes;
+}
+
+/**
+ * Brings what is registered to the way this CLI registers now (`currentLaunch`): the MCP server
+ * entry, and each concos hook handler rewritten where it stands. Adds nothing missing, so hooks
+ * turned off stay off. Empty when the registration is up to date or there is none.
+ */
+export function planUpdate(input: SetupTarget): SetupChange[] {
+    const adapter = getMcpClient(input.host);
+    const launch = currentLaunch();
+    const changes: SetupChange[] = [];
+    const mcpFile = loadChange(resolveMcpPath(input));
+    if(hasRegistration(mcpFile, adapter.mcpFormat) == false) {
+        return changes;
+    }
+    const key = adapter.mcpFormat == "toml" ? "mcp_servers" : "mcpServers";
+    const data = adapter.mcpFormat == "toml" ? parseToml(mcpFile.after) as Record<string, any> : json(mcpFile);
+    const server = data[key].concos as Record<string, unknown>;
+    const expected = serverEntry(launch);
+    if(startOutdated(server, expected, launch)) {
+        // the entry keeps what else it has (env, tools, type)
+        const updated = { ...server, ...expected };
+        if(adapter.mcpFormat == "toml") {
+            removeTomlTable(mcpFile, server);
+            appendTomlServer(mcpFile, updated);
+        }
+        else {
+            mcpFile.removals.push({ key: `${key}.concos`, value: server });
+            setJson(mcpFile, [key, "concos"], updated);
+        }
+        changes.push(mcpFile);
+    }
+    if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
+        return changes;
+    }
+    const wake = hookAdapter(input.host).wake;
+    const targets = new Map<string, Record<string, unknown>>(expectedHooks(input.host).map((item) => [item.kind, item.handler]));
+    if(wake != null) {
+        targets.set(wake.kind, expectedWake(input.host).handler);
+    }
+    const hooksFile = loadChange(resolveHooksPath(input));
+    for(const [event, groups] of Object.entries(hookLists(json(hooksFile), hooksFile.path))) {
+        groups.forEach((group, groupIndex) => {
+            handlersOf(group).forEach((handler, handlerIndex) => {
+                const target = targets.get(concosHookKind(handler) ?? "");
+                if(target == null || startOutdated(handler, target, launch) == false) {
+                    return;
+                }
+                hooksFile.removals.push({ key: `hooks.${event}.${groupIndex}.hooks.${handlerIndex}`, value: handler });
+                setJson(hooksFile, ["hooks", event, groupIndex, "hooks", handlerIndex], target);
+            });
+        });
+    }
+    if(hooksFile.additions.length > 0) {
+        if(input.host == "codex") {
+            hooksFile.notes.push(CODEX_HOOK_TRUST_NOTE);
+        }
+        changes.push(hooksFile);
     }
     return changes;
 }
@@ -761,7 +942,7 @@ export async function runSetup(args: string[]): Promise<void> {
         else process.stdout.write("Preview only. Add --apply to remove concos from this client.\n");
         return;
     }
-    // hooks, or Claude Code's idle wake on top of them; turning either on brings what it
+    // hooks, or idle wake on top of them; turning either on brings what it
     // stands on (MCP, and the hooks for idle wake) in the same preview
     const toggle = values.wake != null
         ? { option: "--wake", name: "idle wake", mode: values.wake, wake: true, plan: planWake, alreadyOn: "Idle wake is already on.", nothingOn: "Idle wake is not on." }
@@ -799,7 +980,18 @@ export async function runSetup(args: string[]): Promise<void> {
     ensureUsableSettings({ host: values.host ?? "" });
     const changes = planSetup({ host: values.host ?? "" });
     if(changes.length == 0) {
-        process.stdout.write("concos MCP is already registered.\n");
+        // registered: bring an older form to the current one
+        const update = planUpdate({ host: values.host ?? "" });
+        if(update.length == 0) {
+            process.stdout.write("concos MCP is already registered.\n");
+            return;
+        }
+        writeChanges(update);
+        if(values.apply) {
+            applySetup(update);
+            process.stdout.write(`${UPDATED_MESSAGE} Existing files were saved as .concos-mcp-backup-*.\n`);
+        }
+        else process.stdout.write("Preview only. Add --apply to update the registration.\n");
         return;
     }
     writeChanges(changes);
@@ -807,5 +999,6 @@ export async function runSetup(args: string[]): Promise<void> {
         applySetup(changes);
         process.stdout.write("MCP registered. Existing files were saved as .concos-mcp-backup-*. Enable concos MCP in your client, then open a new session.\n");
     }
-    else process.stdout.write("Preview only. Add --apply to register MCP. The installed concos command must be on PATH.\n");
+    else if(currentLaunch().command == "concos") process.stdout.write("Preview only. Add --apply to register MCP. The installed concos command must be on PATH.\n");
+    else process.stdout.write("Preview only. Add --apply to register MCP.\n");
 }

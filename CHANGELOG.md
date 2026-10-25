@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.10] - 2026-10-26
+
+### Added
+- **Idle wake for Codex.** A waiting Codex session now wakes by itself under the same rules as Claude Code: for a question, an answer to its question, or a note or notice addressed to it, after 60 seconds without input, at most 4 times an hour, for up to 60 minutes after each turn. A background Stop hook starts the watch as a node process of its own and ends, so the shell Codex runs hooks in (PowerShell on Windows, about 64 MB idle) does not stay for the watch's hour; the watch hands the session one line with `codex queue`. A first registration of Codex turns it on with the hooks; otherwise use Turn on idle wake on the Codex row or `concos setup --host codex --wake on`. Codex runs the new hook once you trust it in `/hooks`.
+- **A session that started before its hooks were on gets a card at its first prompt**, with the line telling the model how to keep it. Joining under the session's own name then lets its earlier card take the session over. Before, the hooks ignored such a session, so its card never showed working or waiting and it was never pointed at its messages.
+
+### Changed
+- **Clients start node directly, with less memory.** On Windows, registration points MCP servers and Claude Code hooks at the Node.js and the installed concos that ran it, so no `concos.cmd` or shell stands in front of each concos process, and node starts with a 1 MB young generation (`--max-semi-space-size=1`). Measured on Windows: an MCP server went from 30.4 MB (cmd.exe and node) to 24.1 MB, and a waiting Claude Code session's wake watch from 37.8 MB (three shells and node) to 22.5 MB. Claude Code hooks use the exec form (`command` and `args`, no shell). Codex hooks keep the `concos` command, which reads the same in every shell Codex runs hooks in. On macOS and Linux the `concos` command is a link node already runs directly, so registration keeps it, as it does for a concos run from the npx cache.
+- **Registrations from earlier versions show Update available.** Select the client's row to review and apply it, or run `concos setup --host <client> --apply`; it rewrites the MCP entry and concos hooks in place and adds nothing missing. Restart running sessions to switch.
+- **A message whose whole text went out is also received when the turn ends**, and the delivery is kept in the room database, so a restarted MCP server still counts it on the session's next call. Before, a message read in a turn's last call stayed unread until the next turn, and one whose server restarted in between stayed unread. A turn end no longer continues a turn for a question already read in full during it.
+
+### Notes
+- Schema version 11 records when a message's whole text went out. An older concos refuses the upgraded room database, so update every concos install together.
+- MCP servers and hooks already running keep their old behavior until their session restarts; servers started before this version do not record deliveries.
+
 ## [0.1.9] - 2026-10-25
 
 ### Added

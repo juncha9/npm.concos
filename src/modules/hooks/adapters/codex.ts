@@ -1,5 +1,44 @@
+import { execFile } from "node:child_process";
+import type { ExecFileOptions } from "node:child_process";
+import { WAKE_WATCH_MS } from "../../../_defs";
+import { RoomError } from "../../store/room-error";
 import type { HostAdapter } from "../types";
 import { contextOutput, continueOutput, failed, normalizeEvent, object, patchFiles, withContinue } from "./shared";
+
+const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Codex idle wake. `codex queue` adds the line to the session's queue through Codex's shared
+ * app-server daemon; an idle session that Codex has open starts a turn with it. For a session no
+ * Codex process has open, the line is only stored.
+ */
+async function queueMessage(sessionId: string, message: string): Promise<void> {
+    // the session id goes into a command line
+    if(THREAD_ID.test(sessionId) == false) {
+        throw new RoomError("invalid Codex session id");
+    }
+    let file = "codex";
+    let args = ["queue", "--thread", sessionId, "--message", message];
+    let options: ExecFileOptions = { timeout: 60_000, windowsHide: true };
+    if(process.platform == "win32") {
+        // npm installs codex as codex.cmd, which only cmd.exe runs. Inside the quotes cmd still
+        // reads " and % and ends the line at a control character, so the line goes without them;
+        // trailing backslashes are doubled so they do not escape the closing quote
+        const text = message.replace(/[\x00-\x1f\x7f]/g, " ").replaceAll("\"", "'").replaceAll("%", "").replace(/(\\+)$/, "$1$1");
+        file = process.env.ComSpec ?? "cmd.exe";
+        args = ["/d", "/v:off", "/s", "/c", `"codex queue --thread ${sessionId} --message "${text}""`];
+        options = { ...options, windowsVerbatimArguments: true };
+    }
+    await new Promise<void>((resolve, reject) => {
+        execFile(file, args, options, (error) => {
+            if(error != null) {
+                reject(error);
+                return;
+            }
+            resolve();
+        });
+    });
+}
 
 export const codex: HostAdapter = {
     id: "codex",
@@ -13,6 +52,9 @@ export const codex: HostAdapter = {
         // Codex allows at most 3 seconds here
         { event: "SessionEnd", kind: "session-end", timeout: 3 },
     ],
+    // the watch stops itself after WAKE_WATCH_MS; the timeout is the host's backstop a minute later
+    wake: { event: "Stop", kind: "watch", timeout: WAKE_WATCH_MS / 1000 + 60, async: true },
+    deliverWake: queueMessage,
     normalize(kind, raw) {
         const payload = object(raw);
         let files: string[] = [];

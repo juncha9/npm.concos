@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseJson } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySetup, ensureUsableSettings, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveMcpPath } from "../src/modules/cli/setup";
+import { applySetup, ensureUsableSettings, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, resolveMcpPath } from "../src/modules/cli/setup";
 import { HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 
 let directory: string;
@@ -315,19 +315,22 @@ describe("hooks", () => {
         expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo after" }] }] } });
     });
 
-    it("let Claude Code turn on idle wake over hooks that are on, and turning hooks off removes it too", () => {
-        const input = { host: "claude", home: directory };
+    it.each(["claude", "codex"])("lets %s turn on idle wake over hooks that are on, and turning hooks off removes it too", (host) => {
+        const input = { host, home: directory };
         applySetup(planSetup(input));
         expect(() => planWake(input, "on")).toThrow(/Turn on hooks before idle wake/);
-        expect(() => planWake({ host: "codex", home: directory }, "on")).toThrow(/Claude Code only/);
         applySetup(planHooks(input, "on"));
         const on = planWake(input, "on");
-        expect(on[0].notes.join(" ")).toContain("Codex sessions do not wake");
+        expect(on[0].notes.join(" ")).toContain("for up to 60 minutes after each turn");
+        if(host == "codex") {
+            expect(on[0].notes.join(" ")).toContain("codex queue");
+            expect(on[0].notes.filter((note) => note.includes("open /hooks in Codex"))).toHaveLength(1);
+        }
         applySetup(on);
-        const file = path.join(directory, ".claude", "settings.json");
+        const file = path.join(directory, host == "claude" ? ".claude/settings.json" : ".codex/hooks.json");
         expect(parseJson(fs.readFileSync(file, "utf8")).hooks.Stop.map((group: { hooks: unknown[] }) => group.hooks[0])).toEqual([
-            { type: "command", command: "concos hook turn-end --host claude", timeout: 10 },
-            { type: "command", command: "concos hook watch --host claude", timeout: 3660, asyncRewake: true },
+            { type: "command", command: `concos hook turn-end --host ${host}`, timeout: 10 },
+            { type: "command", command: `concos hook watch --host ${host}`, timeout: 3660, ...(host == "claude" ? { asyncRewake: true } : { async: true }) },
         ]);
         expect(inspectWake(input)).toBe(true);
         expect(inspectHooks(input).state).toBe("on");
@@ -342,6 +345,23 @@ describe("hooks", () => {
         expect(parseJson(fs.readFileSync(file, "utf8"))).toEqual({ hooks: {} });
     });
 
+    it("keeps later Codex hooks when turning idle wake off and reports their changed trust positions", () => {
+        const input = { host: "codex", home: directory };
+        applySetup(planRegistration(input, { wake: true }));
+        const file = path.join(directory, ".codex", "hooks.json");
+        const data = parseJson(fs.readFileSync(file, "utf8"));
+        data.hooks.Stop.push({ hooks: [{ type: "command", command: "echo keep-after-wake" }] });
+        fs.writeFileSync(file, JSON.stringify(data));
+        const off = planWake(input, "off");
+        expect(off[0].notes.join(" ")).toContain("trust them again");
+        applySetup(off);
+        expect(commands(parseJson(fs.readFileSync(file, "utf8")).hooks.Stop)).toEqual([
+            "concos hook turn-end --host codex", "echo keep-after-wake",
+        ]);
+        expect(inspectHooks(input).state).toBe("on");
+        expect(inspectWake(input)).toBe(false);
+    });
+
     it("rewrite an older concos hook where it stands, and are refused when Codex has concos hooks in config.toml", () => {
         const input = { host: "codex", home: directory };
         applySetup(planSetup(input));
@@ -350,7 +370,9 @@ describe("hooks", () => {
             { hooks: [{ type: "command", command: "echo first" }] },
             { hooks: [{ type: "command", command: "concos hook session-start --host codex --room-base64 bGVnYWN5" }] },
         ] } }));
-        expect(inspectHooks(input).present).toBe(0);
+        // an older form still counts as there, and an update rewrites it too
+        expect(inspectHooks(input).present).toBe(1);
+        expect(planUpdate(input)[0].additions).toEqual([{ key: "hooks.SessionStart.1.hooks.0", value: { type: "command", command: "concos hook session-start --host codex", timeout: 10 } }]);
         applySetup(planHooks(input, "on"));
         expect(commands(JSON.parse(fs.readFileSync(file, "utf8")).hooks.SessionStart)).toEqual(["echo first", "concos hook session-start --host codex"]);
 
@@ -374,7 +396,7 @@ describe("unregistering", () => {
         const hooks = `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }] }] } }, null, 2)}\n`;
         write(".codex/hooks.json", hooks);
         const codex = { host: "codex", home: directory };
-        applySetup(planRegistration(codex, { wake: false }));
+        applySetup(planRegistration(codex, { wake: true }));
         expect(inspectHooks(codex).state).toBe("on");
         applySetup(planUnregister(codex));
         expect(read(".codex/config.toml")).toBe(toml);
@@ -383,7 +405,7 @@ describe("unregistering", () => {
 
         const inline = '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}\n';
         write(".codex/hooks.json", inline);
-        applySetup(planRegistration(codex, { wake: false }));
+        applySetup(planRegistration(codex, { wake: true }));
         applySetup(planUnregister(codex));
         expect(JSON.parse(read(".codex/hooks.json"))).toEqual(JSON.parse(inline));
 
@@ -522,7 +544,7 @@ describe("registration in one preview", () => {
         fs.writeFileSync(hooksFile(), '{\n  // keep me\n  "permissions": {"allow": ["Read"]},\n  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}\n}\n');
         const changes = planRegistration(claude(), { wake: true });
         expect(changes.map((change) => change.path)).toEqual([path.join(directory, ".claude.json"), hooksFile()]);
-        expect(changes[1].notes.join(" ")).toContain("Codex sessions do not wake");
+        expect(changes[1].notes.join(" ")).toContain("A waiting Claude Code session wakes");
         expect(fs.readFileSync(hooksFile(), "utf8")).not.toContain("concos");
         applySetup(changes);
 
@@ -546,13 +568,125 @@ describe("registration in one preview", () => {
         expect(fs.readFileSync(hooksFile(), "utf8")).toBe(broken);
     });
 
-    it("refuses idle wake for Codex, and writes nothing a change would leave unreadable", () => {
-        expect(() => planRegistration({ host: "codex", home: directory }, { wake: true })).toThrow(/Claude Code only/);
+    it("registers Codex MCP, hooks and idle wake in one preview with one trust reminder", () => {
+        const input = { host: "codex", home: directory };
+        const changes = planRegistration(input, { wake: true });
+        expect(fs.readdirSync(directory)).toEqual([]);
+        expect(changes.map((change) => change.path)).toEqual([
+            path.join(directory, ".codex", "config.toml"), path.join(directory, ".codex", "hooks.json"),
+        ]);
+        expect(changes[1].notes.join(" ")).toContain("codex queue");
+        expect(changes[1].notes.filter((note) => note.includes("open /hooks in Codex"))).toHaveLength(1);
+        applySetup(changes);
+        expect(inspectSetup(input).registered).toBe(true);
+        expect(inspectHooks(input).state).toBe("on");
+        expect(inspectWake(input)).toBe(true);
+        expect(planRegistration(input, { wake: true })).toEqual([]);
+    });
+
+    it.each(["gemini", "cursor", "copilot"])("refuses idle wake for %s without writing settings", (host) => {
+        const input = { host, home: directory };
+        expect(() => planWake(input, "on")).toThrow(/Hooks are available for claude, codex/);
+        expect(() => planRegistration(input, { wake: true })).toThrow(/Hooks are available for claude, codex/);
+        expect(fs.readdirSync(directory)).toEqual([]);
+    });
+
+    it("writes nothing a change would leave unreadable", () => {
         expect(planRegistration({ host: "gemini", home: directory }, { wake: false })).toHaveLength(1);
         const file = path.join(directory, "settings.json");
         fs.writeFileSync(file, '{"keep": true}');
         expect(() => applySetup([{ path: file, before: '{"keep": true}', after: '{"keep": true', additions: [], removals: [], notes: [] }])).toThrow(/invalid JSON/);
         expect(fs.readFileSync(file, "utf8")).toBe('{"keep": true}');
         expect(fs.readdirSync(directory)).toEqual(["settings.json"]);
+    });
+});
+
+describe("starting node directly", () => {
+    // a built CLI where npm installs it: <prefix>/node_modules/concos-mcp/dist/cli.js
+    let cli: string;
+    let argv: string;
+    beforeEach(() => {
+        cli = path.join(directory, "prefix", "node_modules", "concos-mcp", "dist", "cli.js");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        fs.writeFileSync(cli, "");
+        argv = process.argv[1];
+        process.argv[1] = cli;
+    });
+    afterEach(() => {
+        process.argv[1] = argv;
+        vi.unstubAllEnvs();
+    });
+    const start = (...rest: string[]) => ({ command: process.execPath, args: ["--max-semi-space-size=1", cli, ...rest] });
+    const readJson = (relative: string) => parseJson(fs.readFileSync(path.join(directory, relative), "utf8"));
+    const readToml = (relative: string) => parseToml(fs.readFileSync(path.join(directory, relative), "utf8")) as Record<string, any>;
+
+    it("registers node on the running cli.js for MCP and Claude Code hooks, and the plain command for Codex hooks", () => {
+        const claude = { host: "claude", home: directory };
+        applySetup(planRegistration(claude, { wake: true }));
+        expect(readJson(".claude.json").mcpServers.concos).toEqual(start("mcp"));
+        const hooks = readJson(".claude/settings.json").hooks;
+        expect(hooks.SessionStart[0].hooks[0]).toEqual({ type: "command", ...start("hook", "session-start", "--host", "claude"), timeout: 10 });
+        expect(hooks.Stop[1].hooks[0]).toEqual({ type: "command", ...start("hook", "watch", "--host", "claude"), timeout: 3660, asyncRewake: true });
+        expect(inspectHooks(claude).state).toBe("on");
+        expect(inspectWake(claude)).toBe(true);
+        expect(planUpdate(claude)).toEqual([]);
+
+        // Codex runs hooks in the session's shell (PowerShell, cmd or sh): the plain command reads the same in all
+        applySetup(planRegistration({ host: "codex", home: directory }, { wake: true }));
+        expect(readToml(".codex/config.toml").mcp_servers.concos).toEqual(start("mcp"));
+        expect(readJson(".codex/hooks.json").hooks.Stop[1].hooks[0]).toEqual({ type: "command", command: "concos hook watch --host codex", timeout: 3660, async: true });
+    });
+
+    it("updates a registration an earlier concos wrote, where it stands and keeping what else the entries have", () => {
+        const claude = { host: "claude", home: directory };
+        const codex = { host: "codex", home: directory };
+        vi.stubEnv("CONCOS_HOME", path.join(directory, "data"));
+        // written by an earlier concos: the `concos` command everywhere
+        process.argv[1] = argv;
+        applySetup(planRegistration(claude, { wake: true }));
+        applySetup(planRegistration(codex, { wake: true }));
+        const hooksBefore = readJson(".codex/hooks.json");
+        process.argv[1] = cli;
+
+        const claudeUpdate = planUpdate(claude);
+        expect(claudeUpdate.map((change) => change.path)).toEqual([path.join(directory, ".claude.json"), path.join(directory, ".claude", "settings.json")]);
+        applySetup(claudeUpdate);
+        expect(readJson(".claude.json").mcpServers.concos).toEqual(start("mcp"));
+        const hooks = readJson(".claude/settings.json").hooks;
+        expect(hooks.Stop.map((group: any) => group.hooks[0].args.slice(2, 4))).toEqual([["hook", "turn-end"], ["hook", "watch"]]);
+        expect(hooks.PostToolUse[0]).toEqual({ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [{ type: "command", ...start("hook", "file-edited", "--host", "claude"), timeout: 10, async: true }] });
+        expect(planUpdate(claude)).toEqual([]);
+
+        // only the MCP table moves for Codex, keeping its data folder; the hooks stay as they are
+        const codexUpdate = planUpdate(codex);
+        expect(codexUpdate.map((change) => change.path)).toEqual([path.join(directory, ".codex", "config.toml")]);
+        applySetup(codexUpdate);
+        expect(readToml(".codex/config.toml").mcp_servers.concos).toEqual({ ...start("mcp"), env: { CONCOS_HOME: path.join(directory, "data") } });
+        expect(readJson(".codex/hooks.json")).toEqual(hooksBefore);
+    });
+
+    it("keeps a direct start a copy run through npx cannot improve on, and replaces one whose cli.js is gone", () => {
+        const claude = { host: "claude", home: directory };
+        applySetup(planRegistration(claude, { wake: false }));
+        const cached = path.join(directory, "npm-cache", "_npx", "1a2b", "node_modules", "concos-mcp", "dist", "cli.js");
+        fs.mkdirSync(path.dirname(cached), { recursive: true });
+        fs.writeFileSync(cached, "");
+        process.argv[1] = cached;
+        expect(planUpdate(claude)).toEqual([]);
+        fs.rmSync(cli);
+        applySetup(planUpdate(claude));
+        expect(readJson(".claude.json").mcpServers.concos).toEqual({ command: "concos", args: ["mcp"] });
+        expect(readJson(".claude/settings.json").hooks.SessionStart[0].hooks[0].command).toBe("concos hook session-start --host claude");
+    });
+
+    it("refuses a server named concos that starts node on something else, and unregisters the direct form", () => {
+        const claude = { host: "claude", home: directory };
+        fs.writeFileSync(path.join(directory, ".claude.json"), JSON.stringify({ mcpServers: { concos: { command: process.execPath, args: ["other.js", "mcp"] } } }));
+        expect(() => planSetup(claude)).toThrow(/already exists with different settings/);
+        fs.rmSync(path.join(directory, ".claude.json"));
+        applySetup(planRegistration(claude, { wake: true }));
+        applySetup(planUnregister(claude));
+        expect(readJson(".claude.json")).toEqual({ mcpServers: {} });
+        expect(readJson(".claude/settings.json")).toEqual({ hooks: {} });
     });
 });

@@ -8,7 +8,7 @@ import { participantName } from "./status-renderer";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
-import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveHooksPath } from "./setup";
+import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, resolveHooksPath, UPDATED_MESSAGE } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 
 export interface MenuOptions {
@@ -46,10 +46,11 @@ function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "
         if(status.registered == false) {
             return { hint: "Not registered" };
         }
+        const update = planUpdate(draft).length > 0 ? " · Update available" : "";
         if(hasHooks(draft.host) == false) {
-            return { hint: "MCP registered", hintStatus: "success" };
+            return { hint: `MCP registered${update}`, hintStatus: "success" };
         }
-        return { hint: `MCP registered · ${hookSummary(draft)}`, hintStatus: "success" };
+        return { hint: `MCP registered · ${hookSummary(draft)}${update}`, hintStatus: "success" };
     }
     catch { return { hint: "Configuration needs attention" }; }
 }
@@ -71,7 +72,7 @@ function previewChanges(prompter: Prompter, changes: SetupChange[]): void {
 }
 
 /**
- * Hooks for a client whose MCP is registered, and Claude Code's idle wake on top of
+ * Hooks for a client whose MCP is registered, and idle wake on top of
  * them: each turned on or off after a preview.
  */
 async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
@@ -83,7 +84,7 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
         + "They record this client's working and waiting status and edited files,\n"
         + "and at the end of a turn remind the agent once about unread questions sent to it.\n");
     if(canWake) {
-        prompter.write("Idle wake, for Claude Code only, wakes a waiting session by itself when a message addressed to it arrives.\n");
+        prompter.write("Idle wake wakes a waiting session by itself when a message addressed to it arrives.\n");
     }
     const items: SelectItem<"on" | "off" | "wake-on" | "wake-off" | "remove" | "back">[] = [];
     if(hooks.state != "on") {
@@ -93,7 +94,7 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
         items.push({ value: "off", label: "Turn off hooks" });
     }
     if(canWake && hooks.state == "on" && wakeOn == false) {
-        items.push({ value: "wake-on", label: "Turn on idle wake", hint: "Claude Code only" });
+        items.push({ value: "wake-on", label: "Turn on idle wake" });
     }
     if(wakeOn) {
         items.push({ value: "wake-off", label: "Turn off idle wake" });
@@ -154,14 +155,28 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
             draft.host = host;
             // settings concos cannot read as they should are reported here, and the client does not open
             ensureUsableSettings(draft);
-            // a first registration brings the hooks, and Claude Code's idle wake, in the same preview;
+            // a first registration brings the hooks and idle wake in the same preview;
             // a registered client changes them from its hooks menu, so hooks turned off stay off
             let changes = planSetup(draft);
             if(changes.length > 0 && hasHooks(draft.host)) {
                 changes = planRegistration(draft, { wake: hasWake(draft.host) });
             }
             if(changes.length == 0) {
-                prompter.write("\nThis client already has the same registration.\n");
+                // registered in an older way: offered once each time the client is opened
+                const update = planUpdate(draft);
+                if(update.length > 0) {
+                    prompter.write("\nThis registration can be updated to how this concos starts now.\n");
+                    previewChanges(prompter, update);
+                    if(await prompter.askYesNo("Update the registration?", false)) {
+                        applySetup(update);
+                        prompter.write(`\n${UPDATED_MESSAGE}\n`);
+                        await prompter.pause();
+                        continue;
+                    }
+                }
+                else {
+                    prompter.write("\nThis client already has the same registration.\n");
+                }
                 if(hasHooks(draft.host)) {
                     await editHooks(prompter, draft);
                 }

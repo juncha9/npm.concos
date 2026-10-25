@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMenu } from "../src/modules/cli/menu";
 import type { MenuOptions } from "../src/modules/cli/menu";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup } from "../src/modules/cli/setup";
+import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUpdate } from "../src/modules/cli/setup";
 import { openDatabase } from "../src/modules/store/database";
 import { RoomStore } from "../src/modules/store/room-store";
 import { TerminalScreen } from "./terminal-screen";
@@ -157,7 +157,8 @@ describe("registration menu", () => {
         const afterFirstRegistration = output.slice(output.indexOf("MCP, hooks and idle wake registered for Claude Code."));
         expect(afterFirstRegistration).toMatch(/[✔√] MCP registered/);
         expect(afterFirstRegistration).toContain("MCP registered · Hooks on · Wake on");
-        expect(afterFirstRegistration).toContain("MCP and hooks registered for Codex CLI.");
+        expect(afterFirstRegistration).toContain("MCP, hooks and idle wake registered for Codex CLI.");
+        expect(inspectWake({ host: "codex", home: path.join(directory, "user") })).toBe(true);
         expect(inspectHooks({ host: "codex", home: path.join(directory, "user") }).state).toBe("on");
     });
 });
@@ -604,6 +605,7 @@ describe("message groups on the board", () => {
     });
 
     it("draws sender rules on a terminal and inverts the selected block's header", async () => {
+        vi.stubEnv("NO_COLOR", undefined);
         await seedMessages([["Alpha", []], ["Alpha", []]]);
         const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
         const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 30 });
@@ -636,7 +638,8 @@ describe("built interactive CLI", () => {
             cwd: directory, env: process.env, input: answers, encoding: "utf8", timeout: 5000,
         });
         expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain("MCP and hooks registered for Codex CLI.");
+        expect(result.stdout).toContain("MCP, hooks and idle wake registered for Codex CLI.");
+        expect(inspectWake({ host: "codex", home: path.join(directory, "user") })).toBe(true);
         expect(inspectSetup({ host: "codex", home: path.join(directory, "user") }).room).toBe("main");
     });
 });
@@ -684,14 +687,40 @@ describe("hooks on the registration screen", () => {
         expect(inspectSetup({ host: "gemini", home: home() }).registered).toBe(false);
     });
 
-    it("offers idle wake on the Claude Code row once its hooks are on, and shows it beside the client", async () => {
-        applySetup(planSetup({ host: "claude", home: home() }));
-        applySetup(planHooks({ host: "claude", home: home() }, "on"));
-        const output = await menu("claude\nwake-on\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
-        expect(output).toContain("Idle wake, for Claude Code only");
-        expect(output.indexOf("Codex sessions do not wake")).toBeLessThan(output.indexOf("Turn on idle wake?"));
-        expect(output).toContain("Idle wake turned on for Claude Code.");
+    it("offers to update a registration an earlier concos wrote, from the row that says so", async () => {
+        const claude = { host: "claude", home: home() };
+        applySetup(planRegistration(claude, { wake: true }));
+        // this concos runs as an installed CLI, which registers node on its cli.js directly
+        const cli = path.join(directory, "prefix", "node_modules", "concos-mcp", "dist", "cli.js");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        fs.writeFileSync(cli, "");
+        const argv = process.argv[1];
+        process.argv[1] = cli;
+        try {
+            const output = await menu("claude\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
+            expect(output).toContain("MCP registered · Hooks on · Wake on · Update available");
+            expect(output.indexOf("Settings to add")).toBeLessThan(output.indexOf("Update the registration?"));
+            expect(output).toContain("Registration updated.");
+            expect(planUpdate(claude)).toEqual([]);
+            expect(inspectWake(claude)).toBe(true);
+        }
+        finally { process.argv[1] = argv; }
+    });
+
+    it.each(["claude", "codex"])("offers idle wake on the %s row once its hooks are on, and shows it beside the client", async (host) => {
+        const input = { host, home: home() };
+        const label = host == "claude" ? "Claude Code" : "Codex CLI";
+        applySetup(planSetup(input));
+        applySetup(planHooks(input, "on"));
+        const output = await menu(`${host}\nwake-on\ny\nback\nquit\n`, { host, startWithSetup: true });
+        expect(output).toContain("Idle wake wakes a waiting session");
+        expect(output.indexOf(`A waiting ${label} session wakes`)).toBeLessThan(output.indexOf("Turn on idle wake?"));
+        if(host == "codex") {
+            expect(output.indexOf("codex queue")).toBeLessThan(output.indexOf("Turn on idle wake?"));
+            expect(output.indexOf("open /hooks in Codex")).toBeLessThan(output.indexOf("Turn on idle wake?"));
+        }
+        expect(output).toContain(`Idle wake turned on for ${label}.`);
         expect(output).toContain("MCP registered · Hooks on · Wake on");
-        expect(inspectWake({ host: "claude", home: home() })).toBe(true);
+        expect(inspectWake(input)).toBe(true);
     });
 });

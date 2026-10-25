@@ -101,11 +101,6 @@ export async function runBridge(): Promise<void> {
     let lastHandle: string | null = null;
     let toolAgentId: string | null = null;
     const joinedAgentIds = new Set<string>();
-    /**
-     * Per agent: messages whose full text went out in its last response. Acknowledged when the
-     * same agent calls again; lost with the bridge, so a session that died keeps them unread.
-     */
-    const deliveredByAgent = new Map<string, number[]>();
 
     const resolveAgentId = (handle: string | undefined): string => {
         const effectiveHandle = handle ?? lastHandle;
@@ -115,8 +110,7 @@ export async function runBridge(): Promise<void> {
         const agentId = store.requireAgentIdByHandle(effectiveHandle);
         toolAgentId = agentId;
         joinedAgentIds.add(agentId);
-        store.recordCall(agentId, deliveredByAgent.get(agentId) ?? []);
-        deliveredByAgent.delete(agentId);
+        store.recordCall(agentId);
         return agentId;
     };
 
@@ -124,9 +118,10 @@ export async function runBridge(): Promise<void> {
         toolAgentId = null;
         try {
             const result = work();
+            // whole texts in this result count as received at the agent's next call or turn end
             const delivered = fullyDeliveredMessageIds(toolName, result);
-            if(toolAgentId != null && delivered.length > 0) {
-                deliveredByAgent.set(toolAgentId, delivered);
+            if(toolAgentId != null) {
+                store.markDelivered(toolAgentId, delivered);
             }
             const inbox = toolAgentId == null ? undefined : store.getInbox(toolAgentId, delivered);
             return { content: [{ type: "text", text: JSON.stringify(inbox == null ? result : { ...result as object, inbox }) }] };

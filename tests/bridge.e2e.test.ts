@@ -229,6 +229,25 @@ describe("concos mcp over stdio", () => {
         expect(receivedAt()).not.toBeNull();
     }, E2E_TIMEOUT_MS);
 
+    it("counts a message read in full as received when the session calls again through a restarted server", async () => {
+        const writer = await connectBridge();
+        const first = await connectBridge();
+        await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const joined = await callTool(first, "join", { display_name: "reader", client: "test", working_directory: workDirectory });
+        const sent = await callTool(writer, "send_message", { to: joined.agent_id, kind: "question", text: "ready?" });
+        expect((await callTool(first, "read_messages", {})).messages.map((message: any) => message.id)).toEqual([sent.message_id]);
+        // the client restarts its concos server before the session calls again
+        openClients.splice(openClients.indexOf(first), 1);
+        await first.close();
+        const second = await connectBridge();
+        expect((await callTool(second, "check_in", { handle: joined.handle })).inbox).toBeUndefined();
+        const check = new DatabaseSync(path.join(dataDirectory, "concos.db"));
+        try {
+            expect(check.prepare("SELECT received_at FROM message_receipt WHERE message_id = :id").get({ id: sent.message_id })).toEqual({ received_at: expect.any(String) });
+        }
+        finally { check.close(); }
+    }, E2E_TIMEOUT_MS);
+
     it("reads a count over the maximum as the maximum, states the limits, and renames through check_in", async () => {
         const writer = await connectBridge();
         const reader = await connectBridge();

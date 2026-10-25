@@ -212,4 +212,10 @@ export const SCHEMA_STEPS: readonly string[] = [
     -- The standing role the user gave an agent, apart from task (what it is doing now).
     ALTER TABLE agent ADD COLUMN role TEXT NOT NULL DEFAULT '';
     `,
+    `
+    -- When the message's whole text last went out to the recipient in a tool result. It counts as
+    -- received at the recipient's next call, through any bridge, or when its turn ends; a bridge
+    -- that restarted used to forget it, and the message stayed unread.
+    ALTER TABLE message_receipt ADD COLUMN delivered_at TEXT;
+    `,
 ];

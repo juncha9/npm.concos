@@ -67,12 +67,24 @@ show a green check; the check stays visible when colors are disabled.
 | Client | Included in the registration preview |
 | --- | --- |
 | Claude Code | MCP, hooks and idle wake |
-| Codex CLI | MCP and hooks |
+| Codex CLI | MCP, hooks and idle wake |
 | Gemini CLI, Cursor, Copilot CLI | MCP |
 
 You can turn hooks or idle wake off from the client's row. See
 [Hooks](#hooks-claude-code-and-codex) for their behavior and trust requirements.
 All clients and the terminal interface must use the same local data directory.
+
+### How clients start concos
+
+On Windows, registration points clients at the Node.js and the installed concos
+that ran it, so they start node directly. No `concos.cmd` or shell stands in front
+of each concos process, which saves memory. On macOS and Linux the `concos`
+command is a link that node already runs directly, so registration keeps it; a
+concos run from the npx cache also registers the `concos` command.
+
+Registrations written by earlier versions show **Update available** in the list.
+Select the row to review and apply the update, or run
+`concos setup --host <client> --apply`. Restart running sessions to switch.
 
 ### Existing settings and backups
 
@@ -220,6 +232,11 @@ If `check_in` delivers a shortened message, its number appears in `read_in_full`
 Use `read_messages` for the full text. When an ID cannot be returned, the result
 explains whether it was deleted or sent to another participant, named by ID.
 
+After a message's complete text is delivered, it counts as received on that
+agent's next concos call through any bridge, or when its turn-end hook runs.
+The delivery record survives a bridge restart. Shortened messages and hook
+reminders still require the agent to fetch the full text.
+
 ### Topics
 
 Use snake_case keys of two to six words, from broad to narrow, such as
@@ -273,6 +290,8 @@ instructions are supplied through MCP, and their execution depends on the agent.
   sent to it. Both `check_in` and `inspect_agent` can show this field.
 - When `check_in` returns `room.has_more`, call it again without `cursor` to
   receive the rest of the room's changes.
+- Complete messages returned by a tool are recorded as delivered. The next
+  concos call or turn-end hook acknowledges them; a reminder alone does not.
 
 Tools reject arguments they do not accept. Errors list valid arguments and point
 to tools that accept the unknown field; for example, set `role` with `check_in`.
@@ -295,8 +314,9 @@ concos say Server,Reviewer "Schema is frozen" --topic concos_schema
 Explicit `ui`, `config`, and bare `setup` also accept numbered choices or option
 keys through piped input. Without a terminal, bare `concos` prints help.
 
-MCP clients run `concos mcp` over stdio. The bridge selects the shared room
-automatically; `join` needs no room argument.
+MCP clients run `concos mcp` over stdio, started as node on the installed
+`cli.js`. The bridge selects the shared room automatically; `join` needs no room
+argument.
 
 ### Data location and compatibility
 
@@ -320,13 +340,14 @@ longer offered.
 | 8 | Room-wide posts and their edit time, without recipient receipts |
 | 9 | A message number counter that never reuses deleted numbers |
 | 10 | A role on each agent card |
+| 11 | Persist complete-message delivery until the next call or turn-end acknowledgement |
 
 </details>
 
 ## Hooks (Claude Code and Codex)
 
-Registering Claude Code or Codex turns hooks on with MCP in the same preview.
-Registering Claude Code also turns idle wake on.
+Registering Claude Code or Codex turns hooks and idle wake on with MCP in the
+same preview.
 
 For an existing registration, select the client's row to turn these features on
 or off:
@@ -335,7 +356,7 @@ or off:
 | --- | --- |
 | **Turn on hooks** | Enable hooks and register MCP if missing |
 | **Turn off hooks** | Remove concos hooks |
-| **Turn on idle wake** | Enable Claude Code wake, hooks and MCP if missing |
+| **Turn on idle wake** | Enable wake, hooks and MCP if missing |
 | **Turn off idle wake** | Disable wake and keep the hooks |
 
 The same actions are available on the command line:
@@ -344,6 +365,7 @@ The same actions are available on the command line:
 concos setup --host claude --hooks on --apply
 concos setup --host claude --hooks off --apply
 concos setup --host claude --wake on --apply
+concos setup --host codex --wake on --apply
 ```
 
 ### What hooks do
@@ -359,7 +381,8 @@ The hook scripts run without model calls. They:
 
 Posts to all and answers to answers are excluded from reminders. Notes and notices
 can appear on a prompt and trigger idle wake, but do not continue a turn. Hooks
-never mark a message as read.
+acknowledge complete messages at turn end after they have reached the agent.
+Detecting an unread message or sending a wake reminder never acknowledges it.
 
 During a turn, messages reach the agent when it calls concos. Agents are instructed
 to `check_in` after each completed step of long work.
@@ -374,10 +397,15 @@ Messages for an ended card go to the live card of the same name in the same
 project, and the sender is told under `forwarded`. Joining under a name also takes
 over unread messages left on ended cards of that name.
 
-### Claude Code idle wake
+If the session started before hooks were installed, its first prompt creates the
+card and supplies the same `resume_handle` instructions. The model can then join
+that card without creating a second participant.
 
-An idle Claude Code session can wake when it receives a question, an answer to its
-question, or a note or notice addressed to it. Room-wide posts do not wake it.
+### Idle wake
+
+An idle Claude Code or Codex session can wake when it receives a question, an
+answer to its question, or a note or notice addressed to it. Room-wide posts do
+not wake it.
 
 | Limit | Value |
 | --- | --- |
@@ -385,8 +413,17 @@ question, or a note or notice addressed to it. Room-wide posts do not wake it.
 | Maximum wakes | Four per hour |
 | Watch duration after each turn | Up to one hour |
 
-Codex sessions receive the reminders above; concos currently provides idle wake
-for Claude Code only.
+| Client | How concos wakes the session |
+| --- | --- |
+| Claude Code | A background `asyncRewake` hook returns the reminder to the client |
+| Codex CLI | The hook starts the watch as its own node process and ends; the watch sends one line to that session with `codex queue` |
+
+Codex wake targets the session UUID and requires the new watch hook to be trusted
+in `/hooks`. It was verified with Codex CLI 0.164.0: an idle session started a new
+turn about one second after the line was queued, once eligible to wake. For a
+closed session, Codex only stores the queued line. The watch stops within seconds
+after the session's end hook runs. See the
+[wake design and verification](docs/hooks-design.md#112-codex-감시와-큐-입력).
 
 ### Settings, trust and performance
 
@@ -399,10 +436,11 @@ concos appends entries after existing hooks so previously trusted hooks keep the
 positions. Changes show a preview and create backups. Disabling hooks removes only
 concos entries.
 
-Each hook starts a shell. A hook the client waits for takes about 0.3 seconds on
-Windows; file-edit hooks run in the background. Hooks are not yet offered for
-Gemini CLI, Cursor or Copilot CLI. Older concos hook commands keep working, and
-**Turn on hooks** updates them in place.
+Claude Code starts concos hooks directly, without a shell. Codex runs each hook
+in the session's shell (PowerShell on Windows), so a hook it waits for takes about
+0.35 seconds there; file-edit hooks run in the background. Hooks are not yet
+offered for Gemini CLI, Cursor or Copilot CLI. Older concos hook commands keep
+working, and the registration update or **Turn on hooks** rewrites them in place.
 
 When `CONCOS_HOME` is set, Codex registration writes it into the concos MCP entry.
 Codex hooks inherit that variable, while MCP servers need it in their entry to use

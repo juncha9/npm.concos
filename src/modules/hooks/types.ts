@@ -1,4 +1,4 @@
-/** `watch`: Claude Code idle wake, a background Stop hook that may wake the waiting session. */
+/** `watch`: idle wake, a background Stop hook that may wake the waiting session (Claude Code, Codex). */
 export const HOOK_EVENTS = ["session-start", "prompt", "file-edited", "turn-end", "session-end", "watch"] as const;
 export type HookEventKind = typeof HOOK_EVENTS[number];
 
@@ -39,6 +39,11 @@ export interface HostAdapter {
     registrations: HookRegistration[];
     /** The idle wake hook, registered separately from `registrations`; only hosts that can wake a session have one. */
     wake?: HookRegistration;
+    /**
+     * Hands the wake line to the waiting session from outside it. Without one, the watch exits
+     * with code 2 and the line on stderr, which Claude Code's asyncRewake turns into a turn.
+     */
+    deliverWake?(sessionId: string, message: string): Promise<void>;
     normalize(kind: HookEventKind, payload: unknown): HookEvent | null;
     output(kind: HookEventKind, context?: string): Record<string, unknown>;
     /** Output that continues the turn at its end; a host without one never continues a turn. */

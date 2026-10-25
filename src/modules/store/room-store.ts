@@ -167,7 +167,7 @@ export interface HookOutcome {
     continueFor?: HookNotice[];
 }
 
-/** A Claude Code idle-wake watch: the session it watches, and the generation that keeps it live. */
+/** An idle-wake watch: the session it watches, and the generation that keeps it live. */
 export interface WakeWatch {
     agentId: string;
     generation: number;
@@ -665,8 +665,9 @@ export class RoomStore {
                     AND id IN (SELECT message_id FROM message_receipt WHERE agent_id = :from AND received_at IS NULL)
                     AND id NOT IN (SELECT message_id FROM message_receipt WHERE agent_id = :to)
             `).run(ids);
+            // what went out to the ended session never reached this one, so its next call must not receive it
             this.prepare(`
-                UPDATE message_receipt SET agent_id = :to
+                UPDATE message_receipt SET agent_id = :to, delivered_at = NULL
                 WHERE agent_id = :from
                     AND received_at IS NULL
                     AND message_id NOT IN (SELECT message_id FROM message_receipt WHERE agent_id = :to)
@@ -993,17 +994,29 @@ export class RoomStore {
 
     /**
      * Mechanical hook updates. A hook never calls checkIn, which would move the model's cursor,
-     * and never acknowledges a message.
+     * and acknowledges only what already went out in full, when the turn ends.
      *
      * Flow:
-     *  1) session-start: join or come back by host session key
+     *  1) session-start: join or come back by host session key; a prompt from a session with no
+     *     card yet, one that started before its hooks were on, joins the same way first
      *  2) Other events: find the participant by session key; none, or one that left, is ignored
-     *  3) A turn end with unread messages not pointed out yet continues the turn once: it stays
-     *     working, keeps its editing claims and records how far it has pointed
+     *  3) A turn end receives what went out in full during the turn, then with unread messages not
+     *     pointed out yet continues the turn once: it stays working, keeps its editing claims and
+     *     records how far it has pointed
      *  4) Otherwise apply the event to status and editing; a prompt reports what is unread
      */
     applyHookEvent(event: HookEvent, room = SHARED_ROOM): HookOutcome | null {
         room = SHARED_ROOM;
+        // without a card the hooks can never point this session at its messages (2026-10-26 report)
+        if(event.kind == "prompt") {
+            const known = this.prepare(`
+                SELECT 1 FROM agent WHERE host = :host AND host_session_id = :session_id AND room = :room
+            `).get({ host: event.host, session_id: event.sessionId, room: room });
+            if(known == null) {
+                const started = this.applyHookEvent({ ...event, kind: "session-start" }, room)!;
+                return { ...(this.applyHookEvent(event, room) ?? { agentId: started.agentId }), joined: started.joined };
+            }
+        }
         // (1) Session start
         if(event.kind == "session-start") {
             const client = event.client ?? event.host;
@@ -1027,7 +1040,10 @@ export class RoomStore {
             if(current.left_at != null) return null;
             const now = new Date().toISOString();
 
-            // (3) Continue the turn once per message
+            // (3) The turn is over, so what went out in full was read; then continue it once per message
+            if(event.kind == "turn-end") {
+                this.acknowledgeDelivered(row.id);
+            }
             if(event.kind == "turn-end" && event.canContinue == true) {
                 const continueFor = this.hookNotices(row.id, row.hook_nudged_seq);
                 if(continueFor.length > 0) {
@@ -1079,7 +1095,7 @@ export class RoomStore {
     }
 
     /**
-     * Claude Code idle wake: starts a watch for the session behind `event` and makes it the only
+     * Idle wake: starts a watch for the session behind `event` and makes it the only
      * live one, so a watch left from an earlier turn ends. A session that never started, or
      * left, has nothing to watch.
      */
@@ -2294,17 +2310,39 @@ export class RoomStore {
 
     /**
      * Any tool call from an agent: it is alive and connected again, and the messages whose full
-     * text reached it in its previous response count as received. Acknowledging on the next call
-     * rather than on delivery keeps a message unread when the session died before reading it.
+     * text reached it in an earlier response count as received. Acknowledging on the next call
+     * rather than on delivery keeps a message unread when the session died before reading it; the
+     * delivery is recorded in the database, so a bridge that restarted in between still counts it.
      */
-    recordCall(agentId: string, deliveredMessageIds: number[]): void {
+    recordCall(agentId: string): void {
         runInTransaction(this.database, () => {
             this.prepare(`
                 UPDATE agent SET last_seen_at = :now, last_call_at = :now, disconnected_at = NULL
                 WHERE id = :id AND left_at IS NULL
             `).run({ now: new Date().toISOString(), id: agentId });
-            this.acknowledge(agentId, deliveredMessageIds);
+            this.acknowledgeDelivered(agentId);
         });
+    }
+
+    /** Messages whose full text went out to the agent in a tool result; received at its next call or turn end. */
+    markDelivered(agentId: string, messageIds: number[]): void {
+        if(messageIds.length == 0) {
+            return;
+        }
+        this.prepare(`
+            UPDATE message_receipt SET delivered_at = :now
+            WHERE agent_id = :agent_id
+                AND received_at IS NULL
+                AND message_id IN (SELECT value FROM json_each(:message_ids))
+        `).run({ now: new Date().toISOString(), agent_id: agentId, message_ids: JSON.stringify(messageIds) });
+    }
+
+    /** Receives what already went out to the agent in full. */
+    private acknowledgeDelivered(agentId: string): void {
+        this.prepare(`
+            UPDATE message_receipt SET received_at = :now
+            WHERE agent_id = :agent_id AND received_at IS NULL AND delivered_at IS NOT NULL
+        `).run({ now: new Date().toISOString(), agent_id: agentId });
     }
 
     /** Liveness only: never creates a change event for other agents. */

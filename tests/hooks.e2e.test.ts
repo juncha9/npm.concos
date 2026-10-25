@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const CLI = path.resolve("dist/cli.js");
@@ -108,7 +109,8 @@ describe("hook CLI", () => {
         expect(fs.readFileSync(configFile, "utf8")).toBe(before);
         expect(fs.readdirSync(first)).toEqual([]);
         expect(fs.readdirSync(second)).toEqual([]);
-        expect(before).toContain('args = [ "mcp" ]');
+        // node starts on this cli.js directly, with no concos shim in front
+        expect(parseToml(before).mcp_servers).toEqual({ concos: { command: process.execPath, args: ["--max-semi-space-size=1", CLI, "mcp"], env: { CONCOS_HOME: environment.CONCOS_HOME } } });
     });
 
     it.each(["claude", "codex"])("continues a %s turn once for a question sent to it, and points at it on the next prompt", (host) => {
@@ -133,7 +135,8 @@ describe("hook CLI", () => {
             expect(result.stderr).toBe("");
         }
         const codexWake = spawnSync(process.execPath, [CLI, "setup", "--host", "codex", "--wake", "on"], { cwd: directory, env: environment, encoding: "utf8" });
-        expect(codexWake.stderr).toContain("Claude Code only");
+        expect(codexWake.status, codexWake.stderr).toBe(0);
+        expect(codexWake.stdout).toContain("concos hook watch --host codex");
     });
 
     it("previews and turns on Codex hooks, registering MCP in the same step when it is missing", () => {
@@ -148,7 +151,8 @@ describe("hook CLI", () => {
         expect(fs.existsSync(hooksFile)).toBe(false);
         expect(fs.existsSync(configFile)).toBe(false);
         expect(hooks("on", "--apply").stdout).toContain("Registered MCP and turned hooks on.");
-        expect(fs.readFileSync(configFile, "utf8")).toContain('args = [ "mcp" ]');
+        expect(parseToml(fs.readFileSync(configFile, "utf8")).mcp_servers).toEqual({ concos: { command: process.execPath, args: ["--max-semi-space-size=1", CLI, "mcp"], env: { CONCOS_HOME: environment.CONCOS_HOME } } });
+        // Codex runs hooks in the session's shell, where only the plain command reads the same
         expect(JSON.parse(fs.readFileSync(hooksFile, "utf8")).hooks.Stop[0].hooks[0].command).toBe("concos hook turn-end --host codex");
         expect(hooks("on").stdout).toContain("already on");
         hooks("off", "--apply");
@@ -164,6 +168,69 @@ describe("hook CLI", () => {
         expect(JSON.parse(fs.readFileSync(hooksFile, "utf8"))).toEqual({ hooks: {} });
         expect(remove().stdout).toContain("concos is not registered for Codex CLI.");
     });
+
+    it("registers Claude Code to start node directly, and its hooks run the way Claude Code starts them", () => {
+        const home = path.join(directory, "user");
+        const claudeEnvironment = { ...environment, HOME: home, USERPROFILE: home };
+        const setup = spawnSync(process.execPath, [CLI, "setup", "--host", "claude", "--wake", "on", "--apply"], { cwd: directory, env: claudeEnvironment, encoding: "utf8" });
+        expect(setup.status, setup.stderr).toBe(0);
+        expect(JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8")).mcpServers.concos).toEqual({ command: process.execPath, args: ["--max-semi-space-size=1", CLI, "mcp"] });
+        const hooks = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf8")).hooks;
+        const start = hooks.SessionStart[0].hooks[0];
+        expect(start).toEqual({ type: "command", command: process.execPath, args: ["--max-semi-space-size=1", CLI, "hook", "session-start", "--host", "claude"], timeout: 10 });
+        expect(hooks.Stop[1].hooks[0]).toMatchObject({ args: ["--max-semi-space-size=1", CLI, "hook", "watch", "--host", "claude"], asyncRewake: true });
+        // exec form: no shell, the event on stdin
+        const output = JSON.parse(execFileSync(start.command, start.args, { env: environment, input: JSON.stringify({ session_id: "s", cwd: directory }), encoding: "utf8" }));
+        expect(output.hookSpecificOutput.additionalContext).toContain("resume_handle=");
+        // registered again: nothing to update
+        expect(spawnSync(process.execPath, [CLI, "setup", "--host", "claude"], { cwd: directory, env: claudeEnvironment, encoding: "utf8" }).stdout).toContain("already registered");
+    });
+
+    it("updates an older Codex registration through setup, previewing first", () => {
+        const configFile = path.join(environment.CODEX_HOME!, "config.toml");
+        fs.mkdirSync(path.dirname(configFile), { recursive: true });
+        fs.writeFileSync(configFile, '[mcp_servers.concos]\ncommand = "concos"\nargs = [ "mcp" ]\n');
+        const setup = (...args: string[]) => spawnSync(process.execPath, [CLI, "setup", "--host", "codex", ...args], { cwd: directory, env: environment, encoding: "utf8" });
+        expect(setup().stdout).toContain("Add --apply to update the registration.");
+        expect(parseToml(fs.readFileSync(configFile, "utf8")).mcp_servers).toEqual({ concos: { command: "concos", args: ["mcp"] } });
+        expect(setup("--apply").stdout).toContain("Registration updated.");
+        expect(parseToml(fs.readFileSync(configFile, "utf8")).mcp_servers).toEqual({ concos: { command: process.execPath, args: ["--max-semi-space-size=1", CLI, "mcp"] } });
+        expect(setup().stdout).toContain("already registered");
+    });
+
+    it("ends the Codex idle-wake hook at once, leaving the watch to a node of its own that ends with the session", async () => {
+        const payload = { session_id: "01a16d85-083e-7373-9dd6-6ae1676b6d7c", cwd: directory };
+        invoke("session-start", "codex", payload);
+        const generation = () => {
+            const db = new DatabaseSync(path.join(environment.CONCOS_HOME!, "concos.db"));
+            try { return (db.prepare("SELECT wake_generation FROM agent WHERE host_session_id = :id").get({ id: payload.session_id }) as { wake_generation: number }).wake_generation; }
+            finally { db.close(); }
+        };
+        const before = generation();
+        const startedMs = Date.now();
+        const hook = spawnSync(process.execPath, [CLI, "hook", "watch", "--host", "codex"], { env: environment, input: JSON.stringify(payload), encoding: "utf8", timeout: 10000 });
+        expect(hook.status).toBe(0);
+        expect(JSON.parse(hook.stdout)).toEqual({});
+        expect(Date.now() - startedMs).toBeLessThan(5000);
+        // the watch has started on its own
+        for(let attempt = 0; attempt < 50 && generation() == before; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        expect(generation()).toBe(before + 1);
+
+        // that watch, run here in the foreground, ends once the session does
+        const watch = spawn(process.execPath, [CLI, "hook", "watch", "--host", "codex"], {
+            env: { ...environment, CONCOS_WATCH_EVENT: JSON.stringify({ host: "codex", kind: "watch", sessionId: payload.session_id, cwd: directory, files: [] }) },
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        const ended = new Promise<number | null>((resolve) => watch.on("exit", (code) => resolve(code)));
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        invoke("session-end", "codex", payload);
+        const code = await Promise.race([ended, new Promise((resolve) => setTimeout(() => resolve("still running"), 8000))]);
+        expect(code).toBe(0);
+        // the detached watch reads the same database and stops the same way
+        await new Promise((resolve) => setTimeout(resolve, 3500));
+    }, 30000);
 
     it("rejects project-scoped registration before creating settings", () => {
         const result = spawnSync(process.execPath, [CLI, "setup", "--host", "codex", "--scope", "project", "--apply"], {

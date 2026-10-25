@@ -533,12 +533,36 @@ describe("ended sessions", () => {
         const sender = joinAgent("sender");
         const receiver = joinAgent("receiver");
         const sent = store.sendMessage(sender.agent_id, { to: receiver.agent_id, kind: "question", text: "ready?", replyTo: null, requestId: null });
+        store.markDelivered(receiver.agent_id, [sent.message_id]);
         store.disconnect([receiver.agent_id]);
         expect(store.getRoomOverview("main", 0).agents.find((agent) => agent.agent_id == receiver.agent_id)?.ended).toBe(true);
 
-        store.recordCall(receiver.agent_id, [sent.message_id]);
+        store.recordCall(receiver.agent_id);
         const overview = store.getRoomOverview("main", 0).agents.find((agent) => agent.agent_id == receiver.agent_id)!;
         expect(overview).toMatchObject({ ended: false, online: true, pending_count: 0 });
+    });
+
+    it("keeps a full-text delivery in the database, so a call through another bridge acknowledges only that", async () => {
+        const sender = joinAgent("sender");
+        const receiver = joinAgent("receiver");
+        const other = joinAgent("other");
+        const send = (to: string, kind: "question" | "note") => store.sendMessage(sender.agent_id, { to: to, kind: kind, text: "x", replyTo: null, requestId: null }).message_id;
+        const delivered = send(receiver.agent_id, "question");
+        const previewed = send(receiver.agent_id, "note");
+        const othersMessage = send(other.agent_id, "note");
+        // an id that is not the receiver's changes nothing
+        store.markDelivered(receiver.agent_id, [delivered, othersMessage]);
+        expect(store.getInbox(receiver.agent_id)).toEqual({ questions: 1, notes: 1 });
+
+        // the client restarted its MCP server: a new process opens the same database
+        const connection = await openDatabase(dataDirectory);
+        try {
+            new RoomStore(connection).recordCall(receiver.agent_id);
+        }
+        finally { connection.close(); }
+        expect(store.getInbox(receiver.agent_id)).toEqual({ questions: 0, notes: 1 });
+        expect(store.readMessages(receiver.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([previewed]);
+        expect(store.getInbox(other.agent_id)).toEqual({ questions: 0, notes: 1 });
     });
 
     it("counts a message delivered in this response out of the inbox it returns", () => {
@@ -583,8 +607,11 @@ describe("ended sessions", () => {
         const waiting = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "notice", text: "left behind", replyTo: null, requestId: null });
         const read = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "note", text: "already read", replyTo: null, requestId: null });
         store.acknowledge(earlier.agent_id, [read.message_id]);
+        // its whole text went out to the earlier session, which ended before calling again
+        store.markDelivered(earlier.agent_id, [waiting.message_id]);
         store.disconnect([earlier.agent_id]);
         const current = joinAgent("Dev / CONCOS 01");
+        store.recordCall(current.agent_id);
         expect(store.readMessages(current.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([waiting.message_id]);
         expect(store.getRoomOverview("main", 10).messages.find((message) => message.id == waiting.message_id)?.to_agent_id).toBe(current.agent_id);
         // what the earlier session read stays its own
@@ -627,7 +654,7 @@ describe("resolved messages", () => {
         database.prepare("UPDATE agent SET last_call_at = :at WHERE id = :id").run({ at: new Date(Date.now() - 31 * 60_000).toISOString(), id: idle.agent_id });
         store.heartbeat([idle.agent_id]);
         expect(messageState(sent.message_id)).toMatchObject({ resolved: true, waiting_on: [] });
-        store.recordCall(idle.agent_id, []);
+        store.recordCall(idle.agent_id);
         expect(messageState(sent.message_id)).toMatchObject({ resolved: false, waiting_on: ["idle"] });
     });
 
@@ -637,7 +664,7 @@ describe("resolved messages", () => {
         const sent = store.sendMessage(sender.agent_id, { to: away.agent_id, kind: "note", text: "later", replyTo: null, requestId: null });
         store.disconnect([away.agent_id]);
         expect(messageState(sent.message_id)).toMatchObject({ resolved: true });
-        store.recordCall(away.agent_id, []);
+        store.recordCall(away.agent_id);
         expect(messageState(sent.message_id)).toMatchObject({ resolved: false, waiting_on: ["away"] });
     });
 

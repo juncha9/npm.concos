@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process";
 import { parseArgs } from "node:util";
-import { SHARED_ROOM } from "../../_defs";
+import { NODE_FLAGS, SHARED_ROOM } from "../../_defs";
 import { $logger } from "../../_libs/logger";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { openDatabase } from "../store/database";
@@ -67,13 +68,31 @@ async function readPayload(): Promise<unknown> {
     });
 }
 
+/** Set on a watch that goes on in a node of its own: the hook event it watches, as JSON. */
+const WATCH_EVENT_VARIABLE = "CONCOS_WATCH_EVENT";
+
 /**
- * The idle-wake hook. Exit code 2 wakes the Claude Code session with stderr as its message, so
- * stderr carries that one line and nothing else; every other ending is a quiet exit 0.
+ * The idle-wake hook. A host that wakes a session from outside (Codex) gets the line from
+ * `deliverWake`. Otherwise exit code 2 wakes the Claude Code session with stderr as its message,
+ * so stderr carries that one line and nothing else. Every other ending is a quiet exit 0.
  */
 async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<void> {
     // child loggers read the level when created, so database logging stays off stderr from here
     process.env.CONCOS_LOG_LEVEL ??= "none";
+    // Waking from outside needs nothing back from this hook, so the watch goes on in a node of its
+    // own and the hook ends: the shell Codex runs hooks in (PowerShell, about 64 MB) does not stay
+    // for the watch's hour. The watch still ends when the session does, through its end hook.
+    if(event != null && adapter.wake != null && adapter.deliverWake != null && process.env[WATCH_EVENT_VARIABLE] == null) {
+        const watch = spawn(process.execPath, [...NODE_FLAGS, process.argv[1], "hook", "watch", "--host", adapter.id], {
+            detached: true, stdio: "ignore", windowsHide: true,
+            env: { ...process.env, [WATCH_EVENT_VARIABLE]: JSON.stringify(event) },
+        });
+        // a watch that cannot start is left for the next turn end; the hook still ends quietly
+        watch.on("error", (error) => $logger.error(error, "idle-wake watch did not start"));
+        watch.unref();
+        process.stdout.write("{}\n");
+        return;
+    }
     let reason: string | null = null;
     if(event != null && adapter.wake != null) {
         const database = await openDatabase(resolveDataDirectory(), { busyTimeoutMs: 100 });
@@ -81,6 +100,11 @@ async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<
             reason = await watchForWake(new RoomStore(database), event);
         }
         finally { database.close(); }
+        if(reason != null && adapter.deliverWake != null) {
+            await adapter.deliverWake(event.sessionId, reason);
+            process.stdout.write("{}\n");
+            return;
+        }
     }
     if(reason == null) {
         process.stdout.write("{}\n");
@@ -103,8 +127,10 @@ export async function runHook(args: string[]): Promise<void> {
         adapter = getHostAdapter(values.host);
         if(positionals.length != 1 || !(HOOK_EVENTS as readonly string[]).includes(positionals[0])) throw new RoomError("invalid hook event");
         kind = positionals[0] as HookEventKind;
+        // a watch started by `runWatch` has no stdin; its event comes along in the environment
+        const watchEvent = process.env[WATCH_EVENT_VARIABLE];
         // Accept old registered commands, but never use their former room selectors.
-        const event = adapter.normalize(kind, await readPayload());
+        const event = kind == "watch" && watchEvent != null ? JSON.parse(watchEvent) as HookEvent : adapter.normalize(kind, await readPayload());
         if(kind == "watch") {
             await runWatch(adapter, event);
             return;

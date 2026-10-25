@@ -584,7 +584,7 @@ async function reportInPlace(prompter: Prompter, report: string): Promise<void> 
 /**
  * Asks every live poster, by question, to remove its posts that no longer apply and rewrite the
  * ones that changed, naming each post by number and first line. A question, so the hooks of
- * Claude Code and Codex continue a turn for it and Claude Code's idle wake rouses a waiting
+ * Claude Code and Codex continue a turn for it and their idle wake rouses a waiting
  * session (user decision 2026-10-25).
  */
 async function askToTidyPosts(prompter: Prompter, store: RoomStore, posters: Poster[], english: boolean): Promise<void> {

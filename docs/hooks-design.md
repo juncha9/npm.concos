@@ -1,6 +1,6 @@
 # 훅 선택 기능 설계 (Claude Code · Codex)
 
-상태: 1·2단계 구현 · 2026-10-25. 0단계 실제 동작 확인 끝(12절). 사용자 설정에 켜서 쓰는 확인(13절)은 남아 있다. 요청은 concos 메시지 #17(사용자 요청, concos development 세션 전달)이다. 결정 사항은 10절, 남은 결정은 14절에 있다. 과거 훅 구현과 검증 기록은 [hooks-plan.md](hooks-plan.md), 설계 전반은 [SCAFFOLD.md](../SCAFFOLD.md)에 있다.
+상태: 1·2단계 구현 · 2026-10-25. 2026-10-26에 Codex 대기 깨우기, 턴 끝 받음 처리, 시작 훅을 놓친 세션의 프롬프트 참가를 확장한다(concos 요청 #163·#186). 확인한 동작과 추가 검증 항목은 12·13절에 구분한다. 최초 요청은 메시지 #17이다. 결정 사항은 10절, 남은 결정은 14절에 있다. 과거 훅 구현과 검증 기록은 [hooks-plan.md](hooks-plan.md), 설계 전반은 [SCAFFOLD.md](../SCAFFOLD.md)에 있다.
 
 ## 1. 목적과 범위
 
@@ -12,10 +12,11 @@ MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 �
 - 상태: 작업 중·대기·종료를 모델 호출 없이 기록한다.
 - 편집 선언: 수정한 파일을 `editing`에 넣고 턴이 끝나면 회수한다.
 - 안내: 알림 대상 메시지(5절)를 프롬프트 때 한 줄로 알리고, 턴 끝에 한 번 상기한다(6절).
+- 받음 처리: 이미 전문이 전달된 메시지만 턴 끝에 확인한다(6.1절).
 
-훅이 하지 않는 일: 메시지 읽음 처리, 메시지 발송, 요약·체크포인트 작성, `check_in` 호출.
+훅이 하지 않는 일: 메시지 본문 조회, 감지·알림만으로 받음 처리, 대합실 메시지 발송, 요약·체크포인트 작성, `check_in` 호출.
 
-1단계 대상은 Claude Code와 Codex다. Gemini CLI·Cursor·Copilot CLI 어댑터는 코드에 있지만 실제 세션 검증 뒤에 연다. [SCAFFOLD.md 1절](../SCAFFOLD.md#1-사용자-요구사항)의 규칙에 따라 1단계에는 두 클라이언트에서 같은 동작만 넣는다. 대기 중인 세션 깨우기는 Claude Code에서만 가능하다. 0단계에서 실제 동작을 확인한 뒤, 사용자가 규칙의 예외로 2단계에 넣기로 정했다(11절).
+대상은 Claude Code와 Codex다. Gemini CLI·Cursor·Copilot CLI 어댑터는 코드에 있지만 실제 세션 검증 뒤에 연다. [SCAFFOLD.md 1절](../SCAFFOLD.md#1-사용자-요구사항)의 공통 기능 원칙을 유지한다. 대기 깨우기는 처음에는 Claude 전용 예외로 도입했으나, Codex의 `codex queue`로 같은 동작을 확인해 두 클라이언트로 확장한다(11절).
 
 ## 2. 두 클라이언트의 훅
 
@@ -33,7 +34,7 @@ MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 �
 | 신뢰 | 대화형 세션은 폴더 신뢰를 받은 뒤 실행(User 설정 포함). `-p`는 신뢰로 간주 | 비관리 훅은 `/hooks`에서 검토·신뢰해야 실행. 명령이 바뀌면 다시 검토 대상이 되고, 그동안 건너뛰며 시작 시 경고 |
 | 명령 실행 | `args`가 없으면 셸로 실행. Windows에서는 Git Bash(`bash.exe`)로 실행됨(0단계 확인) | 세션 `cwd`에서 실행. Windows에서는 PowerShell(`powershell.exe`)로 실행되고 `concos`는 `concos.ps1`로 풀림(0단계 확인). Windows 전용 `commandWindows` 덮어쓰기 가능 |
 | MCP 서버 환경 변수 | 바깥 환경을 물려받음(`CONCOS_HOME` 전달 확인) | 바깥 환경을 넘기지 않음. 훅은 물려받으므로 `CONCOS_HOME`을 바꾼 환경에서는 훅과 MCP가 다른 DB를 볼 수 있음(0단계 확인) |
-| 외부에서 세션 깨우기 | `asyncRewake`, Channels(연구 프리뷰) | 문서에 없음 |
+| 외부에서 세션 깨우기 | `asyncRewake`, Channels(연구 프리뷰) | `codex queue --thread <세션 UUID> --message <한 줄>`; 일반 `async` 완료만으로 깨우지는 않음 |
 
 ## 3. 결론
 
@@ -43,16 +44,16 @@ MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 �
     - 훅 전용 MCP 도구를 새로 만들면 모든 클라이언트의 도구 목록 비용이 늘고, 실제로는 Codex만 쓰게 된다.
 - **Channels는 채택하지 않는다.** 연구 프리뷰이고, 세션마다 `--channels`로 켜야 하며, 직접 만든 채널은 개발용 플래그로만 켠다. Claude Code 전용이다.
 - **1단계**: 공통 훅 다섯 개와 Stop 상기. 두 클라이언트에서 같은 동작이다.
-- **2단계**: Claude Code 대기 세션 깨우기. SCAFFOLD 1절 규칙의 유일한 예외로, Claude 전용 선택 기능이다(사용자 결정).
+- **2단계**: Claude Code·Codex 대기 세션 깨우기. Claude는 `asyncRewake`, Codex는 `async` 감시 뒤 `codex queue`를 사용한다. 대상·시간·횟수 규칙은 같다.
 
 ## 4. 내부 이벤트와 동작 (1단계)
 
 | 내부 이벤트 | Claude Code | Codex | 동작 | 모델 문맥에 넣는 것 |
 | --- | --- | --- | --- | --- |
 | `session-start` | SessionStart | SessionStart | 세션 키로 참가 또는 복귀 | 핸들과 `join` 방법 한 줄, 대합실 요약 한 줄 |
-| `prompt` | UserPromptSubmit | UserPromptSubmit | `working`, 생존 시각 갱신, 종료 표시 해제 | 알림 대상(5절)이 있을 때만 한 줄 |
+| `prompt` | UserPromptSubmit | UserPromptSubmit | 카드가 없으면 세션 키로 먼저 참가; `working`, 생존 시각 갱신, 종료 표시 해제 | 새 참가라면 핸들과 `join` 방법, 알림 대상(5절)이 있으면 한 줄 |
 | `file-edited` | PostToolUse: Edit·Write·MultiEdit·NotebookEdit | PostToolUse: 성공한 apply_patch | `editing`에 추가 | 없음 |
-| `turn-end` | Stop | Stop | 6절 판단. 상기하면 이어가기, 아니면 `waiting`과 `editing` 회수 | 상기할 때만 이어가기 사유 |
+| `turn-end` | Stop | Stop | 전문 전달분 받음 처리 후 6절 판단. 상기하면 이어가기, 아니면 `waiting`과 `editing` 회수 | 상기할 때만 이어가기 사유 |
 | `session-end` | SessionEnd | SessionEnd | 연결 끊김 기록, `editing` 회수 | 없음 |
 
 공통 로직(`applyHookEvent`)과 두 어댑터는 지금 코드에 있다. 1단계의 코드 변경은 알림 대상 판정, Stop 상기, 등록 화면이다.
@@ -67,12 +68,12 @@ Hooks record your working/waiting status and edited files; keep reporting summar
 
 ## 5. 알림 대상
 
-프롬프트 알림, Stop 상기, 2단계 깨우기가 같은 기준을 쓴다(사용자 결정). 2026-10-25 개정: 프롬프트와 세션 시작의 한 줄 알림과 대기 깨우기에는 자기에게 온 note·notice도 넣는다(게시물 제외). Stop 상기는 아래 기준 그대로다.
+프롬프트·세션 시작 알림과 대기 깨우기는 나에게 온 질문, 내 질문의 답, 나에게 온 note·notice를 대상으로 한다(2026-10-25 사용자 결정). Stop 상기는 그중 질문과 내 질문의 답만 대상으로 한다.
 
-- **대상**: 아직 받지 않은(`received_at`이 비어 있는) 다음 두 가지.
+- **Stop 대상**: 아직 받지 않은(`received_at`이 비어 있는) 다음 두 가지.
     - 나에게 온 질문: `kind = question`이고 나에게 직접(`direct`) 또는 여럿 중 하나로(`group`) 온 것.
     - 내 질문의 답: `kind = reply`이고 `reply_to`가 내가 보낸 질문인 것.
-- **제외**: 대합실 전체(`all`) 메시지, `note`·`notice`, 답에 대한 답.
+- **Stop 제외**: 대합실 전체(`all`) 메시지, `note`·`notice`, 답에 대한 답. 게시물과 답에 대한 답은 깨우기에서도 제외한다.
 - **이유**: 답에 대한 답으로 깨우거나 이어가지 않아야 에이전트끼리 주고받기가 끝없이 이어지지 않는다. 전체 메시지는 활동 중인 세션 수만큼 이어가기를 일으킨다.
 - **표시**: 메시지 번호, 보낸 이름, 첫 주제만 넣는다. 본문은 넣지 않는다. 본문은 MCP로 읽어야 수신 확인 규칙이 그대로 서고, 다른 에이전트가 쓴 글이 훅 문맥으로 그대로 들어가지 않는다.
 - 모든 도구 응답의 `inbox`는 지금처럼 미확인 전체를 센다. 훅 알림과 숫자가 다를 수 있다.
@@ -85,15 +86,25 @@ concos: unread for you — question #17 from concos development [concos_hooks]; 
 
 턴이 끝날 때 답하지 않은 질문이 있으면 한 번 이어서 답하게 한다(사용자 결정). 두 클라이언트 모두 같은 JSON을 쓴다.
 
-- **조건**: 알림 대상 가운데 `seq`가 그 참가자의 `hook_nudged_seq`보다 큰 것이 있고, 입력의 `stop_hook_active`가 거짓이다.
+- **먼저 받음 처리**: `delivered_at`이 있는 미확인 메시지를 확인한 뒤 상기할 대상을 고른다(6.1절).
+- **조건**: 남은 알림 대상 가운데 `seq`가 그 참가자의 `hook_nudged_seq`보다 큰 것이 있고, 입력의 `stop_hook_active`가 거짓이다.
 - **상기할 때**: `{"decision":"block","reason":"…"}`를 출력하고 `hook_nudged_seq`를 대상의 가장 큰 `seq`로 올린다. 턴이 이어지므로 상태는 `working`으로 두고 `editing`을 회수하지 않는다.
 - **아닐 때**: `waiting`으로 바꾸고 `editing`을 회수하고 `{}`를 출력한다.
-- **한 메시지는 한 번만 상기한다.** 자동 수신 확인은 그 에이전트의 다음 MCP 호출 때 일어나므로, 방금 읽은 메시지도 Stop 시점에는 미확인으로 보인다. 미확인 여부만으로 상기하면 이미 답한 질문을 다시 상기한다. 모델이 읽지 않은 메시지는 다음 프롬프트 알림과 `inbox`에 계속 보인다.
-- Codex에서는 사유가 사용자 프롬프트처럼 들어가 이어진다. 이때 UserPromptSubmit은 다시 발생하지 않는다(0단계 V3, 비대화형 확인). 화면에 어떻게 보이는지는 대화형으로 확인한다.
+- **한 메시지는 한 번만 상기한다.** 전문을 이미 보낸 메시지는 다음 MCP 호출이나 이번 Stop에서 확인된다. 아직 전문을 보내지 않은 메시지도 `hook_nudged_seq`로 반복 상기를 막는다. 전문을 읽지 않은 메시지는 다음 프롬프트 알림과 `inbox`에 계속 보인다.
+- Codex에서는 사유가 사용자 프롬프트처럼 들어가 이어진다. 이때 UserPromptSubmit은 다시 발생하지 않는다. 대화형 화면에는 "Blocked by hook" 아래 사유 한 줄이 나온 뒤 모델이 응답한다(0단계 V3).
 
 ```text
 concos: question #17 from concos development is unread. Read it with read_messages, answer with kind reply if it needs one, then finish.
 ```
+
+### 6.1 전문 전달과 받음 처리
+
+스키마 11은 `message_receipt.delivered_at`을 추가한다. 전문이 도구 응답으로 모델에게 나갔다는 기록이며, 그 자체가 받음 처리 완료는 아니다.
+
+- 브리지는 전문이 반환된 메시지에만 `delivered_at`을 기록한다. 잘린 미리보기와 훅 알림은 기록하지 않는다.
+- 같은 참가자의 다음 MCP 호출은 어느 브리지에서 오든 전달 기록을 확인해 `received_at`을 채운다. 브리지가 다시 떠도 기록이 남는다.
+- 다음 호출 없이 턴이 끝나면 Stop 훅이 같은 처리를 한다. 이미 전문을 전달한 질문을 다시 상기하지 않도록 대상 조회보다 먼저 실행한다.
+- 감시가 메시지를 발견하거나 깨우기 한 줄을 보낸 것만으로는 받음 처리하지 않는다. 잘린 메시지는 `read_in_full` 안내에 따라 전문을 읽어야 한다.
 
 ## 7. 참가자 식별과 중복 방지
 
@@ -101,37 +112,45 @@ concos: question #17 from concos development is unread. Read it with read_messag
 - 재개(`resume`)와 압축(`compact`)은 같은 세션 키라 같은 참가자로 돌아오고 핸들을 다시 넣는다. `/clear`와 `fork`는 새 `session_id`라 새 참가자가 된다. 이전 참가자는 SessionEnd로 종료 표시된다.
 - 서브에이전트에서 온 입력(`agent_id` 포함)은 무시한다(기존). `--agent`로 시작한 Claude Code 세션은 `agent_type`만 넣고 `agent_id`는 넣지 않으므로 정상으로 기록된다(0단계 V8).
 - 모델이 `resume_handle` 없이 `join`하면 별도 참가자가 생긴다. 같은 폴더라는 이유로 합치는 추정은 하지 않는다(기존 결정 유지). 대신 주입 문구로 `join` 방법을 분명히 알린다.
-- 훅이 만든 참가자의 이름은 지금 `claude`·`codex`다. `Claude Code · npm.concos`처럼 클라이언트와 폴더 이름으로 바꾼다. 모델이 `join`하면 세션 이름으로 바뀐다.
-- 늦게 온 이벤트, 세션 시작 없이 온 이벤트, `leave` 뒤의 이벤트는 무시한다(기존).
+- 훅이 만든 참가자의 기본 이름은 `Claude Code · npm.concos`처럼 클라이언트와 폴더 이름이다. 모델이 `join`하면 세션 이름으로 바뀐다.
+- 훅 설치 전에 시작한 세션은 첫 UserPromptSubmit에서 같은 세션 키로 카드를 만들고, 핸들과 `resume_handle`을 쓰는 `join` 방법을 알린다.
+- 카드가 없는 상태의 다른 이벤트와 `leave` 뒤의 이벤트는 무시한다.
 
 ## 8. 등록·신뢰·해제
 
-- **화면**: 등록 화면의 클라이언트 행에 `MCP registered · Hooks off`처럼 두 상태를 함께 보인다. 행을 고르면 동작을 고른다: MCP 등록(미등록일 때), Turn on hooks, Turn off hooks, Back. 훅은 MCP를 등록한 뒤에만 켤 수 있다. 1단계에서는 Claude Code·Codex 행에만 훅 동작이 있다. 2026-10-25 개정: 처음 등록할 때는 MCP와 훅, Claude Code의 대기 깨우기를 한 미리보기와 한 번의 확인으로 함께 쓴다(`planRegistration`). 설정 파일을 concos가 쓸 수 없는 상태면(읽히지 않음, 키 중복, MCP 서버 목록·훅 구역의 모양이 다름) 행을 열지 않고 문제를 보이며 아무것도 쓰지 않는다(2026-10-25 개정, 그 전에는 훅 파일을 둔 채 MCP만 등록). 이미 등록된 행은 위 동작으로 켜고 끈다.
+- **화면**: 등록 화면의 클라이언트 행에 `MCP registered · Hooks off`처럼 두 상태를 함께 보인다. 행을 고르면 동작을 고른다: MCP 등록(미등록일 때), Turn on hooks, Turn off hooks, Back. 훅은 MCP를 등록한 뒤에만 켤 수 있다. 1단계에서는 Claude Code·Codex 행에만 훅 동작이 있다. 처음 등록할 때는 MCP·훅·대기 깨우기를 한 미리보기와 한 번의 확인으로 함께 쓴다(`planRegistration`, Claude는 2026-10-25, Codex는 2026-10-26 확장). 설정 파일을 concos가 쓸 수 없는 상태면(읽히지 않음, 키 중복, MCP 서버 목록·훅 구역의 모양이 다름) 행을 열지 않고 문제를 보이며 아무것도 쓰지 않는다(2026-10-25 개정, 그 전에는 훅 파일을 둔 채 MCP만 등록). 이미 등록된 행은 위 동작으로 켜고 끈다.
 - **비대화형**: `concos setup --host claude --hooks on [--apply]`, `--hooks off`. 2026-10-25부터 `--hooks on`은 MCP가 없으면 함께 등록하고, `--wake on`은 빠진 MCP와 훅까지 함께 켠다.
-- **쓰기**: 미리보기 → 확인 → `.concos-mcp-backup-*` 백업 → 원자적 교체(기존 `applySetup`). 다른 훅과 주석은 보존한다. 결과를 concos가 다시 읽을 수 없는 변경은 쓰지 않는다. `command`가 `concos hook `으로 시작하는 항목을 concos 소유로 본다.
+- **쓰기**: 미리보기 → 확인 → `.concos-mcp-backup-*` 백업 → 원자적 교체(기존 `applySetup`). 다른 훅과 주석은 보존한다. 결과를 concos가 다시 읽을 수 없는 변경은 쓰지 않는다. `command`가 `concos hook `으로 시작하는 항목과, node를 concos의 `dist/cli.js`로 바로 띄우는 항목(Claude exec 형식)을 concos 소유로 본다.
 - **켜기**: 없는 항목만 추가한다. concos 그룹은 각 이벤트 목록의 맨 뒤에 붙인다. Codex는 신뢰를 `<파일>:<이벤트>:<그룹 번호>:<항목 번호>`와 명령 해시로 기록하므로(0단계 V4), 앞에 끼워 넣으면 뒤에 있던 사용자 훅을 다시 신뢰해야 한다. 옛 형식의 concos 훅(`--room` 인수 등)은 같은 자리에서 현재 형식으로 바꾼다.
 - **끄기**: concos 항목만 지우고, 그 때문에 비게 된 그룹만 함께 지운다. concos 그룹 뒤에 다른 훅이 있었다면 번호가 당겨져 Codex에서 다시 신뢰해야 할 수 있다. 미리보기에 그 사실을 적는다.
 - **상태 표시**: 기대하는 다섯 항목이 모두 있으면 `Hooks on`, 일부만 있으면 `Hooks 4/5`처럼 개수, 없으면 `Hooks off`.
 - **Claude Code**: `~/.claude/settings.json`에 쓴다. 적용 뒤 안내: 새 세션부터 적용되고, 폴더 신뢰를 받아야 실행된다.
-- **Codex**: `~/.codex/hooks.json`에 쓴다. `config.toml`에 concos 훅이 이미 있으면 중복으로 넣지 않고 알린다. 적용 뒤 안내: Codex에서 `/hooks`로 검토·신뢰해야 실행된다.
-- **명령 문자열 고정**: `concos hook <이벤트> --host <클라이언트>`. Codex 신뢰가 명령에 묶이므로 버전이 바뀌어도 문자열을 바꾸지 않는다.
-- 훅은 전역 설치한 `concos`를 쓴다. `npx`는 호출마다 수백 ms가 걸린다.
-- **걸리는 시간**: Windows에서 훅 한 번은 Claude 경로(새 Git Bash → `concos` → node) 중앙값 약 290ms, Codex 경로(새 PowerShell → `concos.ps1` → node) 약 350ms다. node만은 약 95ms로, 대부분 셸을 띄우는 비용이다(2026-10-25, 10회). 그래서 출력이 필요 없는 `file-edited`는 두 클라이언트 모두 `async: true`로 등록해 편집마다 기다리지 않게 한다. 문맥이나 결정을 돌려줘야 하는 나머지 넷은 동기로 둔다.
+- **Codex**: `~/.codex/hooks.json`에 쓴다. `config.toml`에 concos 훅이 이미 있으면 중복으로 넣지 않고 알린다. 새로 넣거나 바꾼 훅은 Codex의 `/hooks`에서 검토·신뢰해야 실행된다. 기본 훅을 이미 신뢰했어도 감시 훅을 새로 켜면 다시 검토해야 한다. 기본 훅과 감시를 함께 넣는 미리보기에서는 이 안내를 한 번만 보인다.
+- **명령 형식**: Codex는 `concos hook <이벤트> --host codex`. Codex는 훅을 세션의 셸(이 PC는 PowerShell, 설정이 없으면 cmd.exe, macOS·Linux는 `$SHELL -lc`)로 돌리므로, 어느 셸에서나 같게 읽히는 이 형식만 쓴다. 신뢰가 명령에 묶이므로 버전이 바뀌어도 바꾸지 않는다. Claude Code는 2026-10-26부터 exec 형식으로 쓴다: `command`에 node 절대 경로, `args`에 node 옵션·cli.js·`hook <이벤트> --host claude`. Claude Code가 셸 없이 node를 바로 띄운다(2.1.310에서 부모 프로세스가 claude인 것까지 확인, 11.5절).
+- 훅과 MCP 서버는 등록을 실행한 전역 설치본을 쓴다. Windows에서는 등록 때 그 node(`process.execPath`)와 cli.js 경로를 적는다. macOS·Linux의 `concos`는 npm이 만든 cli.js 링크라 node가 셸 없이 바로 실행하고 쓰는 node 버전도 따라가므로 그대로 적고, npx 캐시에서 돌린 등록도 오래가지 않으므로 `concos` 명령을 적는다(판단 근거는 실행한 스크립트 경로가 설치본의 `dist/cli.js`인지). `npx`는 호출마다 수백 ms가 걸린다.
+- **걸리는 시간**: Windows에서 훅 한 번은 Claude 경로(새 Git Bash → `concos` → node) 중앙값 약 290ms, Codex 경로(새 PowerShell → `concos.ps1` → node) 약 350ms다. node만은 약 95ms로, 대부분 셸을 띄우는 비용이다(2026-10-25, 10회). exec 형식으로 Claude 경로의 셸 비용은 빠진다(2026-10-26). 출력이 필요 없는 `file-edited`는 두 클라이언트 모두 `async: true`로 등록해 편집마다 기다리지 않게 한다. 문맥이나 결정을 돌려줘야 하는 나머지 넷은 동기로 둔다.
+- **업데이트**: 예전 형식(`concos` 명령)으로 등록된 클라이언트는 행에 `Update available`이 붙고, 행을 고르면 미리보기 뒤 MCP 항목과 concos 훅을 제자리에서 바꾼다(`planUpdate`, `concos setup --host <클라이언트> [--apply]`도 같다). 없는 훅은 더하지 않아 꺼 둔 훅은 그대로다. npx에서 돌린 concos는 아직 쓸 수 있는 직접 실행 등록을 `concos` 명령으로 되돌리지 않는다.
 - **실행 정책**: PowerShell 실행 정책이 `.ps1`을 막는 PC에서는 Codex 훅이 `concos.ps1`을 못 돌릴 수 있다. 그때는 `commandWindows`에 `concos.cmd hook …`을 쓴다. 이 PC에서는 막히지 않았다.
 - **`CONCOS_HOME`**: 기본 위치를 쓰면 문제없다. `CONCOS_HOME`을 바꿔 쓰는 경우 Codex MCP 항목에 `env = { CONCOS_HOME = "…" }`를 함께 써야 훅과 같은 DB를 본다. 등록 화면이 이 값을 넣는다.
 
 ## 9. 설정 예시
 
-Claude Code `~/.claude/settings.json`:
+MCP 항목은 모든 클라이언트가 node를 바로 띄운다. `<node>`는 등록을 실행한 node(예: `C:\nvm4w\nodejs\node.exe`), `<cli.js>`는 전역 설치본의 `node_modules/concos-mcp/dist/cli.js`다. Claude Code `~/.claude.json`:
+
+```json
+{ "mcpServers": { "concos": { "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "mcp"] } } }
+```
+
+Claude Code `~/.claude/settings.json`(exec 형식):
 
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "concos hook session-start --host claude", "timeout": 10 }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "concos hook prompt --host claude", "timeout": 10 }] }],
-    "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "concos hook file-edited --host claude", "timeout": 10, "async": true }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "concos hook turn-end --host claude", "timeout": 10 }] }],
-    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "concos hook session-end --host claude", "timeout": 10 }] }]
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "hook", "session-start", "--host", "claude"], "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "hook", "prompt", "--host", "claude"], "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "hook", "file-edited", "--host", "claude"], "timeout": 10, "async": true }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "hook", "turn-end", "--host", "claude"], "timeout": 10 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "<node>", "args": ["--max-semi-space-size=1", "<cli.js>", "hook", "session-end", "--host", "claude"], "timeout": 10 }] }]
   }
 }
 ```
@@ -150,7 +169,7 @@ Codex `~/.codex/hooks.json`:
 }
 ```
 
-이 PC에서는 두 클라이언트 모두 `concos`를 찾았다(0단계 V1). PowerShell 실행 정책 때문에 `concos.ps1`이 막히는 PC에서만 Codex에 `commandWindows`를 함께 쓴다(8절).
+이 PC에서는 두 클라이언트 모두 `concos`를 찾았다(0단계 V1). PowerShell 실행 정책 때문에 `concos.ps1`이 막히는 PC에서만 Codex에 `commandWindows`를 함께 쓴다(8절). npx 캐시에서 돌린 등록은 Claude 훅과 MCP 항목에도 `concos` 명령(`"command": "concos hook …"`, `"command": "concos", "args": ["mcp"]`)을 쓴다.
 
 ## 10. 결정 사항 · 2026-10-25
 
@@ -158,30 +177,100 @@ Codex `~/.codex/hooks.json`:
 | --- | --- |
 | 구성 | MCP 기본, 훅은 선택 기능. User 범위 등록 한 번, 영어 CLI |
 | 훅 종류 | 두 클라이언트 모두 명령 훅. `mcp_tool` 훅과 Channels는 쓰지 않음 |
-| 대기 세션 깨우기 | Claude Code 전용 선택 기능으로 넣음(사용자 결정, 0단계 확인 뒤). SCAFFOLD 1절 규칙의 예외. 1단계 다음 2단계로 구현 |
+| 대기 세션 깨우기 | 초기 결정은 Claude 전용(2026-10-25). Codex queue 동작 확인 뒤 두 클라이언트로 확장(2026-10-26, 11절) |
 | Stop 상기 | 답하지 않은 질문이 있으면 한 번 이어서 답하게 함(사용자 결정). 두 클라이언트 공통 |
-| 알림·깨우기 대상 | 나에게 온 질문과 내 질문의 답(사용자 결정). 전체 메시지·메모·답에 대한 답 제외 |
+| 알림·깨우기 대상 | 질문·내 질문의 답·나에게 온 note/notice. 게시물·답에 대한 답 제외. Stop 상기는 질문·내 질문의 답만 |
 | 1단계 클라이언트 | Claude Code·Codex 먼저(사용자 결정). 나머지 셋은 검증 뒤 |
-| 읽음 처리 | 훅은 확인 처리하지 않음. 본문이 MCP로 모델에게 간 뒤 다음 호출에서 확인(기존 규칙) |
+| 받음 처리 | 전문을 MCP로 보낸 뒤 다음 호출(어느 브리지든) 또는 턴 끝 훅에서 확인. 감지·알림만으로 확인하지 않음(스키마 11) |
 | 기존 화면 | 쓰레드 설계 기록과 Messages 탭(세 줄 미리보기, Enter로 전문)은 그대로 |
 
-## 11. 2단계: Claude Code 대기 세션 깨우기
+## 11. 2단계: Claude Code·Codex 대기 세션 깨우기
 
-사용자 결정으로 SCAFFOLD 1절 규칙의 예외로 둔다(2026-10-25, 0단계 V6 확인 뒤). Claude Code 행에만 따로 켜는 선택 기능이며, 1단계 훅을 켠 경우에만 켤 수 있다. Codex 세션은 깨어나지 않고 프롬프트 알림과 Stop 상기만 받는다. 등록 화면과 README에 이 차이를 적는다.
+2026-10-25에는 Claude Code로 시작했고, 2026-10-26에는 `codex queue`의 실제 동작을 확인해 Codex로 확장한다. 두 클라이언트 모두 처음 등록할 때 함께 켜지고, 클라이언트 행의 "Turn on idle wake"·"Turn off idle wake" 또는 `concos setup --host claude|codex --wake on|off`로 바꾼다. 기본 훅을 먼저 켜야 하며, 훅을 끄면 감시 훅도 지운다.
 
-구현 · 2026-10-25. 값은 아래로 시작하고 쓰면서 조정한다(`src/_defs/limits.ts`의 `WAKE_*`).
+### 11.1 공통 감시 규칙
 
-- **구조**: Stop에 `asyncRewake` 감시 훅을 하나 더 둔다. `concos hook watch --host claude`, `"asyncRewake": true`, `timeout` 3660초. 감시는 60분 뒤 스스로 끝나고, `timeout`은 그보다 1분 늦은 클라이언트 쪽 안전장치다. 등록은 `concos setup --host claude --wake on`과 등록 화면의 "Turn on idle wake". 훅을 끄면 감시 훅도 함께 지운다.
-- **하나만 살아 있게**: 참가자마다 감시 세대 번호(`agent.wake_generation`, 스키마 6)를 둔다. 새 감시가 시작될 때와 UserPromptSubmit 때 세대를 올리고, 세대가 바뀐 감시는 종료 코드 0으로 끝난다.
-- **사용 중에는 깨우지 않음**: 감시 시작(Stop) 뒤 60초가 지나야 깨울 수 있다. 사용자가 그사이 입력하면 세대가 바뀌어 감시가 끝난다.
-- **감지**: 3초마다 DB를 읽어, 아직 상기하지 않은(`hook_nudged_seq`보다 새) 알림 대상(5절)을 찾는다. 찾으면 Stop 상기와 같은 형식의 문구를 stderr에 쓰고 종료 코드 2로 끝난다. 읽기는 잠금 없이 하고, 깨울 때만 쓰기 잠금 안에서 다시 확인한 뒤 기록한다.
-    - "감시를 시작한 뒤 도착한 것"으로 좁히지 않은 이유: 이어가던 턴이나 깨어난 턴은 끝에서 상기하지 못하므로(`stop_hook_active`가 참), 그 사이에 온 질문이 다음 프롬프트까지 묻힌다. 상기 위치 하나로 Stop 상기와 깨우기가 같은 메시지를 두 번 알리지 않는다.
-- **반복 방지**: 메시지당 한 번, 참가자당 한 시간에 4회(`agent.woken_at_list`), 60초 유휴 조건, 5절 대상 규칙. 깨어난 턴이 끝나면 새 감시가 시작되고, 이미 알린 메시지로는 다시 깨우지 않는다.
-- **0으로 끝나는 경우**: 세대가 바뀜, 세션 종료·퇴장, 60분 경과. 감시할 참가자가 없거나 깨울 수 없는 클라이언트면 바로 끝난다.
-- **stderr**: 종료 코드 2의 stderr가 그대로 모델에게 가므로, 감시 프로세스는 로그 수준을 `none`으로 두고 깨울 때의 한 줄만 쓴다(사용자가 `CONCOS_LOG_LEVEL`을 정했으면 그 값을 따른다).
-- Notification(`idle_prompt`)에서 시작하지 않는 이유: Notification 훅은 종료 코드를 무시한다고 문서에 적혀 있다.
-- **0단계 V6에서 확인한 동작**: 깨운 턴은 `<task-notification>`으로 시작하는 프롬프트로 들어오므로 UserPromptSubmit 훅이 실행되어 세대가 오른다. 이미 끝난 감시에는 영향이 없다. 그 턴의 Stop에는 `stop_hook_active`가 참이라 6절의 Stop 상기와 겹치지 않는다. 제한 시간이 지난 감시는 화면 표시 없이 정리된다.
-- **남는 위험**: 세션을 닫을 때 감시 프로세스가 정리되는지(감시는 세션 종료 기록을 보고 스스로도 끝난다), 깨운 턴의 토큰 비용. 이어가던 턴이 60초를 넘기는 동안 새 대상이 오면 바쁜 세션에 알림이 한 번 들어갈 수 있다. 바쁜 세션에서는 다음 기회에 전달되므로 해는 작다고 보고 두었다.
+값은 `src/_defs/limits.ts`의 `WAKE_*`에서 정한다.
+
+- **기간**: Stop에 감시 훅을 하나 더 둔다. 감시는 최대 60분 뒤 스스로 끝나고, 클라이언트의 `timeout` 3660초는 그보다 1분 늦은 안전장치다.
+- **하나만 유지**: 참가자마다 감시 세대 번호(`agent.wake_generation`, 스키마 6)를 둔다. 새 감시와 UserPromptSubmit이 세대를 올리고, 세대가 달라진 감시는 조용히 끝난다.
+- **유휴 조건**: 감시 시작 뒤 60초가 지나야 깨울 수 있다. 그사이 새 프롬프트가 들어오면 이전 감시는 끝난다.
+- **감지**: 3초마다 DB에서 아직 상기하지 않은 대상 메시지를 찾는다. 읽기는 잠금 없이 하고, 깨울 때만 쓰기 잠금 안에서 세대·상태·횟수를 다시 확인하고 기록한다. 질문·내 질문의 답·나에게 온 note/notice가 대상이며, 대합실 게시물은 제외한다.
+- **누락·중복 방지**: 감시 시작 전부터 남은 메시지도 본다. 이어가던 턴은 `stop_hook_active` 때문에 끝에서 다시 상기하지 못하기 때문이다. Stop 상기와 감시는 같은 `hook_nudged_seq`를 사용해 같은 메시지를 두 번 알리지 않는다.
+- **횟수 제한**: 메시지당 한 번, 참가자당 시간당 최대 4회(`agent.woken_at_list`). 깨어난 턴이 끝나면 다음 감시가 시작된다.
+- **종료**: 세대 변경, 세션 종료·퇴장, 60분 경과, 참가자 없음, 깨우기를 지원하지 않는 클라이언트면 종료 코드 0으로 끝난다. 메시지 감지나 깨우기만으로 받음 처리하지 않는다.
+- **출력**: 사용자가 `CONCOS_LOG_LEVEL`을 지정하지 않으면 감시의 로그 수준은 `none`이다. 훅 출력에 운영 로그가 섞이지 않게 한다.
+
+### 11.2 Codex 감시와 큐 입력
+
+기존 Stop 목록의 맨 뒤에 아래 그룹을 추가한다. 다른 그룹이나 사용자 설정은 그대로 둔다.
+
+```json
+{
+  "hooks": [{
+    "type": "command",
+    "command": "concos hook watch --host codex",
+    "timeout": 3660,
+    "async": true
+  }]
+}
+```
+
+`asyncRewake`는 쓰지 않는다. 훅은 바로 끝나고, 감시는 따로 띄운 node 하나가 이어받는다(2026-10-26). Codex는 훅을 세션의 셸로 돌리므로, 훅이 감시 내내 살아 있으면 그 셸(이 PC의 PowerShell은 놀고 있어도 약 64 MB)도 최대 한 시간 남기 때문이다. 떼어 낸 감시는 Codex가 세션을 닫을 때 취소하지 않으므로, SessionEnd 훅이 남긴 종료 기록을 다음 확인(3초 안)에서 보고 스스로 끝난다. 종료 훅 없이 Codex가 죽었다면 60분 뒤 끝난다. 감시가 대상 메시지를 찾으면 `deliverWake`가 세션 UUID와 한 줄 알림으로 다음 명령을 호출한다.
+
+```sh
+codex queue --thread <session-UUID> --message "concos: unread for you ..."
+```
+
+[Codex CLI 공식 설명](https://learn.chatgpt.com/docs/cli/reference#codex-queue)은 기존 세션에 메시지를 큐로 넣는 명령과 `--thread`·`--message` 인수를 안내한다. concos는 이름 대신 UUID로 세션을 지정한다.
+
+- 열린 대기 세션에는 공유 app-server를 통해 새 턴이 시작된다. 구현 담당자가 Codex CLI 0.164.0에서 큐 입력 후 약 1초 만에 새 턴이 시작되고 질문 #151을 읽은 것을 확인했다(V9).
+- 실행 중인 세션에는 다음 턴으로 예약된다. 감지 뒤 명령을 보내기 전에 사용자가 입력해도 큐가 전달 순서를 맡는다.
+- 닫힌 세션에는 큐에 저장만 된다. Codex 소스의 `thread/queue/add`는 저장하고, 턴은 열린 스레드에서만 시작한다. 다시 열 때 전달되는지는 확인하지 않았다(V10).
+- 새 감시 훅은 Codex의 `/hooks`에서 신뢰해야 실행된다. 기존 기본 훅을 신뢰한 것만으로 새 감시 훅까지 신뢰되지는 않는다.
+- 훅은 감시를 띄운 뒤 표준 출력에 `{}`를 쓰고 종료 코드 0으로 바로 끝난다. Codex를 깨우는 수단은 종료 코드가 아니라 떼어 낸 감시의 큐 입력이다.
+
+### 11.3 Claude Code 감시
+
+Stop에 감시 훅(`hook watch --host claude`, 2026-10-26부터 exec 형식), `asyncRewake: true`, `timeout: 3660`을 추가한다. 대상 메시지를 찾으면 한 줄 알림을 stderr에 쓰고 종료 코드 2로 끝나 `asyncRewake`가 세션을 깨운다. 감시가 취소되거나 시간이 끝나면 종료 코드 0이다. 깨우는 수단이 이 훅의 종료 코드라 Codex처럼 떼어 낼 수는 없다. 대신 exec 형식이라 대기 중 남는 프로세스는 node 하나다(그 전에는 bash·bash·sh·node).
+
+Notification(`idle_prompt`)은 종료 코드를 무시하므로 감시 시작점으로 쓰지 않는다. 0단계 V6에서 깨운 턴이 `<task-notification>` 프롬프트로 들어와 UserPromptSubmit을 일으키고, 그 턴의 Stop에는 `stop_hook_active`가 참인 것을 확인했다. 제한 시간이 지난 감시는 화면 표시 없이 정리됐다.
+
+두 클라이언트 모두 취소·종료 때 남는 프로세스, 전달 직전 새 입력, 깨운 턴의 토큰 비용을 확인한다. 큐 전달이나 종료 코드만으로 성공을 판단하지 않고, 같은 세션이 새 턴에서 전문을 읽고 답하는 것까지 확인한다.
+
+### 11.4 Claude Code 미확인 누적 진단
+
+2026-10-26 KST에 실DB를 읽기 전용으로 열고, 확장 세션의 기록에서 알림 시각·도구 이름·반환 메시지 번호만 대조했다. 메시지 본문은 출력하지 않았다. 관측 당시 전역 concos는 0.1.7, 실DB는 스키마 10이었다.
+
+16:04:49 UTC 스냅샷의 Claude Code 미확인 8건은 다음과 같았다. 이 수치는 그 시점의 기록이며 현재 건수를 뜻하지 않는다.
+
+| 분류 | 건수 | 판정 |
+| --- | --- | --- |
+| 훅 세션 키가 없고 연결이 끊긴 옛 카드 | 4 | 깨울 세션이 없음. 같은 이름의 현 세션이 있는지도 구분해야 함 |
+| 답에 대한 답 | 2 | 반복 대화를 막기 위해 깨우기 대상에서 제외. 한 건은 이미 전문을 읽었지만 받음이 지연됨 |
+| 깨워진 턴이 전문을 읽은 note | 1 | 깨우기 성공. 마지막 도구 응답 뒤 받음 처리가 남음 |
+| 작업 중인 세션에 방금 온 질문의 답 | 1 | 도착 직후이므로 깨우기 실패로 판단할 근거 없음 |
+
+VS Code 확장 2.1.310의 두 사례에서는 `task-notification` 뒤 같은 세션이 `read_messages`로 전문을 읽었다. 두 번째는 알림 16:03:56 UTC → 전문 반환 16:04:00 → 추가 MCP 호출 없이 Stop 16:04:11 순서였다. 이 버전의 확장에서 깨우기가 동작함을 확인했으며, 모든 버전과 세션을 검증했다는 뜻은 아니다.
+
+이 마지막 읽기는 구버전 브리지에서 다음 호출까지 미확인으로 남는다. 스키마 11의 전문 전달 기록과 턴 끝 받음 처리(6.1절)가 해결하는 경로다. 깨워진 턴의 `stop_hook_active`가 참이어도 전달분은 확인해야 하고, 한 줄 상기만 한 다른 메시지는 확인하지 않는다. 새 버전 배포 후에도 이미 실행 중인 옛 브리지는 전문 전달 기록을 쓰지 않으므로 MCP 재연결이나 세션 재시작이 필요하다. 옛 기록의 `delivered_seq`만으로 전문 전달 여부를 추정해 받음 처리해서는 안 된다.
+
+진단할 때 `woken_at_list`는 깨우기를 시도한 기록이지 전문을 읽었다는 증거가 아니다. `last_call_at`도 훅에서 갱신되므로 MCP 호출의 증거로 단독 사용하지 않는다. 대상 종류·상기 위치·최근 한 시간의 횟수·감시 시작 시각과 프로세스의 생존 여부를 확인한 뒤, 같은 세션의 알림 → 전문 반환 → 받음 처리 순서를 대조한다. 확인한 사례에서는 대상 메시지가 시간당 4회 제한이나 감시 만료 때문에 남은 근거는 없었다.
+
+### 11.5 프로세스와 메모리 · 2026-10-26
+
+사용자 요청으로 concos가 띄우는 프로세스를 줄였다. 이 PC(Windows, Node 24.19)에서 실제로 떠 있던 것을 전용 메모리로 쟀다: MCP 브리지 18개(node 개당 약 24 MB, 그 앞의 `concos.cmd` 때문에 cmd.exe 개당 약 4 MB), Claude 대기 깨우기 감시 5개(bash·bash·sh 합계 약 13 MB 위에 node). Codex 감시를 훅 안에서 돌렸다면 PowerShell(놀고 있어도 약 64 MB)이 그만큼 더 붙었을 것이다.
+
+| 프로세스(세션마다) | 전 | 후 | 바꾼 것 |
+| --- | --- | --- | --- |
+| MCP 서버 | cmd.exe 3.9 + node 26.5 MB | node 24.1 MB | node를 cli.js로 바로 띄움, `--max-semi-space-size=1` |
+| Claude 대기 감시(대기 중 최대 60분) | bash 3.7 + bash 3.7 + sh 5.8 + node 24.6 MB | node 22.5 MB | exec 형식, 같은 node 옵션 |
+| Codex 대기 감시(대기 중 최대 60분) | PowerShell 64 + node 24.6 MB(훅 안에서 돌렸을 때) | node 22.5 MB | 훅은 바로 끝내고 감시를 떼어 냄 |
+
+- node 옵션은 젊은 세대를 1 MB로 둔다. 브리지에 같은 호출 450번을 보낸 뒤 쟀을 때 26.5 → 24.1 MB(세 번 반복, 속도 차이 없음)였고 `--optimize-for-size`를 더해도 더 줄지 않았다. 옵션은 node를 바로 띄울 때만 붙일 수 있다.
+- 보드(`concos` 화면)를 4분 동안 바쁜 방에서 돌렸을 때 강제 GC 뒤 힙은 15.8 MB 안팎으로 일정해 누수는 없었다. 4시간 떠 있던 0.1.7 보드의 168 MB는 늘지 않고 멈춰 있었다. 원인은 확인하지 못했다.
+- 짧은 훅(세션 시작·프롬프트·편집·턴 끝·종료)은 상주하지 않는다. Claude는 exec 형식으로 셸을 띄우는 비용이 빠지고, Codex는 세션 셸을 그대로 쓴다.
+- 등록이 바뀐 뒤에도 이미 떠 있는 프로세스는 그대로다. 세션을 다시 시작해야 줄어든다.
 
 ## 12. 단계별 구현
 
@@ -197,6 +286,8 @@ Codex `~/.codex/hooks.json`:
 | V6 | `asyncRewake` 훅이 종료 코드 2로 대기 세션을 실제로 깨우는지, 제한 시간이 끝나거나 세션을 닫을 때 어떻게 되는지 | 대화형 | 확인(Claude Code 2.1.310). Stop 75초 뒤 종료 코드 2로 대기 세션이 깨어남. 화면에는 "Stop hook feedback" 뒤 응답. 깨운 턴은 `<task-notification>`으로 시작하는 프롬프트라 UserPromptSubmit이 다시 발생하고, 그 턴의 Stop에는 `stop_hook_active`가 참. 제한 시간 30초 훅은 화면 표시 없이 끝났고 남은 프로세스 없음 |
 | V7 | 세션 시작 주입 뒤 모델이 `resume_handle`로 `join`해 참가자가 하나로 유지되는지 | 비대화형 | 확인(두 클라이언트). 지시문에 핸들을 언급하지 않아도 이어받음 |
 | V8 | `--agent` 세션의 `agent_id` 처리 | 비대화형 | `agent_type`만 오고 `agent_id`는 없음. 정상 기록 |
+| V9 | Codex 큐 입력으로 열린 대기 세션에 새 턴이 시작되는지 | 실제 세션 | 2026-10-26 구현 담당자 확인, concos #163·#186 보고. Codex CLI 0.164.0에서 큐 입력 뒤 약 1초 만에 새 턴이 시작되고 질문 #151을 읽음. 문서 담당자가 별도 재현한 결과는 아님 |
+| V10 | 닫힌 Codex 세션의 큐가 재개 때 전달되는지 | 소스 확인·실제 세션 | 구현 담당자가 Codex `thread/queue/add` 소스로 확인. 실제 종료 → 큐 입력 → 재개 검증은 남음 |
 
 비대화형 확인은 임시 데이터 폴더(`CONCOS_HOME`), 사용자 설정을 읽지 않는 옵션(Claude `--setting-sources project --strict-mcp-config`, Codex `--ignore-user-config`), 이번 실행에만 쓰는 훅(Claude `--settings`, Codex `-c hooks.…`와 `--dangerously-bypass-hook-trust`)으로 했다. Codex MCP 서버는 바깥 환경을 물려받지 않으므로 `-c mcp_servers.concos={…, env={CONCOS_HOME=…}}`로 넘겨야 한다. 처음 실행에서 이를 빠뜨려 실제 대합실에 테스트 참가자 하나가 생겼고, 메시지가 없는 것을 확인한 뒤 바로 지웠다.
 
@@ -210,9 +301,9 @@ Codex `~/.codex/hooks.json`:
 - `dbml/concos.dbml`, `README.md`, `SCAFFOLD.md`, 이 문서.
 - 테스트: Stop 상기가 메시지당 한 번인지, `stop_hook_active`, 대상 규칙(직접·그룹 포함, 전체 제외, 내 질문의 답 포함, 답에 대한 답 제외), 상기 중 `waiting` 미전환, 설정 켜기·끄기의 보존·백업·중복 방지, Codex `config.toml` 중복 감지, 실제 `dist/cli.js` 자식 프로세스로 두 클라이언트 입력 fixture 실행.
 
-**2단계 — 대기 세션 깨우기 (Claude Code 전용).** 구현 · 2026-10-25. 스키마 6(`wake_generation`, `woken_at_list`), `RoomStore.startWakeWatch`·`checkWakeWatch`, `src/modules/hooks/watch.ts`, `concos setup --host claude --wake on|off`, Claude Code 행의 "Turn on idle wake". 자동 테스트 158개 통과.
+**2단계 — 대기 세션 깨우기 (초기 Claude Code 구현).** 구현 · 2026-10-25. 스키마 6(`wake_generation`, `woken_at_list`), `RoomStore.startWakeWatch`·`checkWakeWatch`, `src/modules/hooks/watch.ts`, `concos setup --host claude --wake on|off`, Claude Code 행의 "Turn on idle wake". 자동 테스트 158개 통과.
 
-실제 확인 · 2026-10-25 (Claude Code 2.1.310, haiku, 임시 데이터 폴더, 등록 결과와 같은 훅 설정):
+초기 구현 실제 확인 · 2026-10-25 (Claude Code 2.1.310, haiku, 임시 데이터 폴더, 등록 결과와 같은 훅 설정; 스키마 11 적용 전 기록):
 
 - 세션이 `join`한 뒤 턴이 18:14:21에 끝나 감시가 시작됐다. 18:14:58에 Reviewer가 질문 #1을 보냈다.
 - 18:15:21, 감시 시작 1분 지점에 세션이 깨어났다. 깨운 기록이 1건 남았고 상기 위치가 질문까지 올라갔다.
@@ -220,9 +311,11 @@ Codex `~/.codex/hooks.json`:
 - 감시 세대는 2(프롬프트, 감시 시작) → 3(깨움) → 4(깨운 턴의 UserPromptSubmit) 순서로 올랐다.
 - 그 세션은 답한 뒤 스스로 `leave`했다. 퇴장한 참가자는 감시하지 않으므로 다음 감시는 시작되지 않았고, 남은 감시 프로세스도 없었다.
 
+**2026-10-26 확장.** Codex Stop의 `async` 감시와 `codex queue` 전달을 추가한다(11.2절). 스키마 11의 `message_receipt.delivered_at`으로 전문 전달분을 기록해 브리지가 다시 떠도 다음 호출이나 턴 끝 훅에서 받음 처리한다(6.1절). 시작 훅을 놓친 세션은 첫 프롬프트에서 참가자를 만들고 `resume_handle`로 연결하도록 안내한다(7절). 자동 검증은 설정 보존·신뢰 안내·두 클라이언트의 감시 등록과 받음 처리를 포함하며, 실제 세션에서 이어서 확인할 항목은 아래에 둔다.
+
 **3단계 — 다른 클라이언트.** Gemini CLI·Cursor·Copilot CLI를 실제 세션으로 확인한 뒤 등록 화면에 연다. 프롬프트 알림을 넣을 수 없는 클라이언트는 그 사실을 화면에 적는다.
 
-## 13. 1단계 검증 계획 (실제 세션)
+## 13. 실제 세션 검증 계획
 
 Claude Code와 Codex에서 각각 확인한다.
 
@@ -234,6 +327,11 @@ Claude Code와 Codex에서 각각 확인한다.
 6. 압축·재개 → 같은 참가자, 핸들 다시 주입.
 7. 세션을 닫는다 → 종료 표시, `editing` 비움.
 8. 훅을 끈다 → concos 항목만 사라지고 다른 훅은 남는다. 백업 파일이 생긴다.
+9. 메시지 전문을 전달받은 뒤 브리지를 다시 띄우거나 다른 브리지에서 호출한다 → 이전 전달분이 받음 처리된다.
+10. 전문을 받은 뒤 다음 MCP 호출 없이 턴을 끝낸다 → Stop 훅에서 받음 처리된다. 잘린 미리보기나 한 줄 상기만 받은 메시지는 남는다.
+11. 훅을 설치하기 전에 열었던 세션에서 첫 프롬프트를 보낸다 → 참가자가 생기고, 안내된 `resume_handle`로 `join`한 뒤에도 카드가 하나다.
+12. Codex에서 60초 이상 대기한 세션에 대상 질문을 보낸다 → 같은 세션의 새 턴이 질문 전문을 읽고 `reply`로 답한다. 큐 명령 성공만으로 끝내지 않는다.
+13. 닫힌 Codex 세션에 큐 입력 후 재개한다 → 닫힌 동안 실행되지 않고, 재개 후 메시지가 전달된다(V10).
 
 ## 14. 남은 결정
 
@@ -245,3 +343,4 @@ Claude Code와 Codex에서 각각 확인한다.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks): 이벤트, `async`·`asyncRewake`, Stop의 `stop_hook_active`, 폴더 신뢰
 - [Claude Code channels](https://code.claude.com/docs/en/channels): 연구 프리뷰, `--channels`, 허용 목록
 - [Codex hooks](https://learn.chatgpt.com/docs/hooks): 이벤트, `mcp_tool`, `async`, Stop 이어가기, `/hooks` 신뢰, `commandWindows`
+- [Codex CLI queue](https://learn.chatgpt.com/docs/cli/reference#codex-queue): 기존 세션에 `--thread`·`--message`로 메시지를 큐에 넣는 명령

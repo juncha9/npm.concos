@@ -14,7 +14,7 @@ export interface WakeTimings {
 export const WAKE_TIMINGS: WakeTimings = { idleMs: WAKE_IDLE_MS, pollMs: WAKE_POLL_MS, watchMs: WAKE_WATCH_MS };
 
 /**
- * Claude Code idle wake: watches a session that just ended its turn. Resolves with the wake
+ * Idle wake: watches a session that just ended its turn. Resolves with the wake
  * message once a message for it is waiting after the quiet time, or with null when a newer
  * watch or a prompt replaces this one, the session ends, or the watch's time runs out.
  */

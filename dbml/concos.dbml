@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 10 · first required by concos 0.1.4. Every table is a record, not a cache.
+// Schema version 11 · first required by concos 0.1.10. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, last_message_id (schema 9; message numbers are never given twice), created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
@@ -38,7 +38,7 @@ Table agent {
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
   delivered_seq integer [not null, default: 0, note: 'position delivered by the last check_in']
   hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake has pointed out; each message is pointed out once']
-  wake_generation integer [not null, default: 0, note: 'Claude Code idle wake: the live watch; a newer watch or a prompt raises it and ends older ones']
+  wake_generation integer [not null, default: 0, note: 'idle wake (Claude Code, Codex): the live watch; a newer watch or a prompt raises it and ends older ones']
   woken_at_list varchar [not null, default: '[]', note: 'JSON array of ISO times this session was woken, for the hourly limit']
   joined_at varchar [not null]
   updated_at varchar [not null, note: 'last card or checkpoint change, not liveness']
@@ -97,7 +97,8 @@ Table message {
 Table message_receipt {
   message_id integer [not null, ref: > message.id]
   agent_id varchar [not null, ref: > agent.id]
-  received_at varchar [note: 'null until acknowledged: on the next call after the full text reached the agent, through check_in received_message_ids, or when a person opens it on the board']
+  received_at varchar [note: 'null until acknowledged: once the full text reached the agent (delivered_at), at its next call through any MCP server or when its turn ends; through check_in received_message_ids; or when a person opens it on the board']
+  delivered_at varchar [note: 'schema 11: when the full text last went out to the agent in a tool result; kept in the database so an MCP server that restarted before the next call still counts it']
 
   indexes {
     (message_id, agent_id) [pk]
