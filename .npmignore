@@ -19,9 +19,9 @@ node_modules/
 tsconfig*.json
 tsup.config.ts
 vitest.config.ts
-scripts/
-db/
-docs/
+[Ss]cripts/
+[Dd]b/
+[Dd]ocs/
 README_DEV.md
 DESIGN.md
 SCAFFOLD.md
