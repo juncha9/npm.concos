@@ -524,7 +524,7 @@ function addWake(change: SetupChange, input: SetupTarget): void {
     }
     setJson(change, ["hooks", item.event, groups.length], item.group, true);
     change.notes.push(
-        `A waiting Claude Code session wakes by itself when a question for it, or an answer to its question, arrives: `
+        `A waiting Claude Code session wakes by itself when a question, an answer to its question, or a note or notice addressed to it arrives: `
         + `after ${WAKE_IDLE_MS / 1000} seconds without input, at most ${WAKE_HOURLY_LIMIT} times an hour, `
         + `for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn. Codex sessions do not wake.`,
     );
@@ -587,6 +587,24 @@ function replaceSettings(file: string, before: string | null, after: string, rep
     finally { fs.rmSync(temporary, { force: true }); }
 }
 
+/**
+ * Copies a settings file to `<file>.concos-mcp-backup-<UTC time>`, the time format of the
+ * database backups, so the newest sorts last; `-2`, `-3`, … follow when that name is taken.
+ * The copy never overwrites an existing file.
+ */
+function backupSettings(file: string, stamp: string): void {
+    for(let attempt = 1; ; attempt += 1) {
+        const target = `${file}.concos-mcp-backup-${stamp}${attempt == 1 ? "" : `-${attempt}`}`;
+        try {
+            fs.copyFileSync(file, target, fs.constants.COPYFILE_EXCL);
+            return;
+        }
+        catch(ex) {
+            if((ex as NodeJS.ErrnoException).code != "EEXIST") throw ex;
+        }
+    }
+}
+
 /** Never writes a settings file that concos itself could not read back. */
 function verifyReadable(change: SetupChange): void {
     if(change.path.endsWith(".toml")) {
@@ -603,12 +621,14 @@ export function applySetup(changes: SetupChange[]): void {
         verifyUnchanged(change.path, change.before);
         verifyReadable(change);
     }
+    // one time for every file this change touches, so its backups read as one set
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const applied: SetupChange[] = [];
     try {
         for(const change of changes) {
             verifyUnchanged(change.path, change.before);
             fs.mkdirSync(path.dirname(change.path), { recursive: true });
-            if(change.before != null) fs.copyFileSync(change.path, `${change.path}.concos-mcp-backup-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
+            if(change.before != null) backupSettings(change.path, stamp);
             replaceSettings(change.path, change.before, change.after, () => applied.push(change));
         }
     }

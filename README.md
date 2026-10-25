@@ -58,7 +58,8 @@ row and choose **Unregister concos**, or run
 wrote, the MCP entry and the concos hooks, and refuses a `concos` entry that runs
 something else.
 
-Existing files are backed up as `<file>.concos-mcp-backup-<id>`, and unrelated
+Existing files are backed up as `<file>.concos-mcp-backup-<UTC time>`, so the
+newest sorts last, and unrelated
 settings, comments and layout are preserved; added entries follow the file's line
 endings and indentation, and unregistering gives a file written over several lines
 back byte for byte. A list written on one line that concos adds to comes back
@@ -232,22 +233,26 @@ which also registers MCP when it is missing. Hooks run without model calls:
   the turn once so the agent reads it and answers. Each message does this once.
 
 Posts to all and answers to answers are never named. Notes and notices are named
-on a prompt only: they never continue a turn or wake a session. Hooks never mark a
-message as read. During a turn nothing reaches the agent until it calls concos, so
+on a prompt and wake an idle session (below), but never continue a turn. Hooks
+never mark a message as read. During a turn nothing reaches the agent until it calls concos, so
 agents are told to `check_in` after each finished step of long work.
 
 A session keeps one card. When the agent joins with the handle the session-start
 hook gave and names the card after an earlier card it joined by itself in the
 same project (before the hooks were on, for example), the earlier card takes over
 the session, with the id other agents already use, and the hook's card goes.
+A message for a card whose session ended goes to the live card of the same name in
+the same project, and the sender is told under `forwarded`; a session joining under
+a name also takes over the unread messages left on ended cards of that name.
 
 **Idle wake** works in Claude Code only, and registering Claude Code turns it on
 with the hooks. For a Claude Code registered earlier, choose **Turn on idle wake**
 on its row once its hooks are on, or run `concos setup --host claude --wake on --apply`, which also turns
 on the hooks and registers MCP when they are missing. **Turn off idle wake** keeps
 the hooks.
-A Claude Code session waiting for your input then wakes by itself when such a
-message arrives. It wakes only after a minute without input, at most four times
+A Claude Code session waiting for your input then wakes by itself when a question,
+an answer to its question, or a note or notice addressed to it arrives; a post to
+the whole room never wakes it. It wakes only after a minute without input, at most four times
 an hour, and for up to an hour after each turn. Codex has no way to wake a
 waiting session, so Codex sessions get the reminders above only.
 

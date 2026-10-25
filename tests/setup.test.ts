@@ -415,6 +415,29 @@ describe("unregistering", () => {
         expect(read(".codex/config.toml")).toBe(inline);
     });
 
+    it("names backups by time so the newest sorts last, and never overwrites one taken in the same millisecond", () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-10-25T06:30:00.123Z"));
+        try {
+            const original = '{"theme": "dark"}\n';
+            write(".gemini/settings.json", original);
+            const gemini = { host: "gemini", home: directory };
+            applySetup(planSetup(gemini));
+            const registered = read(".gemini/settings.json");
+            applySetup(planUnregister(gemini));
+            const backups = fs.readdirSync(path.join(directory, ".gemini")).filter((name) => name.includes(".concos-mcp-backup-")).sort();
+            expect(backups).toEqual([
+                "settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z",
+                "settings.json.concos-mcp-backup-2026-10-25T06-30-00-123Z-2",
+            ]);
+            expect(read(`.gemini/${backups[0]}`)).toBe(original);
+            expect(read(`.gemini/${backups[1]}`)).toBe(registered);
+        }
+        finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("still takes out the MCP entry when the hooks file cannot be edited safely, and leaves that file alone", () => {
         const claude = { host: "claude", home: directory };
         applySetup(planSetup(claude));

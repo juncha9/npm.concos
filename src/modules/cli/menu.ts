@@ -80,7 +80,7 @@ async function editHooks(prompter: Prompter, draft: SetupDraft): Promise<void> {
         + "They record this client's working and waiting status and edited files,\n"
         + "and at the end of a turn remind the agent once about unread questions sent to it.\n");
     if(canWake) {
-        prompter.write("Idle wake, for Claude Code only, wakes a waiting session by itself when a question for it arrives.\n");
+        prompter.write("Idle wake, for Claude Code only, wakes a waiting session by itself when a message addressed to it arrives.\n");
     }
     const items: SelectItem<"on" | "off" | "wake-on" | "wake-off" | "remove" | "back">[] = [];
     if(hooks.state != "on") {

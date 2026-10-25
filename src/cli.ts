@@ -17,7 +17,7 @@ Usage
   concos setup --host claude|codex --hooks on|off [--apply]
                                             Hooks: status, edited files, message reminders
   concos setup --host claude --wake on|off [--apply]
-                                            Claude Code only: wake a waiting session for a question
+                                            Claude Code only: wake a waiting session for a message to it
   concos setup --host <client> --remove [--apply]
                                             Unregister: remove the concos MCP entry and hooks only
   concos mcp                                Run the MCP bridge over stdio

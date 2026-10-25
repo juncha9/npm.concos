@@ -59,12 +59,34 @@ function writeMetaValue(database: DatabaseSync, key: string, value: string): voi
 /** A temporary backup copy this old is not being written any more: its process died mid-backup. */
 const STALE_TEMPORARY_BACKUP_MS = 60 * 60 * 1000;
 
+/** SQLite's companion files, left beside a backup that something opened. */
+const SQLITE_SIDE_FILE = /-(wal|shm|journal)$/;
+
+/**
+ * Keeps the newest `keepCount` backups under `marker`, newest by the time in the name: a
+ * migration backup's name starts with its schema version, and by name alone `v10` would sort
+ * before `v9`. SQLite side files do not count as backups; they go with theirs, or when theirs
+ * is already gone.
+ */
 function pruneBackups(dataDirectory: string, marker: string, keepCount: number): void {
     const prefix = `${DATABASE_FILE_NAME}${marker}`;
     const names = fs.readdirSync(dataDirectory).filter((name) => name.startsWith(prefix) == true);
-    const backupNames = names.filter((name) => name.includes(".tmp-") == false).sort().reverse();
+    const timeOf = (name: string) => {
+        const rest = name.slice(prefix.length);
+        return marker == MIGRATION_BACKUP_MARKER ? rest.replace(/^\d+-/, "") : rest;
+    };
+    const backupNames = names
+        .filter((name) => name.includes(".tmp-") == false && SQLITE_SIDE_FILE.test(name) == false)
+        // ISO times compare as plain strings; a locale-aware compare may weigh the hyphens otherwise
+        .sort((left, right) => (timeOf(left) < timeOf(right) ? 1 : timeOf(left) > timeOf(right) ? -1 : 0));
+    const kept = new Set(backupNames.slice(0, keepCount));
     for(const name of backupNames.slice(keepCount)) {
         fs.rmSync(path.join(dataDirectory, name), { force: true });
+    }
+    for(const name of names.filter((name) => SQLITE_SIDE_FILE.test(name) == true && name.includes(".tmp-") == false)) {
+        if(kept.has(name.replace(SQLITE_SIDE_FILE, "")) == false) {
+            fs.rmSync(path.join(dataDirectory, name), { force: true });
+        }
     }
     // a fresh temporary copy may belong to another process backing up right now; leave those
     for(const name of names.filter((name) => name.includes(".tmp-") == true)) {

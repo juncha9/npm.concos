@@ -222,6 +222,19 @@ describe("idle wake", () => {
         expect(store.checkWakeWatch(watch(), true)).toEqual({ state: "wait" });
     });
 
+    it("wakes for a note or notice named to the session too, but never for a post to the room", () => {
+        const joined = start();
+        const from = asker();
+        const live = watch();
+        store.sendMessage(from, { to: "all", kind: "notice", text: "for reference", replyTo: null, requestId: null });
+        expect(store.checkWakeWatch(live, true)).toEqual({ state: "wait" });
+        const note = store.sendMessage(from, { to: joined.agent_id, kind: "notice", text: "report", replyTo: null, requestId: null }).message_id;
+        expect(store.checkWakeWatch(live, true)).toMatchObject({ state: "wake", notices: [{ id: note, kind: "notice" }] });
+        // a turn end still continues only for questions and answers
+        store.sendMessage(from, { to: joined.agent_id, kind: "note", text: "fyi", replyTo: null, requestId: null });
+        expect(store.applyHookEvent(event("turn-end", { canContinue: true }), "dev")?.continueFor).toBeUndefined();
+    });
+
     it("wakes for a question the last turn end could not point out", () => {
         const joined = start();
         const question = ask(asker(), joined.agent_id);
@@ -389,6 +402,26 @@ describe("schema migration", () => {
             expect(upgraded.prepare("SELECT value FROM meta WHERE key = 'last_message_id'").get()).toEqual({ value: String(direct) });
         }
         finally { upgraded.close(); }
+    });
+
+    it("keeps the three newest migration backups by time, with v10 after v9", async () => {
+        const oldDirectory = path.join(directory, "many-backups");
+        fs.mkdirSync(oldDirectory);
+        const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
+        for(const step of SCHEMA_STEPS.slice(0, 9)) old.exec(step);
+        old.exec("PRAGMA user_version = 9");
+        old.close();
+        const earlier = ["concos.db.bak-v10-2026-10-01T00-00-00-000Z", "concos.db.bak-v8-2026-09-01T00-00-00-000Z", "concos.db.bak-v7-2026-08-01T00-00-00-000Z"];
+        for(const name of earlier) fs.writeFileSync(path.join(oldDirectory, name), "copy");
+        const upgraded = await openDatabase(oldDirectory);
+        upgraded.close();
+        const kept = fs.readdirSync(oldDirectory).filter((name) => name.includes(".bak-v")).sort();
+        expect(kept).toHaveLength(3);
+        expect(kept).toContain(earlier[0]);
+        expect(kept).toContain(earlier[1]);
+        expect(kept.some((name) => name.startsWith("concos.db.bak-v9-"))).toBe(true);
+        // every name carries only characters every file system accepts
+        expect(kept.every((name) => /^[\w.-]+$/.test(name))).toBe(true);
     });
 
     it("does not change version 1 when its migration backup cannot be completed", async () => {

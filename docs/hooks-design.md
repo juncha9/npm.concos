@@ -67,7 +67,7 @@ Hooks record your working/waiting status and edited files; keep reporting summar
 
 ## 5. 알림 대상
 
-프롬프트 알림, Stop 상기, 2단계 깨우기가 같은 기준을 쓴다(사용자 결정). 2026-10-25 개정: 프롬프트와 세션 시작의 한 줄 알림에는 자기에게 온 note·notice도 넣는다. Stop 상기와 깨우기는 아래 기준 그대로다.
+프롬프트 알림, Stop 상기, 2단계 깨우기가 같은 기준을 쓴다(사용자 결정). 2026-10-25 개정: 프롬프트와 세션 시작의 한 줄 알림과 대기 깨우기에는 자기에게 온 note·notice도 넣는다(게시물 제외). Stop 상기는 아래 기준 그대로다.
 
 - **대상**: 아직 받지 않은(`received_at`이 비어 있는) 다음 두 가지.
     - 나에게 온 질문: `kind = question`이고 나에게 직접(`direct`) 또는 여럿 중 하나로(`group`) 온 것.

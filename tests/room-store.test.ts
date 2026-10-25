@@ -548,6 +548,41 @@ describe("ended sessions", () => {
         expect(store.getInbox(receiver.agent_id, [question.message_id])).toEqual({ questions: 0, notes: 1 });
     });
 
+    it("hands a message for an ended card to the live card of the same name in the same project", () => {
+        const sender = joinAgent("sender");
+        const earlier = joinAgent("Dev / CONCOS 01");
+        store.disconnect([earlier.agent_id]);
+        const current = joinAgent("Dev / CONCOS 01");
+        const sent = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "note", text: "report", replyTo: null, requestId: null });
+        expect(sent).toMatchObject({ recipient_count: 1, forwarded: [{ from: earlier.agent_id, to: current.agent_id }] });
+        expect(sent.inactive_recipients).toBeUndefined();
+        expect(store.readMessages(current.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([sent.message_id]);
+        // naming both cards reaches the live one once
+        expect(store.sendMessage(sender.agent_id, { to: [earlier.agent_id, current.agent_id], kind: "note", text: "both", replyTo: null, requestId: null }).recipient_count).toBe(1);
+
+        // no single live card of that name in that project: stored for the ended card, as before
+        const otherFolder = path.join(dataDirectory, "elsewhere");
+        fs.mkdirSync(otherFolder);
+        const lonely = joinAgent("Lonely");
+        store.disconnect([lonely.agent_id]);
+        joinAgent("Lonely", "dev", otherFolder);
+        expect(store.sendMessage(sender.agent_id, { to: lonely.agent_id, kind: "note", text: "x", replyTo: null, requestId: null })).toMatchObject({ inactive_recipients: [lonely.agent_id] });
+    });
+
+    it("gives a session joining under a name the unread messages left on ended cards of that name", () => {
+        const sender = joinAgent("sender");
+        const earlier = joinAgent("Dev / CONCOS 01");
+        const waiting = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "notice", text: "left behind", replyTo: null, requestId: null });
+        const read = store.sendMessage(sender.agent_id, { to: earlier.agent_id, kind: "note", text: "already read", replyTo: null, requestId: null });
+        store.acknowledge(earlier.agent_id, [read.message_id]);
+        store.disconnect([earlier.agent_id]);
+        const current = joinAgent("Dev / CONCOS 01");
+        expect(store.readMessages(current.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([waiting.message_id]);
+        expect(store.getRoomOverview("main", 10).messages.find((message) => message.id == waiting.message_id)?.to_agent_id).toBe(current.agent_id);
+        // what the earlier session read stays its own
+        expect(store.readMessages(current.agent_id, { messageIds: [read.message_id], limit: null }).messages).toEqual([]);
+    });
+
     it("resolves a reused session name to the live session", () => {
         const old = joinAgent("Dev / API 01");
         store.disconnect([old.agent_id]);
@@ -794,6 +829,28 @@ describe("backup residue", () => {
         store = new RoomStore(database);
         expect(fs.existsSync(stale)).toBe(false);
         expect(fs.existsSync(fresh)).toBe(true);
+    });
+
+    it("keeps the newest daily backups by date, without counting SQLite side files as backups", async () => {
+        database.close();
+        const daily = (day: string) => path.join(dataDirectory, `concos.db.bak-daily-2026-01-${day}`);
+        for(const name of fs.readdirSync(dataDirectory).filter((name) => name.includes(".bak-daily-"))) {
+            fs.rmSync(path.join(dataDirectory, name));
+        }
+        for(const day of ["01", "02", "03", "04", "05", "06", "07", "08"]) fs.writeFileSync(daily(day), "copy");
+        // side files of a kept backup someone opened, and of one that goes
+        for(const side of ["-wal", "-shm"]) {
+            fs.writeFileSync(`${daily("08")}${side}`, "");
+            fs.writeFileSync(`${daily("01")}${side}`, "");
+        }
+        database = await openDatabase(dataDirectory);
+        store = new RoomStore(database);
+        const backups = fs.readdirSync(dataDirectory).filter((name) => /bak-daily-\d{4}-\d{2}-\d{2}$/.test(name)).sort();
+        // today's copy and the six newest before it
+        expect(backups).toHaveLength(7);
+        expect(backups.slice(0, 6)).toEqual(["03", "04", "05", "06", "07", "08"].map((day) => path.basename(daily(day))));
+        expect(fs.existsSync(`${daily("08")}-wal`)).toBe(true);
+        expect(fs.existsSync(`${daily("01")}-wal`) || fs.existsSync(`${daily("01")}-shm`)).toBe(false);
     });
 });
 

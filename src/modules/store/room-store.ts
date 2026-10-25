@@ -98,6 +98,8 @@ export interface SendResult {
     duplicate?: true;
     /** Named recipients whose session ended or left: stored for them, but nobody reads it until they return. */
     inactive_recipients?: string[];
+    /** Named cards whose session had ended, and the live card of the same name in the same project that got the message instead. */
+    forwarded?: { from: string; to: string }[];
     reply_target_removed?: true;
     /** Topics already in use that look like a new topic this message introduced. */
     similar_topics?: string[];
@@ -603,6 +605,57 @@ export class RoomStore {
         return row as unknown as AgentRow;
     }
 
+    /** The one live agent card with `card`'s name in its project, or null when there is none or more than one. */
+    private liveCardNamed(card: AgentRow, nowMs: number): AgentRow | null {
+        if(card.workspace_id == null) {
+            return null;
+        }
+        const rows = this.prepare(`
+            SELECT ${AGENT_COLUMNS} FROM agent AS A
+            WHERE A.room = :room
+                AND A.id <> :id
+                AND A.is_human = 0
+                AND A.display_name = :display_name
+                AND A.workspace_id = :workspace_id
+                AND ${ACTIVE_AGENT_CONDITION}
+        `).all({
+            room: card.room, id: card.id, display_name: card.display_name, workspace_id: card.workspace_id, active_since: activeSince(nowMs),
+        }) as unknown as AgentRow[];
+        return rows.length == 1 ? rows[0] : null;
+    }
+
+    /**
+     * A session that joins under a name takes over the unread messages left on cards of that
+     * name in the same project whose sessions ended: one session reaches others by its name, and
+     * a reply to an id from an earlier session would otherwise wait on a card nobody reads.
+     */
+    private adoptFromEndedCards(agentId: string, displayName: string, workspaceId: string, nowMs: number): void {
+        const ended = this.prepare(`
+            SELECT A.id FROM agent AS A
+            WHERE A.room = :room
+                AND A.id <> :id
+                AND A.is_human = 0
+                AND A.display_name = :display_name
+                AND A.workspace_id = :workspace_id
+                AND NOT ${ACTIVE_AGENT_CONDITION}
+        `).all({ room: SHARED_ROOM, id: agentId, display_name: displayName, workspace_id: workspaceId, active_since: activeSince(nowMs) }) as { id: string }[];
+        for(const card of ended) {
+            const ids = { from: card.id, to: agentId };
+            this.prepare(`
+                UPDATE message SET recipient_agent_id = :to
+                WHERE recipient_agent_id = :from
+                    AND id IN (SELECT message_id FROM message_receipt WHERE agent_id = :from AND received_at IS NULL)
+                    AND id NOT IN (SELECT message_id FROM message_receipt WHERE agent_id = :to)
+            `).run(ids);
+            this.prepare(`
+                UPDATE message_receipt SET agent_id = :to
+                WHERE agent_id = :from
+                    AND received_at IS NULL
+                    AND message_id NOT IN (SELECT message_id FROM message_receipt WHERE agent_id = :to)
+            `).run(ids);
+        }
+    }
+
     private requireAgent(agentId: string): AgentRow {
         const row = this.selectAgent(agentId);
         if(row == null) {
@@ -740,14 +793,13 @@ export class RoomStore {
                     changed_seq: seq,
                     now: nowText,
                 });
-                // the model naming the card its session-start hook made
+                // the model naming the card its session-start hook made, or coming back by its handle
+                let cardId = resumed.id;
                 if(session == null) {
-                    const earlier = this.mergeIntoEarlierCard(resumed.id, input.displayName, workspaceId, nowText);
-                    if(earlier != null) {
-                        return { agent_id: earlier, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
-                    }
+                    cardId = this.mergeIntoEarlierCard(resumed.id, input.displayName, workspaceId, nowText) ?? resumed.id;
+                    this.adoptFromEndedCards(cardId, input.displayName, workspaceId, nowMs);
                 }
-                return { agent_id: resumed.id, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
+                return { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: workspaceId, resumed: true };
             }
 
             const agentId = newIdentifier("agt");
@@ -774,6 +826,10 @@ export class RoomStore {
                 host_session_id: session?.sessionId ?? null,
                 now: nowText,
             });
+            // a hook's card carries a placeholder name, so only a name the model gave takes over
+            if(session == null) {
+                this.adoptFromEndedCards(agentId, input.displayName, workspaceId, nowMs);
+            }
             return { agent_id: agentId, handle: handle, room: room, workspace_id: workspaceId, resumed: false };
         });
     }
@@ -867,7 +923,7 @@ export class RoomStore {
      * alone or in a group, and answers to its own questions. Room-wide messages would continue
      * every session in the room, and answers to answers would bounce between agents, so neither
      * counts. `includeNotes` adds notes and notices named to it, for the line a prompt or session
-     * start shows; they never continue a turn or wake a session. Reading this list acknowledges
+     * start shows and for idle wake; they never continue a turn. Reading this list acknowledges
      * nothing.
      */
     hookNotices(agentId: string, afterSeq = 0, includeNotes = false): HookNotice[] {
@@ -1048,7 +1104,8 @@ export class RoomStore {
             if(quietEnough == false) {
                 return { check: { state: "wait" }, woken: [] };
             }
-            const notices = this.hookNotices(watch.agentId, row.hook_nudged_seq);
+            // a note or notice named to the session wakes it too (2026-10-25 user decision)
+            const notices = this.hookNotices(watch.agentId, row.hook_nudged_seq, true);
             const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
             if(notices.length == 0 || woken.length >= WAKE_HOURLY_LIMIT) {
                 return { check: { state: "wait" }, woken: [] };
@@ -1516,6 +1573,7 @@ export class RoomStore {
             let scope: "direct" | "group" | "all" = "all";
             const recipientIds: string[] = [];
             const inactiveRecipients: string[] = [];
+            const forwarded: { from: string; to: string }[] = [];
             if(requested.includes(RECIPIENT_ALL) == true) {
                 if(requested.length > 1) {
                     throw new RoomError("send to \"all\" alone, or list agent ids");
@@ -1526,12 +1584,24 @@ export class RoomStore {
                     throw new RoomError(`at most ${MAX_RECIPIENTS} recipients; use "all" for the whole room`);
                 }
                 for(const agentId of requested) {
-                    const recipient = this.selectAgent(agentId);
+                    let recipient = this.selectAgent(agentId);
                     if(recipient == null || recipient.room != sender.room) {
                         throw new RoomError(`no agent ${agentId} in room ${sender.room}`);
                     }
+                    // the user knows a session by its name: an ended card whose session goes on under
+                    // that name in the same project hands the message to the live card
+                    if(recipient.is_human == 0 && (recipient.left_at != null || isEnded(recipient, nowMs) == true)) {
+                        const successor = this.liveCardNamed(recipient, nowMs);
+                        if(successor != null && successor.id != senderId) {
+                            forwarded.push({ from: recipient.id, to: successor.id });
+                            recipient = successor;
+                        }
+                    }
                     if(recipient.id == senderId) {
                         throw new RoomError("cannot send a message to yourself");
+                    }
+                    if(recipientIds.includes(recipient.id) == true) {
+                        continue;
                     }
                     recipientIds.push(recipient.id);
                     // still stored: an ended session that comes back reads it, but the sender should know
@@ -1638,6 +1708,9 @@ export class RoomStore {
             }
             if(inactiveRecipients.length > 0) {
                 result.inactive_recipients = inactiveRecipients;
+            }
+            if(forwarded.length > 0) {
+                result.forwarded = forwarded;
             }
             if(replyTargetRemoved == true) {
                 result.reply_target_removed = true;
