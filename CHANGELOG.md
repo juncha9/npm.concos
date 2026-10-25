@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [Unreleased]
+## [0.1.9] - 2026-10-25
 
 ### Added
 - **`join` says when it merged cards.** When an earlier card of the session's name takes over the card the session-start hook made, the answer names that card under `merged_from`, so an agent_id other than the hook's no longer comes back unexplained.
