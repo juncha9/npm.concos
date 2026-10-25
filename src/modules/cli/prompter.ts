@@ -1,5 +1,5 @@
-// Adapted from an in-house MCP tool's terminal interface. Copyright © 2026 Alkemic Studio.
-// MIT license; the original notice is included in NOTICE.
+// Adapted from an in-house MCP tool's terminal interface. Copyright © 2026 Alkemic Studio, the author's
+// company, which brings it into concos under concos's license (AGPL-3.0-or-later).
 import type { Readable, Writable } from "node:stream";
 
 /**
