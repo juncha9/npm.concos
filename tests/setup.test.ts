@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseJson } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveMcpPath } from "../src/modules/cli/setup";
+import { applySetup, ensureUsableSettings, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveMcpPath } from "../src/modules/cli/setup";
 import { HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 
 let directory: string;
@@ -374,7 +374,7 @@ describe("unregistering", () => {
         const hooks = `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }] }] } }, null, 2)}\n`;
         write(".codex/hooks.json", hooks);
         const codex = { host: "codex", home: directory };
-        applySetup(planRegistration(codex, { wake: false, skipBrokenHooks: false }));
+        applySetup(planRegistration(codex, { wake: false }));
         expect(inspectHooks(codex).state).toBe("on");
         applySetup(planUnregister(codex));
         expect(read(".codex/config.toml")).toBe(toml);
@@ -383,7 +383,7 @@ describe("unregistering", () => {
 
         const inline = '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}\n';
         write(".codex/hooks.json", inline);
-        applySetup(planRegistration(codex, { wake: false, skipBrokenHooks: false }));
+        applySetup(planRegistration(codex, { wake: false }));
         applySetup(planUnregister(codex));
         expect(JSON.parse(read(".codex/hooks.json"))).toEqual(JSON.parse(inline));
 
@@ -391,7 +391,7 @@ describe("unregistering", () => {
             const input = { host, home: directory };
             const file = path.relative(directory, resolveMcpPath(input));
             write(file, '{\n  // keep\n  "theme": "dark",\n  "mcpServers": {"other": {"command": "other"}}\n}\n');
-            applySetup(planRegistration(input, { wake: host == "claude", skipBrokenHooks: false }));
+            applySetup(planRegistration(input, { wake: host == "claude" }));
             applySetup(planUnregister(input));
             expect(parseJson(read(file))).toEqual({ theme: "dark", mcpServers: { other: { command: "other" } } });
             expect(read(file)).toContain("// keep");
@@ -438,17 +438,78 @@ describe("unregistering", () => {
         }
     });
 
-    it("still takes out the MCP entry when the hooks file cannot be edited safely, and leaves that file alone", () => {
+    it("takes nothing out while the hooks file cannot be read as it should", () => {
         const claude = { host: "claude", home: directory };
         applySetup(planSetup(claude));
         const broken = '{"hooks": {}, "hooks": {}}';
         write(".claude/settings.json", broken);
-        const changes = planUnregister(claude);
-        expect(changes.map((change) => path.relative(directory, change.path))).toEqual([".claude.json"]);
-        expect(changes[0].notes.join(" ")).toMatch(/Hooks were left in place, and their file untouched/);
-        applySetup(changes);
-        expect(inspectSetup(claude).registered).toBe(false);
+        expect(() => planUnregister(claude)).toThrow(/duplicate JSON key "hooks"/);
+        expect(() => ensureUsableSettings(claude)).toThrow(/^Claude Code settings need fixing before concos can use them:/);
+        expect(inspectSetup(claude).registered).toBe(true);
         expect(read(".claude/settings.json")).toBe(broken);
+    });
+});
+
+describe("settings concos cannot use", () => {
+    const write = (relative: string, text: string) => {
+        fs.mkdirSync(path.dirname(path.join(directory, relative)), { recursive: true });
+        fs.writeFileSync(path.join(directory, relative), text);
+    };
+    const problems = (host: string) => inspectSettings({ host, home: directory }).map((line) => line.replace(`${directory}${path.sep}`, ""));
+
+    it("names each part of the MCP list and hooks section in another shape, and nothing else", () => {
+        expect(problems("claude")).toEqual([]);
+        write(".claude.json", JSON.stringify({ mcpServers: { mine: { command: "mine" }, loose: "mine --serve" } }));
+        write(".claude/settings.json", JSON.stringify({
+            permissions: { allow: "not checked" },
+            hooks: {
+                Stop: [{ hooks: { type: "command", command: "mine" } }, "loose", { matcher: 1, hooks: [{ command: 2, timeout: "5" }, null] }],
+                SessionEnd: { hooks: [] },
+                SessionStart: [{ matcher: "startup", hooks: [{ type: "command", command: "mine", timeout: 5, async: true }] }],
+            },
+        }));
+        const settings = path.join(".claude", "settings.json");
+        expect(problems("claude")).toEqual([
+            ".claude.json: mcpServers.loose must be an object",
+            `${settings}: hooks.Stop[0].hooks must be a list`,
+            `${settings}: hooks.Stop[1] must be an object`,
+            `${settings}: hooks.Stop[2].matcher must be a string`,
+            `${settings}: hooks.Stop[2].hooks[0].command must be a string`,
+            `${settings}: hooks.Stop[2].hooks[0].timeout must be a number`,
+            `${settings}: hooks.Stop[2].hooks[1] must be an object`,
+            `${settings}: hooks.SessionEnd must be a list`,
+        ]);
+    });
+
+    it("reports a file that does not parse, repeats a key or is not an object, as one problem each", () => {
+        write(".claude.json", '{"mcpServers": {}');
+        write(".claude/settings.json", '{"hooks": {}, "hooks": {}}');
+        write(".cursor/mcp.json", "[]");
+        write(".codex/config.toml", "[mcp_servers\n");
+        expect(problems("claude")).toEqual([
+            ".claude.json: invalid JSON",
+            `${path.join(".claude", "settings.json")}: duplicate JSON key "hooks"`,
+        ]);
+        expect(problems("cursor")).toEqual([`${path.join(".cursor", "mcp.json")} must be an object`]);
+        expect(problems("codex")).toEqual([`${path.join(".codex", "config.toml")}: invalid TOML`]);
+        write(".codex/config.toml", 'hooks = "x"\nmcp_servers = { concos = "concos mcp" }\n');
+        expect(problems("codex")).toEqual([
+            `${path.join(".codex", "config.toml")}: mcp_servers.concos must be a table`,
+            `${path.join(".codex", "config.toml")}: hooks must be a table`,
+        ]);
+    });
+
+    it("checks hooks only where concos keeps them, so a Gemini hooks section is not judged", () => {
+        write(".gemini/settings.json", JSON.stringify({ hooks: { BeforeTool: { command: "theirs" } } }));
+        expect(problems("gemini")).toEqual([]);
+    });
+
+    it("refuses the client with every problem, ten at most, and changes nothing", () => {
+        write(".claude/settings.json", JSON.stringify({ hooks: { Stop: Array.from({ length: 12 }, () => "loose") } }));
+        expect(() => ensureUsableSettings({ host: "claude", home: directory })).toThrow(
+            /need fixing before concos can use them:\n( {2}.+hooks\.Stop\[\d+\] must be an object\n){10} {2}…and 2 more\nconcos changed nothing\. Fix the file, then try Claude Code again\.$/,
+        );
+        expect(fs.readdirSync(path.join(directory, ".claude"))).toEqual(["settings.json"]);
     });
 });
 
@@ -459,7 +520,7 @@ describe("registration in one preview", () => {
     it("registers Claude Code MCP, hooks and idle wake at once, after the user's own hooks and comments", () => {
         fs.mkdirSync(path.dirname(hooksFile()));
         fs.writeFileSync(hooksFile(), '{\n  // keep me\n  "permissions": {"allow": ["Read"]},\n  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}\n}\n');
-        const changes = planRegistration(claude(), { wake: true, skipBrokenHooks: true });
+        const changes = planRegistration(claude(), { wake: true });
         expect(changes.map((change) => change.path)).toEqual([path.join(directory, ".claude.json"), hooksFile()]);
         expect(changes[1].notes.join(" ")).toContain("Codex sessions do not wake");
         expect(fs.readFileSync(hooksFile(), "utf8")).not.toContain("concos");
@@ -473,25 +534,21 @@ describe("registration in one preview", () => {
         expect(parseJson(text).permissions).toEqual({ allow: ["Read"] });
         expect(parseJson(text).hooks.Stop.map((group: { hooks: { command: string }[] }) => group.hooks[0].command))
             .toEqual(["echo mine", "concos hook turn-end --host claude", "concos hook watch --host claude"]);
-        expect(planRegistration(claude(), { wake: true, skipBrokenHooks: true })).toEqual([]);
+        expect(planRegistration(claude(), { wake: true })).toEqual([]);
     });
 
-    it("leaves a hooks file it cannot edit safely untouched and still registers MCP, unless asked for hooks", () => {
+    it("registers nothing while the hooks file cannot be read as it should", () => {
         fs.mkdirSync(path.dirname(hooksFile()));
         const broken = '{"hooks": {"Stop": []}, "hooks": {}}';
         fs.writeFileSync(hooksFile(), broken);
-        const changes = planRegistration(claude(), { wake: true, skipBrokenHooks: true });
-        expect(changes.map((change) => change.path)).toEqual([path.join(directory, ".claude.json")]);
-        expect(changes[0].notes.join(" ")).toMatch(/Hooks were left out, and their file untouched: .*duplicate JSON key "hooks"\. Fix it/);
-        applySetup(changes);
-        expect(inspectSetup(claude()).registered).toBe(true);
+        expect(() => planRegistration(claude(), { wake: true })).toThrow(/duplicate JSON key "hooks"/);
+        expect(fs.existsSync(path.join(directory, ".claude.json"))).toBe(false);
         expect(fs.readFileSync(hooksFile(), "utf8")).toBe(broken);
-        expect(() => planRegistration(claude(), { wake: false, skipBrokenHooks: false })).toThrow(/duplicate JSON key/);
     });
 
     it("refuses idle wake for Codex, and writes nothing a change would leave unreadable", () => {
-        expect(() => planRegistration({ host: "codex", home: directory }, { wake: true, skipBrokenHooks: false })).toThrow(/Claude Code only/);
-        expect(planRegistration({ host: "gemini", home: directory }, { wake: false, skipBrokenHooks: true })).toHaveLength(1);
+        expect(() => planRegistration({ host: "codex", home: directory }, { wake: true })).toThrow(/Claude Code only/);
+        expect(planRegistration({ host: "gemini", home: directory }, { wake: false })).toHaveLength(1);
         const file = path.join(directory, "settings.json");
         fs.writeFileSync(file, '{"keep": true}');
         expect(() => applySetup([{ path: file, before: '{"keep": true}', after: '{"keep": true', additions: [], removals: [], notes: [] }])).toThrow(/invalid JSON/);

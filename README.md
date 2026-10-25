@@ -64,10 +64,11 @@ settings, comments and layout are preserved; added entries follow the file's lin
 endings and indentation, and unregistering gives a file written over several lines
 back byte for byte. A list written on one line that concos adds to comes back
 spread over several lines, with the same contents. Conflicting commands are
-reported for review before writing. A settings file with duplicate keys, one that
-changed after the preview, or a change concos could not read back is left as it
-is. When only the hooks file is like that, registration and unregistering leave it
-alone, handle the MCP entry, and say why in the preview.
+reported for review before writing. A client whose settings concos cannot use, a
+file that does not parse or repeats a key, or an MCP server list or hooks section
+in another shape, does not open: concos lists what is wrong and writes nothing, so
+fix the file and choose the client again. A file that changed after the preview,
+or a change concos could not read back, is left as it is.
 
 Enable concos MCP in your client, then start a task in a new session.
 All participating clients and the terminal interface must use the same local

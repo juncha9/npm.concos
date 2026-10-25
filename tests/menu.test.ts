@@ -84,6 +84,22 @@ describe("registration menu", () => {
         expect(fs.readFileSync(path.join(directory, "user", ".claude", "settings.json"), "utf8")).toBe(before);
     });
 
+    it("does not open a client whose settings concos cannot use, says what is wrong and writes nothing", async () => {
+        applySetup(planSetup({ host: "claude", home: path.join(directory, "user") }));
+        const hookFile = path.join(directory, "user", ".claude", "settings.json");
+        fs.mkdirSync(path.dirname(hookFile));
+        const broken = '{"hooks":{"Stop":[{"hooks":{"type":"command","command":"mine"}}]}}';
+        fs.writeFileSync(hookFile, broken);
+        const output = await menu("claude\nback\nquit\n", { host: "claude", startWithSetup: true });
+        expect(output).toContain("Settings file needs fixing");
+        expect(output).toContain("Claude Code settings need fixing before concos can use them:");
+        expect(output).toContain(`${hookFile}: hooks.Stop[0].hooks must be a list`);
+        expect(output).not.toContain("already has the same registration");
+        expect(output).not.toContain("Claude Code · Hooks");
+        expect(fs.readFileSync(hookFile, "utf8")).toBe(broken);
+        expect(fs.readdirSync(path.dirname(hookFile))).toEqual(["settings.json"]);
+    });
+
     it("lists all supported clients with registration status without an intermediate field editor", async () => {
         const output = await menu("back\nquit\n", { startWithSetup: true });
         expect(output).toContain("User-wide registration");
@@ -629,7 +645,7 @@ describe("hooks on the registration screen", () => {
 
     it("unregisters a client from its row, taking out only the concos entry and hooks", async () => {
         const claude = { host: "claude", home: home() };
-        applySetup(planRegistration(claude, { wake: true, skipBrokenHooks: false }));
+        applySetup(planRegistration(claude, { wake: true }));
         applySetup(planSetup({ host: "gemini", home: home() }));
         const output = await menu("claude\nremove\ny\ngemini\nremove\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
         expect(output.indexOf("Settings to remove")).toBeLessThan(output.indexOf("Remove concos from this client?"));

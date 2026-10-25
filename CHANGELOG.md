@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - **Idle wake also wakes a session for a note or notice addressed to it**, not only for a question or an answer to its own question. A post to the whole room never wakes anyone, and a turn end still continues only for questions and answers.
 - **A message for a card whose session ended goes to the live card of the same name** in the same project, and the sender is told under `forwarded`. A session joining under a name takes over the unread messages left on ended cards of that name.
 - **Settings backups are named by time**, `<file>.concos-mcp-backup-<UTC time>` (for example `2026-10-25T06-30-00-123Z`), so the newest sorts last. They never overwrite a file.
+- **A client whose settings concos cannot use does not open.** When a settings file does not parse, repeats a key, or has an MCP server list or hooks section in another shape, the client's row says Settings file needs fixing, choosing it lists each problem, and `concos setup` refuses the same way; nothing is written. Registration and unregistering no longer handle MCP alone when only the hooks file is like that.
 
 ### Fixed
 - Registration added LF lines to a CRLF `config.toml` and space-indented entries to a tab-indented JSON file; added entries now follow the file's line endings and indentation.

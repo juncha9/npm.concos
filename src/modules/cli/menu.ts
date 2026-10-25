@@ -8,7 +8,7 @@ import { participantName } from "./status-renderer";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
-import { applySetup, hasWake, HOST_LABELS, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveHooksPath } from "./setup";
+import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planWake, resolveHooksPath } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 
 export interface MenuOptions {
@@ -39,6 +39,9 @@ function hookSummary(draft: SetupTarget): string {
 
 function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "success" } {
     try {
+        if(inspectSettings(draft).length > 0) {
+            return { hint: "Settings file needs fixing" };
+        }
         const status = inspectSetup(draft);
         if(status.registered == false) {
             return { hint: "Not registered" };
@@ -146,11 +149,13 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
             ], { defaultValue: draft.host, cancelValue: "back" });
             if(host == "back") return;
             draft.host = host;
+            // settings concos cannot read as they should are reported here, and the client does not open
+            ensureUsableSettings(draft);
             // a first registration brings the hooks, and Claude Code's idle wake, in the same preview;
             // a registered client changes them from its hooks menu, so hooks turned off stay off
             let changes = planSetup(draft);
             if(changes.length > 0 && hasHooks(draft.host)) {
-                changes = planRegistration(draft, { wake: hasWake(draft.host), skipBrokenHooks: true });
+                changes = planRegistration(draft, { wake: hasWake(draft.host) });
             }
             if(changes.length == 0) {
                 prompter.write("\nThis client already has the same registration.\n");

@@ -163,6 +163,98 @@ function hasRegistration(file: SetupChange, format: "json" | "toml"): boolean {
     return true;
 }
 
+const isRecord = (value: unknown): value is Record<string, any> => value != null && typeof value == "object" && Array.isArray(value) == false;
+
+/** The fields concos reads or writes in a hook handler, and their types. */
+const HANDLER_FIELDS = [["type", "string"], ["command", "string"], ["timeout", "number"], ["async", "boolean"], ["asyncRewake", "boolean"]] as const;
+
+/** `inspectSettings` for one file: `servers` checks its MCP server list, `hooks` its hooks section. */
+function settingsProblems(file: string, parts: { servers: boolean; hooks: boolean }): string[] {
+    const toml = file.endsWith(".toml");
+    let data: Record<string, any>;
+    try {
+        const change = loadChange(file);
+        if(toml == true) {
+            try { data = parseToml(change.after); }
+            catch { return [`${file}: invalid TOML`]; }
+        }
+        else data = json(change);
+    }
+    catch(ex) {
+        if((ex instanceof RoomError) == false) throw ex;
+        return [ex.message.replace(/; settings were not changed$/, "")];
+    }
+    const problems: string[] = [];
+    const check = (valid: boolean, key: string, shape: string) => {
+        if(valid == false) problems.push(`${file}: ${key} must be ${shape}`);
+        return valid;
+    };
+    const objectShape = toml ? "a table" : "an object";
+    if(parts.servers == true) {
+        const key = toml ? "mcp_servers" : "mcpServers";
+        if(data[key] !== undefined && check(isRecord(data[key]), key, objectShape)) {
+            for(const [name, server] of Object.entries(data[key])) check(isRecord(server), `${key}.${name}`, objectShape);
+        }
+        // Codex also reads hooks from config.toml
+        if(toml == true && data.hooks !== undefined) check(isRecord(data.hooks), "hooks", objectShape);
+    }
+    if(parts.hooks == true && data.hooks !== undefined && check(isRecord(data.hooks), "hooks", objectShape)) {
+        for(const [event, groups] of Object.entries(data.hooks)) {
+            if(check(Array.isArray(groups), `hooks.${event}`, "a list") == false) continue;
+            (groups as unknown[]).forEach((value, groupIndex) => {
+                const at = `hooks.${event}[${groupIndex}]`;
+                if(check(isRecord(value), at, "an object") == false) return;
+                const group = value as Record<string, any>;
+                if(group.matcher !== undefined) check(typeof group.matcher == "string", `${at}.matcher`, "a string");
+                if(check(Array.isArray(group.hooks), `${at}.hooks`, "a list") == false) return;
+                (group.hooks as unknown[]).forEach((entry, handlerIndex) => {
+                    if(check(isRecord(entry), `${at}.hooks[${handlerIndex}]`, "an object") == false) return;
+                    const handler = entry as Record<string, any>;
+                    for(const [field, type] of HANDLER_FIELDS) {
+                        if(handler[field] !== undefined) check(typeof handler[field] == type, `${at}.hooks[${handlerIndex}].${field}`, `a ${type}`);
+                    }
+                });
+            });
+        }
+    }
+    return problems;
+}
+
+/**
+ * What keeps concos from using a client's settings, one `<file>: <problem>` line each: a file
+ * that does not parse or repeats a key, or an MCP server list or hooks section in another shape
+ * than concos reads and writes. Other settings are not checked; concos keeps them byte for byte.
+ */
+export function inspectSettings(input: SetupTarget): string[] {
+    const mcpPath = resolveMcpPath(input);
+    const hooksPath = (HOOK_CLIENTS as readonly string[]).includes(input.host) ? resolveHooksPath(input) : null;
+    const problems = settingsProblems(mcpPath, { servers: true, hooks: hooksPath == mcpPath });
+    if(hooksPath != null && hooksPath != mcpPath) {
+        problems.push(...settingsProblems(hooksPath, { servers: false, hooks: true }));
+    }
+    return problems;
+}
+
+const SHOWN_PROBLEMS = 10;
+
+/** Refuses a client `inspectSettings` finds problems in, before anything is planned or written. */
+export function ensureUsableSettings(input: SetupTarget): void {
+    const problems = inspectSettings(input);
+    if(problems.length == 0) {
+        return;
+    }
+    const label = HOST_LABELS[input.host] ?? input.host;
+    const shown = problems.slice(0, SHOWN_PROBLEMS);
+    if(problems.length > shown.length) {
+        shown.push(`…and ${problems.length - shown.length} more`);
+    }
+    throw new RoomError([
+        `${label} settings need fixing before concos can use them:`,
+        ...shown.map((line) => `  ${line}`),
+        `concos changed nothing. Fix the file, then try ${label} again.`,
+    ].join("\n"));
+}
+
 /** Builds the complete change without writing. Existing commands and comments are retained. */
 export function planSetup(input: SetupTarget & { room?: string }): SetupChange[] {
     const adapter = getMcpClient(input.host);
@@ -249,8 +341,7 @@ function removeTomlTable(change: SetupChange, value: unknown): void {
  * Builds the change that takes concos out of a client, without writing: its MCP server entry,
  * and for Claude Code and Codex every concos hook, idle wake included. Only what concos would
  * have written goes: a server named concos that runs something else is refused, and everything
- * around ours stays. A hooks file concos cannot edit safely is left alone while the MCP entry
- * still goes, with a note saying why.
+ * around ours stays.
  */
 export function planUnregister(input: SetupTarget): SetupChange[] {
     const adapter = getMcpClient(input.host);
@@ -275,15 +366,7 @@ export function planUnregister(input: SetupTarget): SetupChange[] {
     if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
         return changes;
     }
-    try {
-        changes.push(...planHooks(input, "off"));
-    }
-    catch(ex) {
-        if((ex instanceof RoomError) == false || changes.length == 0) {
-            throw ex;
-        }
-        changes[0].notes.push(`Hooks were left in place, and their file untouched: ${ex.message.replace(/; settings were not changed$/, "")}.`);
-    }
+    changes.push(...planHooks(input, "off"));
     return changes;
 }
 
@@ -533,29 +616,17 @@ function addWake(change: SetupChange, input: SetupTarget): void {
 /**
  * Everything a client gets at once, in one preview: MCP unless it is already registered, the
  * hooks for Claude Code and Codex, and with `wake` Claude Code's idle wake. The hooks and idle
- * wake share one change, since both go into the hooks file. With `skipBrokenHooks`, a hooks file
- * concos cannot edit safely (invalid, duplicate keys, an odd shape) is left alone and MCP is still
- * registered, with a note saying why; otherwise that stops the whole plan.
+ * wake share one change, since both go into the hooks file.
  */
-export function planRegistration(input: SetupTarget, options: { wake: boolean; skipBrokenHooks: boolean }): SetupChange[] {
+export function planRegistration(input: SetupTarget, options: { wake: boolean }): SetupChange[] {
     const changes = inspectSetup(input).registered ? [] : planSetup(input);
     if((HOOK_CLIENTS as readonly string[]).includes(input.host) == false) {
         return changes;
     }
-    let hooks: SetupChange;
-    try {
-        hooks = loadChange(resolveHooksPath(input));
-        addHooks(hooks, input);
-        if(options.wake == true) {
-            addWake(hooks, input);
-        }
-    }
-    catch(ex) {
-        if(options.skipBrokenHooks == false || (ex instanceof RoomError) == false || changes.length == 0) {
-            throw ex;
-        }
-        changes[0].notes.push(`Hooks were left out, and their file untouched: ${ex.message.replace(/; settings were not changed$/, "")}. Fix it, then turn hooks on from this client's row.`);
-        return changes;
+    const hooks = loadChange(resolveHooksPath(input));
+    addHooks(hooks, input);
+    if(options.wake == true) {
+        addWake(hooks, input);
     }
     if(hooks.additions.length > 0) {
         changes.push(hooks);
@@ -676,6 +747,7 @@ export async function runSetup(args: string[]): Promise<void> {
     if(values.remove == true) {
         if(values.host == null) throw new RoomError("--remove needs --host <client>.");
         const target = { host: values.host };
+        ensureUsableSettings(target);
         const removal = planUnregister(target);
         if(removal.length == 0) {
             process.stdout.write(`concos is not registered for ${HOST_LABELS[values.host] ?? values.host}.\n`);
@@ -699,12 +771,11 @@ export async function runSetup(args: string[]): Promise<void> {
     if(toggle != null) {
         if(toggle.mode != "on" && toggle.mode != "off") throw new RoomError(`${toggle.option} must be on or off.`);
         const target = { host: values.host ?? "" };
+        // naming the client first gives an unknown one the hooks message, not the MCP one
+        resolveHooksPath(target);
+        ensureUsableSettings(target);
         let toggleChanges: SetupChange[];
-        if(toggle.mode == "on") {
-            // naming the client first gives an unknown one the hooks message, not the MCP one
-            resolveHooksPath(target);
-            toggleChanges = planRegistration(target, { wake: toggle.wake, skipBrokenHooks: false });
-        }
+        if(toggle.mode == "on") toggleChanges = planRegistration(target, { wake: toggle.wake });
         else toggleChanges = toggle.plan(target, toggle.mode);
         if(toggleChanges.length == 0) {
             process.stdout.write(`${toggle.mode == "on" ? toggle.alreadyOn : toggle.nothingOn}\n`);
@@ -725,6 +796,7 @@ export async function runSetup(args: string[]): Promise<void> {
         await runMenu({ input: process.stdin, output: process.stdout, startWithSetup: true });
         return;
     }
+    ensureUsableSettings({ host: values.host ?? "" });
     const changes = planSetup({ host: values.host ?? "" });
     if(changes.length == 0) {
         process.stdout.write("concos MCP is already registered.\n");
