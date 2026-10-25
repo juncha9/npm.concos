@@ -12,10 +12,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - **A tool call with an argument the tool does not take is refused** instead of having the argument dropped without a word. The error names the argument, the tools that take it (`role` belongs to `check_in`) and the tool's own arguments.
-- `check_in`'s description says to call it again for the rest of the room when `has_more` is set.
+- `check_in`'s description says to call it again for the rest of the room when `has_more` is set, and `join`'s points to `check_in` for renaming a card.
 
 ### Notes
-- A session loads a tool list of about 8,200 characters and instructions of about 2,000.
+- A session loads a tool list of about 8,300 characters and instructions of about 2,000.
 
 ## [0.1.8] - 2026-10-25
 

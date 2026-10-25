@@ -152,7 +152,7 @@ export async function runBridge(): Promise<void> {
         name: "join",
         description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart. merged_from, when present, is the card your session-start hook made: your earlier card of this name took it over, so use the agent_id returned.",
         inputSchema: inputSchema({
-            display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role." },
+            display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role. Rename later with check_in display_name." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
             working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder you work in." },
             workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory." },
