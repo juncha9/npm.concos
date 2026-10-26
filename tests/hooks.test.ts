@@ -472,16 +472,31 @@ describe("Codex idle wake", () => {
         await expect(codex.deliverWake!("session-1 & calc", "line")).rejects.toThrow(/invalid Codex session id/);
     });
 
+    const asker = () => store.join({ room: "main", displayName: "Asker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+    const ask = (from: string, to: string) => store.sendMessage(from, { to, kind: "question", text: "body", replyTo: null, requestId: null }).message_id;
+    // runs `act` with the clock at `ms`
+    const at = <T>(ms: number, act: () => T): T => {
+        vi.useFakeTimers({ now: ms, toFake: ["Date"] });
+        try {
+            return act();
+        }
+        finally { vi.useRealTimers(); }
+    };
+    // a live session's own server keeps its card online with a heartbeat
+    const online = (agentId: string, ms: number) => at(ms, () => store.keepAlive(agentId));
+
     it("lets the MCP server wake a session no watch woke, once the message and the agent have been quiet long enough", () => {
         const session = { host: "codex", sessionId: THREAD_ID } as const;
         const joined = start(session);
-        const from = store.join({ room: "main", displayName: "Asker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const from = asker();
         const live = store.startWakeWatch(event("watch", session))!;
         // a failed turn: the prompt came and the Stop hook never did, so the card stays working
         store.applyHookEvent(event("prompt", session), "dev");
-        const question = store.sendMessage(from, { to: joined.agent_id, kind: "question", text: "body", replyTo: null, requestId: null }).message_id;
+        const question = ask(from, joined.agent_id);
         const nowMs = Date.now();
+        online(joined.agent_id, nowMs + WAKE_FALLBACK_MS - 5000);
         expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS - 5000)).toBeNull();
+        online(joined.agent_id, nowMs + WAKE_FALLBACK_MS + 1000);
         expect(store.fallbackWake(joined.agent_id, ["claude"], nowMs + WAKE_FALLBACK_MS + 1000)).toBeNull();
         expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS + 1000)).toEqual({
             host: "codex", sessionId: THREAD_ID, notices: [expect.objectContaining({ id: question })], unread: 1,
@@ -493,26 +508,47 @@ describe("Codex idle wake", () => {
     });
 
     it("leaves the wake to the watch while the agent acts or the message is new", () => {
-        const session = { host: "codex", sessionId: THREAD_ID } as const;
-        const joined = start(session);
-        const from = store.join({ room: "main", displayName: "Asker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const joined = start({ host: "codex", sessionId: THREAD_ID });
+        const from = asker();
         const nowMs = Date.now();
-        const at = (ms: number, act: () => void) => {
-            vi.useFakeTimers({ now: ms, toFake: ["Date"] });
-            try {
-                act();
-            }
-            finally { vi.useRealTimers(); }
-        };
         // a message that came after a long quiet is still new
-        at(nowMs + WAKE_FALLBACK_MS, () => {
-            store.sendMessage(from, { to: joined.agent_id, kind: "question", text: "body", replyTo: null, requestId: null });
-        });
+        at(nowMs + WAKE_FALLBACK_MS, () => ask(from, joined.agent_id));
+        online(joined.agent_id, nowMs + WAKE_FALLBACK_MS + 1000);
         expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS + 1000)).toBeNull();
         // the agent acts late in the period: the clock starts again from its last call
         at(nowMs + 2 * WAKE_FALLBACK_MS - 1000, () => store.recordCall(joined.agent_id));
         expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + 2 * WAKE_FALLBACK_MS + 1000)).toBeNull();
+        online(joined.agent_id, nowMs + 3 * WAKE_FALLBACK_MS);
         expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + 3 * WAKE_FALLBACK_MS)).not.toBeNull();
+    });
+
+    it("leaves an offline card alone, since its session may have closed without its end hook", () => {
+        const joined = start({ host: "codex", sessionId: THREAD_ID });
+        ask(asker(), joined.agent_id);
+        const later = Date.now() + WAKE_FALLBACK_MS + 1000;
+        expect(store.fallbackWakeCandidates(["codex"], later)).toEqual([]);
+        expect(store.fallbackWake(joined.agent_id, ["codex"], later)).toBeNull();
+    });
+
+    it("finds every online, quiet session of a host it can wake, whichever server they joined through", () => {
+        const first = start({ host: "codex", sessionId: THREAD_ID });
+        const second = start({ host: "codex", sessionId: "01a16d85-083e-7373-9dd6-6ae1676b6d7d" });
+        const busy = start({ host: "codex", sessionId: "01a16d85-083e-7373-9dd6-6ae1676b6d7e" });
+        const claude = start({ sessionId: "claude-session" });
+        const from = asker();
+        for(const card of [first, second, busy, claude]) {
+            ask(from, card.agent_id);
+        }
+        const later = Date.now() + WAKE_FALLBACK_MS + 1000;
+        for(const card of [first, second, busy, claude]) {
+            online(card.agent_id, later);
+        }
+        // one that called concos a minute ago is still at work
+        at(later - 60 * 1000, () => store.recordCall(busy.agent_id));
+        expect(store.fallbackWakeCandidates(["codex"], later)).toEqual([first.agent_id, second.agent_id].sort());
+        expect(store.fallbackWakeCandidates([], later)).toEqual([]);
+        const woken = store.fallbackWakeCandidates(["codex"], later).map((agentId) => store.fallbackWake(agentId, ["codex"], later)?.sessionId);
+        expect(woken.sort()).toEqual([THREAD_ID, "01a16d85-083e-7373-9dd6-6ae1676b6d7d"]);
     });
 });
 

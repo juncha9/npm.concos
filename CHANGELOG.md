@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.14] - 2026-10-27
+
+### Changed
+
+- **Any MCP server wakes every stuck Codex session.** In 0.1.13 only the MCP
+  server an agent joined through could wake its Codex session when no watch did,
+  so every session had to restart, and its agent call concos, before it was
+  covered. Now each concos MCP server checks all online Codex cards on the
+  machine, so one new session of any client covers sessions still running an
+  older server. A card with no sign of life for 3 minutes is left alone, since its
+  session may have closed without its end hook.
+
+### Notes
+
+- It starts working once one concos MCP server of this version runs on the
+  machine: reconnect concos in any client (`/mcp` in Claude Code) or start any
+  new session. Sessions already running need no restart. No schema change.
+
 ## [0.1.13] - 2026-10-27
 
 ### Fixed

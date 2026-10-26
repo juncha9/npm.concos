@@ -39,7 +39,7 @@ import { inputSchema } from "./tool-schema";
 import type { ValueSchema } from "./tool-schema";
 
 const SHUTDOWN_DEADLINE_MS = 3000;
-/** Hosts whose sessions can be woken from outside (Codex): an MCP server wakes them when no watch did. */
+/** Hosts whose sessions can be woken from outside (Codex): any MCP server wakes them when no watch did. */
 const WAKE_HOSTS = HOST_ADAPTERS.filter((adapter) => adapter.deliverWake != null);
 
 /**
@@ -363,11 +363,20 @@ export async function runBridge(): Promise<void> {
         catch(ex) {
             _logger.error(ex, "heartbeat or clean-up failed");
         }
-        // a turn that fails ends without the Stop hook, so no watch wakes the session; its MCP
-        // server, still running, wakes it once a message has waited too long (2026-10-27)
-        for(const agentId of joinedAgentIds) {
+        // a turn that fails ends without the Stop hook, so no watch wakes the session. Every MCP
+        // server wakes any online session left so once a message has waited too long, not only
+        // the ones joined through it: one server of this version covers the machine (2026-10-27)
+        const hosts = WAKE_HOSTS.map((adapter) => adapter.id);
+        let candidates: string[] = [];
+        try {
+            candidates = store.fallbackWakeCandidates(hosts);
+        }
+        catch(ex) {
+            _logger.error(ex, "fallback wake check failed");
+        }
+        for(const agentId of candidates) {
             try {
-                const wake = store.fallbackWake(agentId, WAKE_HOSTS.map((adapter) => adapter.id));
+                const wake = store.fallbackWake(agentId, hosts);
                 if(wake == null) {
                     continue;
                 }

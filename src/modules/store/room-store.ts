@@ -1416,11 +1416,37 @@ export class RoomStore {
     }
 
     /**
+     * The cards `fallbackWake` may wake: bound to a session of one of `hosts`, online, and quiet
+     * for `WAKE_FALLBACK_MS`. Every MCP server looks at all of them, not only the cards joined
+     * through it, so one server of this version on the machine covers every such session, even
+     * those whose own server is older (2026-10-27 user decision).
+     */
+    fallbackWakeCandidates(hosts: string[], nowMs: number = Date.now()): string[] {
+        const rows = this.prepare(`
+            SELECT id
+            FROM agent
+            WHERE host IN (SELECT value FROM json_each(:hosts))
+                AND host_session_id IS NOT NULL
+                AND left_at IS NULL
+                AND disconnected_at IS NULL
+                AND last_seen_at >= :online_since
+                AND (last_call_at IS NULL OR last_call_at <= :quiet_since)
+            ORDER BY id
+        `).all({
+            hosts: JSON.stringify(hosts),
+            online_since: new Date(nowMs - OFFLINE_AFTER_MS).toISOString(),
+            quiet_since: new Date(nowMs - WAKE_FALLBACK_MS).toISOString(),
+        }) as { id: string }[];
+        return rows.map((row) => row.id);
+    }
+
+    /**
      * Idle wake that no watch made. A turn that fails ends without the Stop hook, so no watch
      * starts and the card stays working; a watch may also have run out or failed to start. When a
      * message to wake for has waited `WAKE_FALLBACK_MS` without being pointed out, and the agent,
-     * bound to a session of one of `hosts`, has not acted for as long, the wake is recorded as a
-     * watch records it, any watch still running ends, and the session to wake comes back.
+     * bound to a session of one of `hosts` and online, has not acted for as long, the wake is
+     * recorded as a watch records it, any watch still running ends, and the session to wake comes
+     * back. An offline card is left alone: its session may have closed without its end hook.
      *
      * Reads take no lock; the wake is checked again under the write lock before it is recorded.
      */
@@ -1428,13 +1454,17 @@ export class RoomStore {
         // the wake, and the wake times within the last hour
         const look = (): { wake: FallbackWake; woken: string[] } | null => {
             const row = this.prepare(`
-                SELECT host, host_session_id, hook_nudged_seq, woken_at_list, last_call_at
+                SELECT host, host_session_id, hook_nudged_seq, woken_at_list, last_call_at, last_seen_at
                 FROM agent
                 WHERE id = :id AND left_at IS NULL AND disconnected_at IS NULL
             `).get({ id: agentId }) as {
-                host: string | null; host_session_id: string | null; hook_nudged_seq: number; woken_at_list: string; last_call_at: string | null;
+                host: string | null; host_session_id: string | null; hook_nudged_seq: number; woken_at_list: string;
+                last_call_at: string | null; last_seen_at: string;
             } | undefined;
             if(row == null || row.host == null || row.host_session_id == null || hosts.includes(row.host) == false) {
+                return null;
+            }
+            if(nowMs - Date.parse(row.last_seen_at) > OFFLINE_AFTER_MS) {
                 return null;
             }
             if(row.last_call_at != null && nowMs - Date.parse(row.last_call_at) < WAKE_FALLBACK_MS) {

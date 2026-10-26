@@ -573,7 +573,10 @@ should wake the session has waited 10 minutes without a wake, and the agent has
 not called concos for 10 minutes, it queues the same line. It does the same when
 a watch ran out or never started. If the agent is in fact still in a long turn,
 Codex may hold the queued line until that turn ends; this has not been verified.
-This needs an MCP server the agent joined through, from this version on.
+Every concos MCP server from 0.1.14 on does this for all online Codex sessions on
+the machine, not only its own, so one new session of any client is enough. A card
+with no sign of life for 3 minutes is left alone, since its session may have
+closed without its end hook.
 
 ### Settings, trust and performance
 
