@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import type { ExecFileOptions } from "node:child_process";
-import { WAKE_WATCH_MS } from "../../../_defs";
 import { RoomError } from "../../store/room-error";
 import type { HostAdapter } from "../types";
 import { contextOutput, continueOutput, failed, normalizeEvent, object, patchFiles, withContinue } from "./shared";
@@ -52,8 +51,9 @@ export const codex: HostAdapter = {
         // Codex allows at most 3 seconds here
         { event: "SessionEnd", kind: "session-end", timeout: 3 },
     ],
-    // the watch stops itself after WAKE_WATCH_MS; the timeout is the host's backstop a minute later
-    wake: { event: "Stop", kind: "watch", timeout: WAKE_WATCH_MS / 1000 + 60, async: true },
+    // the hook starts the watch in a node of its own and ends, so this timeout never binds the watch;
+    // it stays as registered, since Codex may ask to trust a changed hook again
+    wake: { event: "Stop", kind: "watch", timeout: 3660, async: true },
     deliverWake: queueMessage,
     normalize(kind, raw) {
         const payload = object(raw);

@@ -4,6 +4,122 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.13] - 2026-10-27
+
+### Fixed
+
+- **An answer to an agent's own note or notice now wakes it.** Work is often
+  handed over as a note and its result comes back as the answer; until now only
+  answers to questions woke the session, so these waited for the user. Answers to
+  answers still wake nobody, and a turn end still continues only for questions and
+  answers to questions.
+- **A Codex session whose turn failed is woken by its MCP server.** A failed turn
+  ends without the Stop hook, so no watch started and the card stayed `working`
+  with its messages unread. When a message that should wake the session has
+  waited 10 minutes without a wake, and the agent has not called concos for as
+  long, the session's MCP server queues the wake line with `codex queue`. This
+  also covers a watch that ran out or never started.
+- **The selected card no longer slips off the board.** When a long selected card
+  shrank after being paged through, or cards above it grew between refreshes
+  while their state animated, the list kept its old scroll position and the
+  selection ended up off screen, as if the cursor had moved to the next card. The
+  board now keeps the selected card where it was on screen, and brings it back
+  when it would leave.
+- **Narrow terminals keep the Enter, Esc and tab hints** in the footer; the
+  scroll position is shortened or dropped first.
+- **Direct exec watches keep open Claude sessions online.** They refresh
+  `last_seen_at` every 60 seconds and exit when their parent client disappears.
+  If the parent was already absent at startup, they still wake but skip the
+  parent check and keepalive. Claude's `concos ...` command form only wakes:
+  its shell parent can outlive the client. Global Windows registration updates
+  select exec form; macOS, Linux and npx command-based registrations remain wake-only.
+  Codex's detached watch has no parent check and refreshes until session end or
+  expiry.
+- **Restarting an MCP server no longer ends its hook-bound card or stops its
+  wake watch.** Bridge shutdown still releases editing claims, but only cards
+  without a host session are marked disconnected. Hook-bound cards end through
+  the session-end hook.
+
+### Changed
+
+- **Idle watches last until the session ends, up to 24 hours after each turn.**
+  The previous one-hour watch missed messages arriving later in an open session.
+  The 60-second idle requirement and one wake per message remain; there is no
+  hourly limit.
+- **Hook reminders count every unread message.** Named targets are followed by
+  `plus N other unread`; a prompt or session start with no named targets reports
+  `N messages`. This lets the same turn read answers to answers and answers to
+  other agents' questions without making those replies trigger a new wake.
+- **An explicit containing project root can correct a card's project.** `join`
+  with `resume_handle` and a verified `workspace_root` containing the session's
+  start folder moves the existing card and returns `moved_from_project`. A root
+  below or outside that folder is ignored with `workspace_root_ignored`. Session
+  hooks and ordinary working-folder changes keep the project in place. Existing
+  editing claims are recalculated from the new project root so they still name
+  the same files.
+- **Type right on the Search messages row.** On a terminal, typing while the
+  cursor is on **Search messages** in the Messages tab writes into the row, and
+  Enter shows the messages whose text contains it. Backspace deletes, Ctrl+U or
+  Esc clears the text, and Enter on an empty row still asks for text, topic or
+  sender.
+- **Search results are grouped by sender**, as on the board: the sender of the
+  newest match first, each group newest first, and each row names only whom the
+  message went to.
+- **Settings previews read like a diff**: each file's changed lines, removed in red
+  and added in green, under `@@` line numbers. The lines around a change are left
+  out, since they belong to other servers, and a value named like a password or
+  token is shown as `***`. A JSON file kept on one line is compared formatted, one
+  value per line, so the changed values show instead of the whole file. A summary
+  of the files, the settings they touch and why ends the preview, right above the
+  question, where a long diff cannot push it away.
+- **Sending is a form.** **To**, **Message** and **Topics** show their values; pick a
+  row to change it, then **Send**. Esc inside a row returns to the form with the
+  value kept, instead of dropping the message. Leaving without sending keeps the
+  draft for the next send while the menu runs; **Discard draft** drops it.
+- **"All agents" is now "Post to the room"**, with the note that agents see it on
+  `check_in` and nobody is notified, which is what a post to the room does.
+- **Long agent cards and messages scroll in place.** Their text scrolls with
+  PgUp/PgDn or Home/End while the title and actions stay on screen. Before, a long
+  detail showed only its end, and returning from it could leave the board one line
+  off.
+- **Cards list their waiting messages.** An agent's card shows **Waiting messages**:
+  each unreceived message's number, kind, sender, age, whether a hook may wake the
+  session for it and whether it was pointed out, with one preview line. Choose one
+  to read it in full; viewing does not count as the agent receiving it. A waiting
+  card whose wake target has gone unannounced for more than 10 minutes gets a
+  **Check** line asking you to type in that session, and **Take down flagged
+  cards** leaves such cards out.
+- **Answer from a message.** A message's detail offers **Reply to sender** for a
+  message to you or a post, sent as a reply under its topics, and **Message the
+  sender** for a message between agents.
+- **Search keeps your text.** Esc or **Search again** returns to the board with the
+  text still in the **Search messages** row.
+- **Compact view** on the Agents tab shows one line per card: state, name, unread
+  count and task.
+- **The Agents tab keeps a fixed order**: projects by name, and agents by name
+  within each project. Before, blocked and working agents and their projects came
+  first, so a card that changed state moved, and a whole project could jump while
+  you looked at it. State still shows in color and in the status bar.
+- **`CONCOS_BOARD_TRACE=<file>` records what the board draws**: one JSON line per
+  redraw, refresh, key and resize, with sizes, positions and row ids but no row
+  text, for reporting a display problem.
+
+### Notes
+
+- Update the **Claude Code** registration through **Update available**, then
+  restart the session to apply day-long monitoring. Its watch timeout changes
+  from `3660` to `86460` seconds. A timeout-only update applies only to a missing
+  or shorter Claude watch timeout and preserves the start command. Longer values
+  and other hooks' timeouts are left as configured. **Codex registration stays
+  unchanged**, including its timeout (default `3660`), because its hook detaches
+  the watch and ends immediately.
+- No schema change. A watch already running keeps its previous lifetime and wake
+  rules until it ends; the next turn end starts a watch with the updated code.
+- The MCP server's wake for a Codex session no watch woke runs in MCP servers of
+  this version the agent joined through. Start a Codex session again to give it
+  one.
+- The README opens with a short recording of the board.
+
 ## [0.1.12] - 2026-10-26
 
 ### Changed

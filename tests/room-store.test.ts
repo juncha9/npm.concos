@@ -4,6 +4,7 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CHECK_IN_MAX_CHARS, MESSAGE_PREVIEW_LENGTH } from "../src/_defs";
+import { CONCOS_VERSION } from "../src/_libs/version";
 import { openDatabase } from "../src/modules/store/database";
 import { RoomError } from "../src/modules/store/room-error";
 import { RoomStore } from "../src/modules/store/room-store";
@@ -127,6 +128,28 @@ describe("join", () => {
         emptyCheckIn(joined.agent_id, { update: { currentDirectory: workDirectory } });
         expect(inspect().current_directory).toBeUndefined();
         expect(() => emptyCheckIn(joined.agent_id, { update: { currentDirectory: "docs-repo" } })).toThrow(/absolute/);
+    });
+
+    it("moves a card up to a project root holding the folder its session started in, never down into another", () => {
+        const app = path.join(workDirectory, "app-web");
+        const docs = path.join(workDirectory, "docs-repo");
+        fs.mkdirSync(app);
+        fs.mkdirSync(docs);
+        const joined = store.join({ room: "dev", displayName: "Admin", client: "test", workingDirectory: app, workspaceRoot: null, resumeHandle: null });
+        emptyCheckIn(joined.agent_id, { update: { editing: ["src/a.ts"] } });
+        // told its project root is the folder above, it joins again with that root
+        const up = store.join({ room: "dev", displayName: "Admin", client: "test", workingDirectory: workDirectory, workspaceRoot: workDirectory, resumeHandle: joined.handle });
+        expect(up.agent_id).toBe(joined.agent_id);
+        expect(up.workspace_id).not.toBe(joined.workspace_id);
+        expect(up.moved_from_project).toBe(app);
+        // the claim keeps naming the same file, now as a path from the root above
+        expect(store.getRoomOverview("main", 0).agents[0]).toMatchObject({ workspace_path: workDirectory, working_directory: app, editing: ["app-web/src/a.ts"] });
+
+        // a folder beside or below the one it started in holds no part of it: the card stays
+        const down = store.join({ room: "dev", displayName: "Admin", client: "test", workingDirectory: docs, workspaceRoot: docs, resumeHandle: joined.handle });
+        expect(down.workspace_id).toBe(up.workspace_id);
+        expect(down.workspace_root_ignored).toMatch(/must hold the folder this session started in/);
+        expect(down.moved_from_project).toBeUndefined();
     });
 
     it("merges by the project the session started in, even when the model joins from another folder", () => {
@@ -668,8 +691,9 @@ describe("cards that look wrong", () => {
     };
 
     it("records the concos version of the bridge that joined or keeps the card alive, and flags an older one", () => {
-        const joined = store.join({ room: "dev", displayName: "Old", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, concosVersion: "0.1.11" });
-        expect(overviewOf(joined.agent_id)).toMatchObject({ concos_version: "0.1.11", issues: [] });
+        // the running concos's own version, which a release raises
+        const joined = store.join({ room: "dev", displayName: "Old", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null, concosVersion: CONCOS_VERSION });
+        expect(overviewOf(joined.agent_id)).toMatchObject({ concos_version: CONCOS_VERSION, issues: [] });
         // a bridge left over from an earlier concos keeps beating the card
         store.heartbeat([joined.agent_id], "0.0.1");
         expect(overviewOf(joined.agent_id)).toMatchObject({ concos_version: "0.0.1", issues: [{ kind: "old_concos", version: "0.0.1" }] });

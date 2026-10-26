@@ -1,9 +1,11 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { WAKE_FALLBACK_MS } from "../src/_defs";
 import { openDatabase } from "../src/modules/store/database";
 import { SCHEMA_STEPS } from "../src/modules/store/schema";
 import { RoomStore } from "../src/modules/store/room-store";
@@ -131,12 +133,12 @@ describe("hook lifecycle", () => {
         }).message_id);
         const before = database.prepare("SELECT delivered_seq FROM agent WHERE id = ?").get(joined.agent_id);
         const output = processHook(store, event("prompt"), "dev");
-        // notes and notices are named too; an answer to another's question is not
-        expect(output?.context).toBe(`concos: unread for you — question #${question.message_id} from human; note #${sent[0]} from human; notice #${sent[1]} from human. Read them with read_messages.`);
+        // notes and notices are named too; an answer to another's question is only counted
+        expect(output?.context).toBe(`concos: unread for you — question #${question.message_id} from human; note #${sent[0]} from human; notice #${sent[1]} from human; plus 1 other unread. Read them with read_messages.`);
         expect(database.prepare("SELECT delivered_seq FROM agent WHERE id = ?").get(joined.agent_id)).toEqual(before);
         expect(store.getInbox(joined.agent_id)).toEqual({ questions: 1, notes: 3 });
         store.checkIn(joined.agent_id, { update: {}, receivedMessageIds: [question.message_id, sent[0], sent[1]], cursor: null, expectedRevision: null, checkpoint: null });
-        expect(processHook(store, event("prompt"), "dev")).toBeUndefined();
+        expect(processHook(store, event("prompt"), "dev")?.context).toBe("concos: unread for you — 1 message. Read them with read_messages.");
         expect(store.getInbox(joined.agent_id)).toEqual({ questions: 0, notes: 1 });
     });
 
@@ -327,6 +329,15 @@ describe("idle wake", () => {
         expect(store.checkWakeWatch(watch(), true)).toEqual({ state: "wait" });
     });
 
+    it.each(["note", "notice"] as const)("wakes for an answer to its own %s, which a turn end does not continue for", (kind) => {
+        const joined = start();
+        const from = asker();
+        const handedOver = store.sendMessage(joined.agent_id, { to: from, kind, text: "please do this", replyTo: null, requestId: null }).message_id;
+        const result = store.sendMessage(from, { to: joined.agent_id, kind: "reply", text: "done", replyTo: handedOver, requestId: null }).message_id;
+        expect(store.applyHookEvent(event("turn-end", { canContinue: true }), "dev")?.continueFor).toBeUndefined();
+        expect(store.checkWakeWatch(watch(), true)).toMatchObject({ state: "wake", notices: [{ id: result, kind: "reply" }] });
+    });
+
     it("wakes for a question the last turn end could not point out", () => {
         const joined = start();
         const question = ask(asker(), joined.agent_id);
@@ -362,6 +373,59 @@ describe("idle wake", () => {
         // the wakes at +0, +1 and +2 seconds are over an hour old by then
         const row = database.prepare("SELECT woken_at_list FROM agent WHERE id = ?").get(joined.agent_id) as { woken_at_list: string };
         expect(JSON.parse(row.woken_at_list)).toHaveLength(4);
+    });
+
+    it("keeps a session's card connected, and its watch going, when one of its MCP servers exits", () => {
+        const joined = start();
+        const live = watch();
+        // a client restarting its MCP server within the open session
+        store.disconnect([joined.agent_id]);
+        expect(database.prepare("SELECT disconnected_at FROM agent WHERE id = :id").get({ id: joined.agent_id })).toEqual({ disconnected_at: null });
+        expect(store.checkWakeWatch(live, true)).toEqual({ state: "wait" });
+        // the session's own end still ends it
+        store.applyHookEvent(event("session-end"), "dev");
+        expect(store.checkWakeWatch(live, true)).toEqual({ state: "stop" });
+    });
+
+    it("tells of the other unread messages in the wake line, so the woken turn reads them too", async () => {
+        const joined = start();
+        const from = asker();
+        // an answer to the session's answer wakes nobody, but stays unread
+        const note = store.sendMessage(from, { to: joined.agent_id, kind: "note", text: "fyi", replyTo: null, requestId: null }).message_id;
+        store.acknowledge(joined.agent_id, [note]);
+        const thanks = store.sendMessage(joined.agent_id, { to: from, kind: "reply", text: "thanks", replyTo: note, requestId: null }).message_id;
+        store.sendMessage(from, { to: joined.agent_id, kind: "reply", text: "noted", replyTo: thanks, requestId: null });
+        const waking = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000 });
+        setTimeout(() => ask(from, joined.agent_id), 30);
+        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker; plus 1 other unread\. Read them with read_messages/);
+        expect(processHook(store, event("prompt"), "dev")?.context).toMatch(/question #\d+ from Asker; plus 1 other unread\./);
+    });
+
+    it("keeps the waiting card online while it watches, and ends once the client that ran it is gone", async () => {
+        const joined = start();
+        database.prepare("UPDATE agent SET last_seen_at = :old WHERE id = :id").run({ old: "2026-01-01T00:00:00.000Z", id: joined.agent_id });
+        // stands in for the Claude Code process that started the watch, then quits
+        const client = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { stdio: "ignore" });
+        const startedMs = Date.now();
+        expect(await watchForWake(store, event("watch"), { idleMs: 0, pollMs: 10, watchMs: 10_000, keepAliveMs: 0 }, { keepOnline: true, parentPid: client.pid })).toBeNull();
+        expect(Date.now() - startedMs).toBeLessThan(5000);
+        const seen = database.prepare("SELECT last_seen_at FROM agent WHERE id = :id").get({ id: joined.agent_id }) as { last_seen_at: string };
+        expect(Date.now() - Date.parse(seen.last_seen_at)).toBeLessThan(5000);
+    });
+
+    it("does not keep the card online for a parent already gone when the watch starts, but still watches", async () => {
+        const joined = start();
+        database.prepare("UPDATE agent SET last_seen_at = :old WHERE id = :id").run({ old: "2026-01-01T00:00:00.000Z", id: joined.agent_id });
+        // a launcher that ran the watch and left: nothing vouches for the session any more
+        const launcher = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+        await new Promise((resolve) => launcher.once("exit", resolve));
+        const waking = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000, keepAliveMs: 0 }, { keepOnline: true, parentPid: launcher.pid });
+        setTimeout(() => ask(asker(), joined.agent_id), 50);
+        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker\./);
+        expect(database.prepare("SELECT last_seen_at FROM agent WHERE id = :id").get({ id: joined.agent_id })).toEqual({ last_seen_at: "2026-01-01T00:00:00.000Z" });
+        // started through a shell, which outlives a killed client: the watch only wakes
+        expect(await watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 100, keepAliveMs: 0 }, { keepOnline: false })).toBeNull();
+        expect(database.prepare("SELECT last_seen_at FROM agent WHERE id = :id").get({ id: joined.agent_id })).toEqual({ last_seen_at: "2026-01-01T00:00:00.000Z" });
     });
 
     it("resolves the watch with the wake line when a question arrives, or with nothing when its time runs out", async () => {
@@ -406,6 +470,49 @@ describe("Codex idle wake", () => {
 
     it("refuses a session id that is not a Codex thread id, before running anything", async () => {
         await expect(codex.deliverWake!("session-1 & calc", "line")).rejects.toThrow(/invalid Codex session id/);
+    });
+
+    it("lets the MCP server wake a session no watch woke, once the message and the agent have been quiet long enough", () => {
+        const session = { host: "codex", sessionId: THREAD_ID } as const;
+        const joined = start(session);
+        const from = store.join({ room: "main", displayName: "Asker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const live = store.startWakeWatch(event("watch", session))!;
+        // a failed turn: the prompt came and the Stop hook never did, so the card stays working
+        store.applyHookEvent(event("prompt", session), "dev");
+        const question = store.sendMessage(from, { to: joined.agent_id, kind: "question", text: "body", replyTo: null, requestId: null }).message_id;
+        const nowMs = Date.now();
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS - 5000)).toBeNull();
+        expect(store.fallbackWake(joined.agent_id, ["claude"], nowMs + WAKE_FALLBACK_MS + 1000)).toBeNull();
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS + 1000)).toEqual({
+            host: "codex", sessionId: THREAD_ID, notices: [expect.objectContaining({ id: question })], unread: 1,
+        });
+        // pointed out once, by one of them: the fallback does not come back to it and older watches end
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS + 2000)).toBeNull();
+        expect(store.checkWakeWatch(live, true)).toEqual({ state: "stop" });
+        expect(card(joined.agent_id).status).toBe("working");
+    });
+
+    it("leaves the wake to the watch while the agent acts or the message is new", () => {
+        const session = { host: "codex", sessionId: THREAD_ID } as const;
+        const joined = start(session);
+        const from = store.join({ room: "main", displayName: "Asker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const nowMs = Date.now();
+        const at = (ms: number, act: () => void) => {
+            vi.useFakeTimers({ now: ms, toFake: ["Date"] });
+            try {
+                act();
+            }
+            finally { vi.useRealTimers(); }
+        };
+        // a message that came after a long quiet is still new
+        at(nowMs + WAKE_FALLBACK_MS, () => {
+            store.sendMessage(from, { to: joined.agent_id, kind: "question", text: "body", replyTo: null, requestId: null });
+        });
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + WAKE_FALLBACK_MS + 1000)).toBeNull();
+        // the agent acts late in the period: the clock starts again from its last call
+        at(nowMs + 2 * WAKE_FALLBACK_MS - 1000, () => store.recordCall(joined.agent_id));
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + 2 * WAKE_FALLBACK_MS + 1000)).toBeNull();
+        expect(store.fallbackWake(joined.agent_id, ["codex"], nowMs + 3 * WAKE_FALLBACK_MS)).not.toBeNull();
     });
 });
 

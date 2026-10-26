@@ -1,6 +1,6 @@
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import type { AgentIssue, InspectResult, RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
+import type { AgentIssue, InspectResult, PendingMessage, PendingWakeExclusion, RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth } from "./prompter";
 
 export interface StatusRenderOptions {
@@ -170,6 +170,11 @@ export function issueText(issue: AgentIssue, nowMs: number, english: boolean): s
     if(issue.kind == "duplicate") {
         return english ? "a newer card has this name · take this one down" : "같은 이름의 새 카드가 있음 · 이 카드를 내리세요";
     }
+    if(issue.kind == "unread_unwoken") {
+        const duration = age(issue.since, nowMs, english).replace(english ? / ago$/ : / 전$/, "");
+        return english ? `${issue.count} unread for ${duration} without a wake · type in the session`
+            : `미확인 ${issue.count}개가 ${duration}째 깨우지 못함 · 세션에 입력하세요`;
+    }
     return english ? `says working, but last acted ${age(issue.since, nowMs, true)}` : `작업 중이지만 마지막 활동은 ${age(issue.since, nowMs, false)}`;
 }
 
@@ -305,7 +310,7 @@ function detailWidth(options: StatusRenderOptions): number {
  * One agent's full card and recent checkpoints, for the waiting room board's detail view.
  * The board list shows one line per agent; this is where the long fields are read.
  */
-export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions = {}): string {
+export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions & { pendingMessages?: PendingMessage[] } = {}): string {
     const english = options.language == "en";
     const nowMs = options.nowMs ?? Date.now();
     const width = detailWidth(options);
@@ -354,7 +359,7 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
     if(agent.pending_count > 0) {
         unread = english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`;
     }
-    // wrapped like every other line: the board erases the card by its line count when it returns
+    // Wrapped like every other field so the card can fit in the detail viewport.
     const nameLines = wrap(participantName(card.name, card.client, card.human), Math.max(10, width - displayWidth(stateText) - displayWidth(unread)));
     nameLines.forEach((nameLine, lineIndex) => {
         let line = `${" ".repeat(displayWidth(stateText))}${paint(nameLine, 1)}`;
@@ -391,6 +396,18 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
     field(english ? "Editing" : "편집 중", card.editing.join(", "));
     field(english ? "References" : "참고", card.references.join(", "));
 
+    if(options.pendingMessages != null) {
+        lines.push("");
+        add(english ? "Waiting messages" : "미확인 메시지", "", 1);
+        if(options.pendingMessages.length == 0) add(english ? "None" : "없음", "  ", 2);
+        for(const message of options.pendingMessages) {
+            for(const line of pendingMessageLines(message, width - 2, options)) {
+                const code = line.tone == "bold" ? 1 : line.tone == "warning" ? 33 : 2;
+                lines.push("  " + paint(line.text, code));
+            }
+        }
+    }
+
     if(detail.checkpoints.length > 0) {
         lines.push("");
         add(english ? "Checkpoints" : "체크포인트", "", 1);
@@ -400,6 +417,43 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
         }
     }
     return lines.join("\n");
+}
+
+/** The same waiting-message diagnostics in a full card or a selectable board row. */
+export function pendingMessageLines(message: PendingMessage, width: number, options: StatusRenderOptions = {}): { text: string; tone: "bold" | "warning" | "dim" }[] {
+    const english = options.language == "en";
+    const nowMs = options.nowMs ?? Date.now();
+    const contentWidth = Math.max(1, width - 2);
+    const header = `#${message.id} ${message.kind.toUpperCase()} · ${participantName(message.from_name, message.from_client, message.from_human)} · ${age(message.created_at, nowMs, english)}`;
+    const delivery = message.delivered_at == null
+        ? (english ? "Full text not delivered" : "전문 전달 전")
+        : (english ? `Full text delivered ${age(message.delivered_at, nowMs, true)}` : `전문 전달 ${age(message.delivered_at, nowMs, false)}`);
+    const wake = `${pendingWakeText(message, english)} · ${delivery}`;
+    const tone: "warning" | "dim" = message.wake_target && !message.notified ? "warning" : "dim";
+    return [
+        ...wrap(header, Math.max(1, width)).map((text) => ({ text, tone: "bold" as const })),
+        ...wrap(wake, contentWidth).map((text) => ({ text: "  " + text, tone })),
+        ...previewText(message.preview, contentWidth, 1, options.unicode ?? true).map((text) => ({ text: "  " + text, tone: "dim" as const })),
+    ];
+}
+
+function pendingWakeText(message: PendingMessage, english: boolean): string {
+    if(message.wake_target) {
+        if(english) return message.notified ? "Wake target · already notified" : "Wake target · not yet notified";
+        return message.notified ? "깨우기 대상 · 이미 알림" : "깨우기 대상 · 아직 알리지 않음";
+    }
+    const reasons: Record<PendingWakeExclusion, [string, string]> = {
+        reply_to_your_reply: ["Reply to this agent's answer", "이 에이전트의 답에 온 답"],
+        reply_to_other_reply: ["Reply to another answer", "다른 답에 온 답"],
+        reply_to_other_question: ["Reply to someone else's question", "다른 이의 질문에 온 답"],
+        reply_to_your_note: ["Reply to this agent's note", "이 에이전트의 note에 온 답"],
+        reply_to_other_note: ["Reply to someone else's note", "다른 이의 note에 온 답"],
+        reply_to_your_notice: ["Reply to this agent's notice", "이 에이전트의 notice에 온 답"],
+        reply_to_other_notice: ["Reply to someone else's notice", "다른 이의 notice에 온 답"],
+        reply_target_missing: ["Reply target no longer available", "답 대상 원문 없음"],
+    };
+    const reason = message.wake_reason == null ? (english ? "Not a wake target" : "깨우기 대상 아님") : reasons[message.wake_reason][english ? 0 : 1];
+    return `${reason} · ${english ? "does not wake" : "깨우지 않음"}`;
 }
 
 /** One message in full, for the board's message view; the room report shows only first lines. */

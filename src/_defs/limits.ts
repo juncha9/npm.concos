@@ -26,8 +26,18 @@ export const HOOK_NOTICES_SHOWN = 3;
 /** Idle wake: a session wakes only after this long without a prompt since its turn ended. */
 export const WAKE_IDLE_MS = 60 * 1000;
 export const WAKE_POLL_MS = 3 * 1000;
-/** One watch's life; the registered hook timeout adds a minute so the watch ends on its own first. */
-export const WAKE_WATCH_MS = 60 * 60 * 1000;
+/**
+ * One watch's life after a turn ends: until the session ends, at most a day, the longest a message
+ * lives (2026-10-26 user decision; with an hour, messages that came later waited for the user).
+ * Claude Code's registered hook timeout adds a minute so the watch ends on its own first.
+ */
+export const WAKE_WATCH_MS = 24 * 60 * 60 * 1000;
+/**
+ * Idle wake without a watch: a message to wake for that has waited this long, to an agent that has
+ * not acted for as long, is delivered by the session's MCP server. A failed turn ends without the
+ * Stop hook, so no watch starts (2026-10-27 user decision).
+ */
+export const WAKE_FALLBACK_MS = 10 * 60 * 1000;
 /** Node flags for the long-lived processes a client starts: a 1 MB young generation keeps an idle MCP server about 2 MB smaller (2026-10-26, 26.5 → 24.1 MB). */
 export const NODE_FLAGS = ["--max-semi-space-size=1"];
 export const MAX_REQUEST_ID_LENGTH = 100;

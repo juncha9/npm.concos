@@ -10,17 +10,19 @@ import { getHostAdapter } from "./adapters";
 import { describeNotices } from "./notices";
 import { HOOK_EVENTS } from "./types";
 import type { HookEvent, HookEventKind, HookResult, HostAdapter } from "./types";
-import { watchForWake } from "./watch";
+import { WAKE_TIMINGS, watchForWake } from "./watch";
+import type { WakeLiveness } from "./watch";
 
 export function processHook(store: RoomStore, event: HookEvent, room = SHARED_ROOM): HookResult | undefined {
     const outcome = store.applyHookEvent(event, room);
     if(outcome == null) return;
     if(outcome.continueFor != null) {
         return {
-            continueReason: `${describeNotices(outcome.continueFor)} Read them with read_messages, answer questions with kind reply if they need one, then finish.`,
+            continueReason: `${describeNotices(outcome.continueFor, outcome.unread)} Read them with read_messages, answer questions with kind reply if they need one, then finish.`,
         };
     }
     const notices = outcome.notices ?? [];
+    const unread = outcome.unread ?? notices.length;
     if(outcome.joined != null) {
         const { joined } = outcome;
         const overview = store.getRoomOverview(room, 0);
@@ -28,13 +30,13 @@ export function processHook(store: RoomStore, event: HookEvent, room = SHARED_RO
         let context = `concos shared waiting room; agent_id=${joined.agent_id}; handle=${joined.handle}\n`
             + `Call join with resume_handle=${joined.handle}, your absolute working_directory and this session's name as display_name to keep this participant.\n`
             + `Hooks record your working/waiting status and edited files; keep reporting summary and next step with check_in. ${others} other participant(s).`;
-        if(notices.length > 0) {
-            context += `\n${describeNotices(notices)} Read them with read_messages.`;
+        if(unread > 0) {
+            context += `\n${describeNotices(notices, unread)} Read them with read_messages.`;
         }
         return { context: context };
     }
-    if(notices.length > 0) {
-        return { context: `${describeNotices(notices)} Read them with read_messages.` };
+    if(unread > 0) {
+        return { context: `${describeNotices(notices, unread)} Read them with read_messages.` };
     }
 }
 
@@ -97,7 +99,19 @@ async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<
     if(event != null && adapter.wake != null) {
         const database = await openDatabase(resolveDataDirectory(), { busyTimeoutMs: 100 });
         try {
-            reason = await watchForWake(new RoomStore(database), event);
+            let liveness: WakeLiveness = { keepOnline: true };
+            if(adapter.deliverWake == null) {
+                // Claude Code starts a watch registered in exec form (node with concos's flags) itself, so
+                // its parent is the client. Through the `concos` command the parent is a shell, which
+                // outlives a killed client (checked on 2.1.310): such a watch only wakes.
+                if(process.execArgv.includes(NODE_FLAGS[0])) {
+                    liveness = { keepOnline: true, parentPid: process.ppid };
+                }
+                else {
+                    liveness = { keepOnline: false };
+                }
+            }
+            reason = await watchForWake(new RoomStore(database), event, WAKE_TIMINGS, liveness);
         }
         finally { database.close(); }
         if(reason != null && adapter.deliverWake != null) {

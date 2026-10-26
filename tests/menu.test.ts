@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMenu } from "../src/modules/cli/menu";
 import type { MenuOptions } from "../src/modules/cli/menu";
-import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUpdate } from "../src/modules/cli/setup";
+import { applySetup, inspectHooks, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUpdate, resolveHooksPath } from "../src/modules/cli/setup";
 import { openDatabase } from "../src/modules/store/database";
 import { RoomStore } from "../src/modules/store/room-store";
 import { TerminalScreen } from "./terminal-screen";
@@ -45,7 +45,7 @@ async function seedRoom() {
 describe("registration menu", () => {
     it("selects a supported client directly and writes only after the preview is accepted", async () => {
         const output = await menu("setup\nclaude\ny\nback\nquit\n");
-        expect(output.indexOf("Settings to add")).toBeLessThan(output.indexOf("Register these settings?"));
+        expect(output.indexOf("Changes to ")).toBeLessThan(output.indexOf("Register these settings?"));
         // one preview names MCP, the hooks and idle wake, before the single question
         expect(output.indexOf("concos hook watch --host claude")).toBeLessThan(output.indexOf("Register these settings?"));
         expect(output).toContain("MCP, hooks and idle wake registered for Claude Code.");
@@ -237,6 +237,25 @@ describe("room menu", () => {
         finally { check.close(); }
     });
 
+    it("lists projects and their agents in a fixed order by name, whatever state they are in", async () => {
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const join = (name: string, folder: string, status: "working" | "waiting") => {
+            const joined = store.join({ room: "main", displayName: name, client: "Codex", workingDirectory: path.join(directory, folder), workspaceRoot: null, resumeHandle: null });
+            store.checkIn(joined.agent_id, { cursor: null, expectedRevision: null, update: { status }, checkpoint: null, receivedMessageIds: [] });
+        };
+        // a working agent used to pull its project, and itself, to the top
+        join("Zed", "b-project", "working");
+        join("Amy", "b-project", "waiting");
+        join("Bob", "a-project", "waiting");
+        database.close();
+
+        const output = await menu("status\nback\nquit\n");
+        const order = ["a-project", "Bob (Codex)", "b-project", "Amy (Codex)", "Zed (Codex)"].map((text) => output.indexOf(text));
+        expect(order.every((position) => position >= 0)).toBe(true);
+        expect([...order].sort((left, right) => left - right)).toEqual(order);
+    });
+
     it("keeps an agent under the project its session started in and shows the folder it works in now", async () => {
         const agent = await seedRoom();
         const docs = path.join(directory, "docs-repo");
@@ -328,8 +347,8 @@ describe("room menu", () => {
         store.sendMessage(human, { to: agent.agent_id, kind: "question", text, replyTo: null, requestId: null });
         database.close();
 
-        // the tab's actions take rows 1 and 2, above the messages
-        const output = await menu("status\nmessages\n3\nback\nquit\n");
+        // the tab's actions take rows 1 and 2, above the messages; the detail's own Back returns to the tab
+        const output = await menu("status\nmessages\n3\nback\nback\nquit\n");
         expect(output).toContain("Server (Codex) (1 unread)");
         expect(output).toContain(" Agents 1  [Messages 1]");
         expect(output).toMatch(/1\) Send a message +to all, several agents or one\n[^\n]*2\) Search messages/);
@@ -384,49 +403,81 @@ describe("room menu", () => {
         expect(frames[2]).not.toContain("preview text visible in the list");
     });
 
-    it("sends a message from an agent's card without asking for the recipient", async () => {
+    const storedMessages = async () => {
+        const database = await openDatabase(path.join(directory, "data"));
+        try { return database.prepare("SELECT recipient_agent_id, recipient_scope, kind, body FROM message ORDER BY id").all(); }
+        finally { database.close(); }
+    };
+
+    it("sends a message from an agent's card with the recipient already filled in", async () => {
         const agent = await seedRoom();
-        const output = await menu(`status\nServer\nsay\nPlease review this change\n\ny\nback\nquit\n`);
+        const output = await menu(`status\nServer\nsay\nmessage\nPlease review this change\nsend\nback\nquit\n`);
         expect(output).not.toContain("? Recipient");
-        expect(output).toContain(`Recipient: Server (Codex) (${agent.agent_id})`);
-        const database = await openDatabase(path.join(directory, "data"));
-        try {
-            expect(database.prepare("SELECT recipient_agent_id, kind FROM message").get()).toMatchObject({ recipient_agent_id: agent.agent_id, kind: "note" });
-        }
-        finally { database.close(); }
+        expect(output).toContain(`To       Server (Codex) (${agent.agent_id})`);
+        expect(await storedMessages()).toMatchObject([{ recipient_agent_id: agent.agent_id, kind: "note" }]);
     });
 
-    it("stores a message sent from the Messages tab for the selected participant after confirmation", async () => {
+    it("fills the send form row by row from the Messages tab, Enter following the rows in order", async () => {
         const agent = await seedRoom();
-        // Enter at the topics prompt files the message under none
-        const output = await menu(`status\nmessages\nsend\n${agent.agent_id}\n검증 메시지\n\ny\nback\nquit\n`);
+        // Enter picks the row the cursor moved to: To, then Message, then Topics (none), then Send
+        const output = await menu(`status\nmessages\nsend\n\n${agent.agent_id}\n\n검증 메시지\n\n\n\nback\nquit\n`);
+        expect(output).toContain("? New message");
         expect(output).toContain("1 recipient(s)");
-        const database = await openDatabase(path.join(directory, "data"));
-        try {
-            expect(database.prepare("SELECT recipient_agent_id, kind, body FROM message").get()).toMatchObject({ recipient_agent_id: agent.agent_id, kind: "note", body: "검증 메시지" });
-        }
-        finally { database.close(); }
+        expect(await storedMessages()).toMatchObject([{ recipient_agent_id: agent.agent_id, kind: "note", body: "검증 메시지" }]);
     });
 
-    it("does not store a message when confirmation is declined", async () => {
+    it("keeps an unsent draft for the next send, and drops it only when asked", async () => {
         const agent = await seedRoom();
-        await menu(`status\nmessages\nsend\n${agent.agent_id}\n취소할 메시지\n\n\nback\nquit\n`);
-        const database = await openDatabase(path.join(directory, "data"));
-        try { expect(database.prepare("SELECT COUNT(*) AS count FROM message").get()).toMatchObject({ count: 0 }); }
-        finally { database.close(); }
+        const kept = await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\n초안 메시지\nback\nsend\nsend\nback\nquit\n`);
+        expect(kept).toContain("Keeps the draft for the next send");
+        // the second form opened with the draft, its cursor on Send
+        expect(kept.slice(kept.lastIndexOf("? New message"))).toContain("초안 메시지");
+        expect(await storedMessages()).toMatchObject([{ body: "초안 메시지" }]);
+
+        await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\n버릴 메시지\nback\nsend\ndiscard\ny\nback\nquit\n`);
+        expect(await storedMessages()).toHaveLength(1);
     });
 
-    it("returns to the board, sending nothing, when Esc is pressed inside the Messages tab's send flow", async () => {
+    it("goes back to the form, the value unchanged, when Esc is pressed inside an edit", async () => {
         const agent = await seedRoom();
-        const output = await menu(`status\nmessages\nsend\n${agent.agent_id}\nESC\nback\nquit\n`);
-        // the board again after the Message prompt, not the main menu
+        const output = await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\nESC\nback\nback\nquit\n`);
+        // the form again after the Message prompt, still waiting for the text
+        const afterEsc = output.slice(output.indexOf("? Message"));
+        expect(afterEsc).toContain("? New message");
+        expect(afterEsc).toMatch(/Message\s+\(required\)/);
         expect(output.lastIndexOf("[Messages 0]")).toBeGreaterThan(output.indexOf("? Message"));
-        const database = await openDatabase(path.join(directory, "data"));
-        try { expect(database.prepare("SELECT COUNT(*) AS count FROM message").get()).toMatchObject({ count: 0 }); }
-        finally { database.close(); }
+        expect(await storedMessages()).toHaveLength(0);
     });
 
-    it("sends one message to several picked agents under the typed topics, asking again for a mistyped topic", async () => {
+    it("answers a message to the person from its detail, as a reply under the message's topics", async () => {
+        const agent = await seedRoom();
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const person = store.ensureHumanParticipant("main", os.userInfo().username);
+        const asked = store.sendMessage(agent.agent_id, { to: person, kind: "question", text: "Ship it tonight?", replyTo: null, requestId: null, topics: ["release_plan"] }).message_id;
+        database.close();
+
+        // the tab's actions take rows 1 and 2; the question is row 3
+        const output = await menu("status\nmessages\n3\nreply\nmessage\nYes, after the smoke test\nsend\nback\nback\nquit\n");
+        expect(output).toContain(`? Answer to #${asked}`);
+        expect(output).toMatch(/Topics\s+release_plan/);
+        expect(await storedMessages()).toMatchObject([
+            { kind: "question" },
+            { recipient_agent_id: agent.agent_id, kind: "reply", body: "Yes, after the smoke test" },
+        ]);
+    });
+
+    it("names a message to all a post to the room, which notifies nobody", async () => {
+        await seedRoom();
+        const output = await menu("status\nmessages\nsend\nto\nall\nmessage\nRelease freeze starts at 18:00\nsend\nback\nquit\n");
+        expect(output).toContain("Post to the room");
+        expect(output).toContain("Agents see it on check_in; nobody is notified");
+        expect(output).not.toContain("All agents");
+        expect(output).toContain("posted");
+        expect(await storedMessages()).toMatchObject([{ recipient_scope: "all", body: "Release freeze starts at 18:00" }]);
+    });
+
+    it("sends one message to several picked agents under the typed topics, keeping the form when a topic is mistyped", async () => {
         const database = await openDatabase(path.join(directory, "data"));
         const store = new RoomStore(database);
         const join = (displayName: string) => store.join({ room: "main", displayName, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
@@ -435,11 +486,11 @@ describe("room menu", () => {
         join("Third");
         database.close();
 
-        const output = await menu("status\nmessages\nsend\nseveral\nFirst\nSecond\ndone\nreview the board\nboard\nConcos board, concos-ui\ny\nback\nquit\n");
+        const output = await menu("status\nmessages\nsend\nto\nseveral\nFirst\nSecond\ndone\nmessage\nreview the board\ntopics\nboard\ntopics\nConcos board, concos-ui\nsend\nback\nquit\n");
         expect(output).toContain("Recipients · First (Codex), Second (Codex)");
         expect(output).toContain(`topic "board" must be`);
-        expect(output).toContain(`Recipient: First (Codex) (${first.agent_id}), Second (Codex) (${second.agent_id})`);
-        expect(output).toContain("Topics: concos_board, concos_ui");
+        expect(output).toContain(`First (Codex) (${first.agent_id}), Second (Codex) (${second.agent_id})`);
+        expect(output).toMatch(/Topics\s+concos_board, concos_ui/);
         expect(output).toContain("2 recipient(s)");
         const check = await openDatabase(path.join(directory, "data"));
         try {
@@ -489,13 +540,13 @@ describe("ended sessions on the board", () => {
     it("offers only active agents as recipients and says when a picked card's session has ended", async () => {
         const { database, gone } = await seedWithEnded();
         database.close();
-        const listed = await menu("status\nmessages\nsend\nback\nback\nquit\n");
-        const recipients = listed.slice(listed.indexOf("? Recipient"));
+        const listed = await menu("status\nmessages\nsend\nto\nback\nback\nback\nquit\n");
+        const recipients = listed.slice(listed.indexOf("? Recipient"), listed.indexOf("? New message", listed.indexOf("? Recipient")));
         expect(recipients).toContain("Live");
         expect(recipients).not.toContain("Gone");
 
-        const fromCard = await menu("status\nended\nGone\nsay\nhello later\n\ny\nback\nquit\n");
-        expect(fromCard).toContain(`Recipient: Gone (Codex) (${gone.agent_id})`);
+        const fromCard = await menu("status\nended\nGone\nsay\nmessage\nhello later\nsend\nback\nquit\n");
+        expect(fromCard).toContain(`Gone (Codex) (${gone.agent_id})`);
         expect(fromCard).toContain("A recipient's session has ended; it reads this only if that session comes back.");
     });
 
@@ -709,6 +760,41 @@ describe("message groups on the board", () => {
         expect(output.lastIndexOf("[Messages 1]")).toBeGreaterThan(output.indexOf("Search messages by"));
     });
 
+    it("searches message text typed straight into the Search messages row on a terminal", async () => {
+        const agent = await seedRoom();
+        const database = await openDatabase(path.join(directory, "data"));
+        const store = new RoomStore(database);
+        const human = store.ensureHumanParticipant("main", "Reviewer");
+        store.sendMessage(human, { to: agent.agent_id, kind: "note", text: "the needle is in the cart service", replyTo: null, requestId: null });
+        store.sendMessage(human, { to: agent.agent_id, kind: "note", text: "unrelated", replyTo: null, requestId: null });
+        database.close();
+
+        const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+        const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 30 });
+        let screen = "";
+        output.on("data", (chunk) => { screen += chunk.toString(); });
+        const running = runMenu({ input, output, home: path.join(directory, "user"), selfUpdate: false });
+        const frames: string[] = [];
+        // menu: Enter concos; board: Tab to Messages, 2 to the search row, type, Enter; results: Esc;
+        // board: Esc clears the query kept in the row, Esc leaves; menu: Esc
+        for(const key of ["1", "\r", "\t", "2", "n", "e", "e", "d", "l", "e", "SNAP", "\r", "SNAP", "\u001b", "SNAP", "\u001b", "\u001b", "\u001b"]) {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            if(key == "SNAP") {
+                frames.push(screen.slice(screen.lastIndexOf("\u001b[J") + 3).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, ""));
+                continue;
+            }
+            input.write(key);
+        }
+        await running;
+
+        expect(frames[0]).toMatch(/Search messages +needle/);
+        expect(frames[1]).toContain("Message search · needle · 1 result");
+        expect(frames[1]).toContain("the needle is in the cart service");
+        expect(frames[1]).not.toContain("unrelated");
+        // back on the board, the row still holds the query
+        expect(frames[2]).toMatch(/Search messages +needle/);
+    });
+
     it("draws sender rules on a terminal and inverts the selected block's header", async () => {
         vi.stubEnv("NO_COLOR", undefined);
         await seedMessages([["Alpha", []], ["Alpha", []]]);
@@ -757,13 +843,13 @@ describe("hooks on the registration screen", () => {
         const on = await menu("claude\non\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
         expect(on).toContain("MCP registered · Hooks off");
         expect(on).toContain("Claude Code · Hooks");
-        expect(on.indexOf("Settings to add")).toBeLessThan(on.indexOf("Turn on these hooks?"));
+        expect(on.indexOf("Changes to ")).toBeLessThan(on.indexOf("Turn on these hooks?"));
         expect(on).toContain("Hooks turned on for Claude Code.");
         expect(on).toContain("MCP registered · Hooks on");
         expect(inspectHooks({ host: "claude", home: home() }).state).toBe("on");
 
         const off = await menu("claude\noff\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
-        expect(off.indexOf("Settings to remove")).toBeLessThan(off.indexOf("Remove these hooks?"));
+        expect(off.indexOf("Changes to ")).toBeLessThan(off.indexOf("Remove these hooks?"));
         expect(off).toContain("Hooks turned off for Claude Code.");
         expect(inspectHooks({ host: "claude", home: home() }).state).toBe("off");
     });
@@ -784,7 +870,7 @@ describe("hooks on the registration screen", () => {
         applySetup(planRegistration(claude, { wake: true }));
         applySetup(planSetup({ host: "gemini", home: home() }));
         const output = await menu("claude\nremove\ny\ngemini\nremove\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
-        expect(output.indexOf("Settings to remove")).toBeLessThan(output.indexOf("Remove concos from this client?"));
+        expect(output.indexOf("Changes to ")).toBeLessThan(output.indexOf("Remove concos from this client?"));
         expect(output).toContain("concos removed from Claude Code.");
         expect(output).toContain("concos removed from Gemini CLI.");
         expect(inspectSetup(claude).registered).toBe(false);
@@ -804,10 +890,39 @@ describe("hooks on the registration screen", () => {
         try {
             const output = await menu("claude\ny\nback\nquit\n", { host: "claude", startWithSetup: true });
             expect(output).toContain("MCP registered · Hooks on · Wake on · Update available");
-            expect(output.indexOf("Settings to add")).toBeLessThan(output.indexOf("Update the registration?"));
+            expect(output.indexOf("Changes to ")).toBeLessThan(output.indexOf("Update the registration?"));
+            // a diff of the hook lines: the `concos` command out, node on the installed cli.js in
+            expect(output).toMatch(/\n {2}-\s*"command": "concos hook /);
+            expect(output).toMatch(/\n {2}\+\s*"command": "/);
             expect(output).toContain("Registration updated.");
             expect(planUpdate(claude)).toEqual([]);
             expect(inspectWake(claude)).toBe(true);
+        }
+        finally { process.argv[1] = argv; }
+    });
+
+    it("previews a settings file kept on one line value by value, and ends with what changes where", async () => {
+        const claude = { host: "claude", home: home() };
+        applySetup(planRegistration(claude, { wake: true }));
+        const settings = resolveHooksPath(claude);
+        fs.writeFileSync(settings, JSON.stringify(JSON.parse(fs.readFileSync(settings, "utf8"))));
+        const cli = path.join(directory, "prefix", "node_modules", "concos-mcp", "dist", "cli.js");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        fs.writeFileSync(cli, "");
+        const argv = process.argv[1];
+        process.argv[1] = cli;
+        try {
+            const output = await menu("claude\nn\nback\nquit\n", { host: "claude", startWithSetup: true });
+            const preview = output.slice(output.indexOf(`Changes to ${settings}`), output.indexOf("Update the registration?"));
+            // one changed value per line, not the whole file as one line
+            expect(preview).toMatch(/\n {2}-\s*"command": "concos hook [^\n]*\n/);
+            expect(preview.split("\n").filter((line) => /^ {2}[-+]/.test(line) && line.length >= 200)).toEqual([]);
+            expect(preview).toContain("Both versions shown formatted, one value per line");
+            // the summary sits last, right above the question
+            const summary = preview.slice(preview.indexOf("Summary"));
+            expect(preview.indexOf("Summary")).toBeGreaterThan(preview.lastIndexOf("@@"));
+            expect(summary).toContain(`${settings} · hooks.`);
+            expect(summary).toContain("Existing configuration files will be backed up before applying.");
         }
         finally { process.argv[1] = argv; }
     });

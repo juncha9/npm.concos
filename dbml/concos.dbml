@@ -24,7 +24,7 @@ Table agent {
   display_name varchar [not null]
   client varchar [not null]
   is_human integer [not null, default: 0, note: '1 = person posting from the CLI']
-  workspace_id varchar [ref: > workspace.id, note: 'the project of the folder the session started in; a later join from another folder does not change it']
+  workspace_id varchar [ref: > workspace.id, note: 'project of the session start folder; ordinary folder changes and session hooks keep it. Explicit join with resume_handle and a verified workspace_root containing that start folder may move the card, returning moved_from_project; other roots are ignored with workspace_root_ignored']
   working_directory varchar [note: 'the folder the session started in: set by its session-start hook or its first join, fixed until the session starts again']
   current_directory varchar [note: 'schema 12: the folder the agent works in now, when it is not working_directory; from check_in or a later join, cleared on leave or when a person takes the card down']
   concos_version varchar [note: 'schema 12: the concos version of the MCP bridge that last joined or kept the card alive; null until a bridge from 0.1.11 on touches it. The board flags a live card whose bridge is older']
@@ -35,19 +35,19 @@ Table agent {
   next_step varchar [not null, default: '']
   blocker varchar [not null, default: '']
   reference_list varchar [not null, default: '[]', note: 'JSON string array']
-  editing_list varchar [not null, default: '[]', note: 'JSON string array; cleared on leave and bridge shutdown']
+  editing_list varchar [not null, default: '[]', note: 'JSON string array of paths from workspace_id; recalculated from the new project root when an explicit join moves the project. Cleared on leave and bridge shutdown']
   revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
   delivered_seq integer [not null, default: 0, note: 'position delivered by the last check_in']
-  hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake has pointed out; each message is pointed out once']
-  wake_generation integer [not null, default: 0, note: 'idle wake (Claude Code, Codex): the live watch; a newer watch or a prompt raises it and ends older ones']
+  hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake (watch or MCP-server fallback) has pointed out; each message is pointed out once']
+  wake_generation integer [not null, default: 0, note: 'idle wake (Claude Code, Codex): the live watch; a newer watch, a prompt or an MCP-server fallback wake raises it and ends older ones']
   woken_at_list varchar [not null, default: '[]', note: 'JSON array of ISO times this session was woken in the last hour, kept for diagnosis; no hourly limit since 2026-10-26']
   joined_at varchar [not null]
   updated_at varchar [not null, note: 'last card or checkpoint change, not liveness']
   editing_updated_at varchar
-  last_seen_at varchar [not null, note: 'bridge heartbeat']
+  last_seen_at varchar [not null, note: 'bridge heartbeat or 60-second idle-watch keepAlive: Codex, or Claude exec form with a live parent at startup. Claude command-form watches, and exec watches whose parent was already absent, do not keep the card online']
   last_call_at varchar [note: 'last concos tool call or hook event of the agent itself, never the heartbeat; messages wait only on agents that acted within 30 minutes. Schema 7 filled existing cards from updated_at']
-  disconnected_at varchar
+  disconnected_at varchar [note: 'set by bridge shutdown only without host_session_id; hook-bound cards stay connected across MCP server restarts and end through their session-end hook']
   left_at varchar
 
   indexes {

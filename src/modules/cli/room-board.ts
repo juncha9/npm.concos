@@ -7,7 +7,7 @@ import { RoomStore } from "../store/room-store";
 import type { RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth, padToWidth, PromptBackError } from "./prompter";
 import type { LinePart, Prompter, SelectChoice, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
-import { age, issueText, plain, renderAgentDetail, renderMessageDetail, stateLabel, stateOf, workFolder, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
+import { age, issueText, plain, renderAgentDetail, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, workFolder, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
 import type { State, StatusRenderOptions } from "./status-renderer";
 import { showMessageSearch } from "./message-search";
 import { RoomActivity } from "./room-activity";
@@ -35,19 +35,24 @@ const PEOPLE_GROUP = "\u0000people";
 
 export interface RoomBoardOptions extends StatusRenderOptions {
     /** Opens the send flow: to `agentId` when given (an agent's card), else asking for all, several agents or one (the Messages tab). */
-    send: (agentId?: string) => Promise<void>;
+    send: (agentId?: string, reply?: { messageId: number; topics: string[] }) => Promise<void>;
 }
 
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "tidy:posts" | "send:message" | "search:messages" | "retire:flagged" | "back";
+type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "send:message" | "search:messages" | "retire:flagged" | "back";
 
 type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
 /** Left or ended: still on record, folded away on the board. */
 function isInactive(agent: RoomOverviewAgent): boolean {
     return agent.left == true || agent.ended == true;
+}
+
+/** An unwoken message calls for typing in the session, rather than taking its card down. */
+function canTakeDownFlagged(agent: RoomOverviewAgent): boolean {
+    return agent.human == false && isInactive(agent) == false && agent.issues.some((issue) => issue.kind != "unread_unwoken");
 }
 
 interface BoardView {
@@ -66,6 +71,18 @@ interface BoardView {
 
 function oneLine(text: string): string {
     return plain(text).replace(/\s+/g, " ").trim();
+}
+
+/** Fill a compact cell without wrapping a short name down to its first word. */
+function compactText(text: string, width: number, unicode: boolean): string {
+    if(displayWidth(text) <= width) return text;
+    const ellipsis = unicode ? "…" : ".".repeat(Math.min(3, width));
+    let shown = "";
+    for(const character of text) {
+        if(displayWidth(shown + character + ellipsis) > width) break;
+        shown += character;
+    }
+    return shown.trimEnd() + ellipsis;
 }
 
 function projectName(workspacePath: string, english: boolean): string {
@@ -136,16 +153,15 @@ function writtenLineCount(text: string): number {
 }
 
 /**
- * The Agents tab, grouped by project with blocked and working agents first. Each agent is a
+ * The Agents tab, grouped by project in a fixed order, by project and then agent name. Each agent is a
  * state column, its name with the unread count right after it, then its role, the folder it works
  * in when that is not its project's root, its blocker, task and next step on lines aligned under
  * the name.
  */
-function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: boolean, nowMs: number, showEnded: boolean, activity: RoomActivity, unicode = true): {
+function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: boolean, nowMs: number, showEnded: boolean, activity: RoomActivity, unicode = true, compact = false): {
     items: SelectItem<BoardValue>[];
     inactiveCount: number;
 } {
-    const priority = (agent: RoomOverviewAgent): number => STATE_PRIORITY.indexOf(stateOf(agent));
     const agents = allAgents.filter((agent) => isInactive(agent) == false);
     const inactive = allAgents.filter((agent) => isInactive(agent) == true);
     // fixed widths from every possible value, so a refresh never shifts the columns
@@ -179,13 +195,26 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                 else if(receding == true) {
                     paintName = style.dim;
                 }
+                const unread = agent.pending_count > 0 ? (english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`) : "";
                 const first: LinePart[] = [
                     { text: padToWidth(activity.indicator(`agent:${agent.agent_id}`, state == "working") + stateLabel(state, english).toLowerCase(), stateWidth), paint: statePaint(style, state) },
-                    { text: participantName(agent.name, agent.client, agent.human), paint: paintName },
                 ];
-                if(agent.pending_count > 0) {
-                    first.push({ text: english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`, paint: style.warning });
+                const name = participantName(agent.name, agent.client, agent.human);
+                if(compact == true) {
+                    const task = oneLine(agent.task);
+                    const taskWidth = task == "" ? 0 : Math.min(displayWidth(task), 20, Math.floor(width / 3)) + 3;
+                    const nameWidth = Math.max(4, width - stateWidth - displayWidth(unread) - taskWidth);
+                    first.push({ text: compactText(name, nameWidth, unicode), paint: paintName });
+                    first.push({ text: unread, paint: style.warning });
+                    if(task != "") {
+                        first.push({ text: " · ", paint: style.dim });
+                        const used = first.reduce((total, part) => total + displayWidth(part.text), 0);
+                        first.push({ text: compactText(task, Math.max(1, width - used), unicode), paint: receding ? style.dim : undefined });
+                    }
+                    return [first];
                 }
+                first.push({ text: name, paint: paintName });
+                if(unread != "") first.push({ text: unread, paint: style.warning });
                 first.push(...activity.badge(`agent:${agent.agent_id}`, style));
                 first.push({ text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim });
 
@@ -226,9 +255,12 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
         }
         groups.set(key, [...(groups.get(key) ?? []), agent]);
     }
-    const sortedGroups = [...groups.entries()].sort(([leftKey, left], [rightKey, right]) => {
+    // A fixed order, by project and then name: a card that changes state keeps its place, so a
+    // refresh never moves what the person is looking at (2026-10-26 user decision). State shows in
+    // the colors and the status bar; sorting by it moved whole projects as their agents finished.
+    const sortedGroups = [...groups.entries()].sort(([leftKey], [rightKey]) => {
         return Number(leftKey == PEOPLE_GROUP) - Number(rightKey == PEOPLE_GROUP)
-            || Math.min(...left.map(priority)) - Math.min(...right.map(priority))
+            || projectName(leftKey, english).localeCompare(projectName(rightKey, english))
             || leftKey.localeCompare(rightKey);
     });
 
@@ -241,7 +273,7 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
         else {
             items.push({ separator: true, rule: true, label: projectName(key, english), hint: key });
         }
-        const sortedMembers = [...members].sort((left, right) => priority(left) - priority(right) || left.name.localeCompare(right.name));
+        const sortedMembers = [...members].sort((left, right) => left.name.localeCompare(right.name));
         for(const agent of sortedMembers) {
             items.push(agentRow(agent));
         }
@@ -452,8 +484,9 @@ function buildView(
     style: Style,
     options: StatusRenderOptions,
     tab: BoardTab,
-    toggles: { showEnded: boolean },
+    toggles: { showEnded: boolean; compact: boolean },
     activity: RoomActivity,
+    searchField: { text: string; placeholder?: string },
 ): BoardView {
     const english = options.language == "en";
     const overview = store.getRoomOverview(SHARED_ROOM, BOARD_MESSAGE_LIMIT);
@@ -471,7 +504,8 @@ function buildView(
         // the actions sit above the list, which can run long (2026-10-26 user decision); the list opens with its own heading
         items = [
             { value: "send:message", key: "send", label: english ? "Send a message" : "메시지 보내기", hint: english ? "to all, several agents or one" : "전체·여러 에이전트·한 에이전트에게" },
-            { value: "search:messages", key: "search", label: english ? "Search messages" : "메시지 검색", hint: english ? "by text, topic or sender" : "내용·주제·보낸 이로" },
+            // typing on the row searches message text at once (2026-10-26 user request)
+            { value: "search:messages", key: "search", label: english ? "Search messages" : "메시지 검색", hint: english ? "by text, topic or sender" : "내용·주제·보낸 이로", input: searchField },
         ];
         if(posters.length > 0) {
             items.push({
@@ -486,11 +520,14 @@ function buildView(
         items.push(...messageItems);
     }
     else {
-        const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true);
+        const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true, toggles.compact);
         items = built.items;
         inactiveCount = built.inactiveCount;
     }
     items.push({ separator: true });
+    if(tab == "tab:agents") {
+        items.push({ value: "toggle:compact", key: "compact", label: english ? "Compact view" : "간단히 보기", hint: toggles.compact ? (english ? "on" : "켬") : (english ? "off" : "끔") });
+    }
     if(inactiveCount > 0) {
         let toggleLabel = english ? `Show ended sessions (${inactiveCount})` : `종료된 세션 보기 (${inactiveCount})`;
         if(toggles.showEnded == true) {
@@ -498,7 +535,7 @@ function buildView(
         }
         items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
     }
-    const flagged = agents.filter((agent) => agent.issues.length > 0);
+    const flagged = agents.filter(canTakeDownFlagged);
     if(tab == "tab:agents" && flagged.length > 0) {
         items.push({
             value: "retire:flagged",
@@ -572,59 +609,88 @@ async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverview
 
 async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions): Promise<void> {
     const english = options.language == "en";
-    // the agent itself is the viewer: inspectAgent only requires both to be in the same room
-    const detail = store.inspectAgent(agent.agent_id, {
-        agentId: agent.agent_id,
-        checkpointLimit: DETAIL_CHECKPOINT_LIMIT,
-        beforeCheckpointId: null,
-    });
-    const card = renderAgentDetail(agent, detail, options);
-    prompter.write(`\n${card}\n\n`);
-
-    const items: SelectItem<"say" | "role" | "retire" | "back">[] = [];
-    if(agent.human == false && agent.left == false) {
-        items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기" });
-    }
-    if(agent.human == false) {
-        items.push({ value: "role", label: english ? "Set role" : "역할 정하기", hint: english ? "What this agent is responsible for" : "이 에이전트가 맡은 일" });
-    }
-    if(agent.human == false && agent.left == false) {
-        // taking a card down sits apart from the everyday actions
-        items.push({ separator: true });
-        items.push({
-            value: "retire",
-            label: english ? "Take down this card" : "이 카드 내리기",
-            hint: english ? "it leaves the room; unread messages go to the live card of its name" : "대합실에서 빠짐 · 미확인 메시지는 같은 이름의 살아 있는 카드로",
+    type AgentAction = `message:${number}` | "say" | "role" | "retire" | "back";
+    let selected: AgentAction | undefined;
+    for(;;) {
+        // the agent itself is the viewer: inspectAgent only requires both to be in the same room
+        const detail = store.inspectAgent(agent.agent_id, {
+            agentId: agent.agent_id,
+            checkpointLimit: DETAIL_CHECKPOINT_LIMIT,
+            beforeCheckpointId: null,
         });
-    }
-    if(items.length > 0) {
-        items.push({ separator: true });
-    }
-    items.push({ value: "back", label: english ? "Back" : "뒤로" });
-    const action = await selectInPlace(prompter, participantName(agent.name, agent.client, agent.human), items, { cancelValue: "back" });
-    if(action == "back") {
-        prompter.eraseLines(writtenLineCount(card));
-        return;
-    }
-    if(action == "role") {
-        prompter.eraseLines(writtenLineCount(card));
-        await setRole(prompter, store, agent, english);
-        return;
-    }
-    if(action == "retire") {
-        prompter.eraseLines(writtenLineCount(card));
-        await takeDownCards(prompter, store, [agent], english);
-        return;
-    }
-    try {
-        await options.send(agent.agent_id);
-    }
-    catch(error) {
-        // Esc inside the send flow is one level back: the board, not the main menu
-        if(error instanceof PromptBackError) {
+        const pending = store.pendingFor(agent.agent_id);
+        const card = renderAgentDetail(agent, detail, { ...options, pendingMessages: pending.length == 0 ? [] : undefined });
+
+        const items: SelectItem<AgentAction>[] = [];
+        if(pending.length > 0) {
+            items.push({ separator: true, rule: true, label: english ? "Waiting messages" : "미확인 메시지" });
+            for(const message of pending) {
+                items.push({
+                    value: `message:${message.id}`,
+                    key: String(message.id),
+                    label: `#${message.id}`,
+                    lines: (active, width) => pendingMessageLines(message, width, options).map((line) => [{
+                        text: line.text,
+                        paint: active ? prompter.paint.accent : line.tone == "bold" ? prompter.paint.bold : line.tone == "warning" ? prompter.paint.warning : prompter.paint.dim,
+                    }]),
+                });
+            }
+            items.push({ separator: true });
+        }
+        if(agent.human == false && agent.left == false) {
+            items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기" });
+        }
+        if(agent.human == false) {
+            items.push({ value: "role", label: english ? "Set role" : "역할 정하기", hint: english ? "What this agent is responsible for" : "이 에이전트가 맡은 일" });
+        }
+        if(agent.human == false && agent.left == false) {
+            // taking a card down sits apart from the everyday actions
+            items.push({ separator: true });
+            items.push({
+                value: "retire",
+                label: english ? "Take down this card" : "이 카드 내리기",
+                hint: english ? "it leaves the room; unread messages go to the live card of its name" : "대합실에서 빠짐 · 미확인 메시지는 같은 이름의 살아 있는 카드로",
+            });
+        }
+        if(items.length > 0) {
+            items.push({ separator: true });
+        }
+        items.push({ value: "back", label: english ? "Back" : "뒤로" });
+        const action: AgentAction = await selectInPlace(prompter, participantName(agent.name, agent.client, agent.human), items, {
+            cancelValue: "back", defaultValue: selected, preface: card.split("\n"),
+        });
+        if(action == "back") {
             return;
         }
-        throw error;
+        if(action.startsWith("message:")) {
+            selected = action;
+            const message = store.messageForBoard(Number(action.slice("message:".length)));
+            if(message != null) await showMessage(prompter, store, message, options);
+            continue;
+        }
+        if(action == "role") {
+            await setRole(prompter, store, agent, english);
+            return;
+        }
+        if(action == "retire") {
+            await takeDownCards(prompter, store, [agent], english);
+            return;
+        }
+        const mark = prompter.mark();
+        try {
+            await options.send(agent.agent_id);
+        }
+        catch(error) {
+            // Esc inside the send flow is one level back: the board, not the main menu
+            if(error instanceof PromptBackError) {
+                return;
+            }
+            throw error;
+        }
+        finally {
+            prompter.eraseTo(mark);
+        }
+        return;
     }
 }
 
@@ -712,43 +778,43 @@ async function askToTidyPosts(prompter: Prompter, store: RoomStore, posters: Pos
 
 async function showMessage(prompter: Prompter, store: RoomStore, message: RoomOverviewMessage, options: RoomBoardOptions): Promise<void> {
     const english = options.language == "en";
-    const text = renderMessageDetail(message, options);
-    prompter.write(`\n${text}\n\n`);
     // a person has no check_in: opening a message that names them, alone or in a group, is their
     // acknowledgement. The viewer is the same OS user the menu sends as.
-    store.acknowledgeForPerson(os.userInfo().username, message.id);
-    if(message.posted == false) {
+    const person = os.userInfo().username;
+    store.acknowledgeForPerson(person, message.id);
+    const sender = store.messageSender(message.id);
+    const canReply = message.posted || message.recipients.some((recipient) => recipient.human && recipient.name == person);
+    const items: SelectItem<"back" | "send" | "remove">[] = [
+        { value: "back", label: english ? "Back" : "뒤로" },
+    ];
+    if(sender != null && sender.human == false && sender.left == false) {
+        items.push({ value: "send", key: canReply ? "reply" : "send", label: canReply ? (english ? "Reply to sender" : "보낸 이에게 답장") : (english ? "Message the sender" : "보낸 이에게 메시지") });
+    }
+    if(message.posted) {
+        items.push({ value: "remove", label: english ? "Remove this post" : "이 공지 내리기", hint: english ? "for everyone" : "모두에게서" });
+    }
+    const action = await selectInPlace(prompter, `#${message.id}`, items, {
+        cancelValue: "back", preface: renderMessageDetail(message, options).split("\n"),
+    });
+    if(action == "send" && sender != null) {
+        const mark = prompter.mark();
         try {
-            await prompter.pause();
+            await options.send(sender.agent_id, canReply ? { messageId: message.id, topics: message.topics } : undefined);
         }
         catch(error) {
-            // Esc after reading goes back to the Messages tab, like Enter
-            if((error instanceof PromptBackError) == false) {
-                throw error;
-            }
+            if(!(error instanceof PromptBackError)) throw error;
         }
-        prompter.eraseLines(writtenLineCount(text));
-        return;
+        finally {
+            prompter.eraseTo(mark);
+        }
     }
-
-    // a post: the person at the board may take it down for everyone
-    const items: SelectItem<"back" | "remove">[] = [
-        { value: "back", label: english ? "Back" : "뒤로" },
-        { value: "remove", label: english ? "Remove this post" : "이 공지 내리기", hint: english ? "for everyone" : "모두에게서" },
-    ];
-    const action = await selectInPlace(prompter, `#${message.id}`, items, { cancelValue: "back" });
-    let removed = false;
     if(action == "remove") {
         const sender = participantName(message.from_name, message.from_client, message.from_human);
         const question = english ? `Remove post #${message.id} by ${sender}?` : `${sender}의 공지 #${message.id}를 내릴까요?`;
         if(await confirmInPlace(prompter, question) == true) {
             store.removePosts(null, [message.id]);
-            removed = true;
+            await reportInPlace(prompter, english ? `Removed post #${message.id}.` : `공지 #${message.id}를 내렸습니다.`);
         }
-    }
-    prompter.eraseLines(writtenLineCount(text));
-    if(removed == true) {
-        await reportInPlace(prompter, english ? `Removed post #${message.id}.` : `공지 #${message.id}를 내렸습니다.`);
     }
 }
 
@@ -766,9 +832,14 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
         // opening the board sweeps too, so residue goes even when no agent bridge is running
         store.cleanUp();
         let tab: BoardTab = "tab:agents";
-        const toggles = { showEnded: false };
+        const toggles = { showEnded: false, compact: false };
         const activity = new RoomActivity(prompter.isInteractive, prompter.motionEnabled, options.unicode ?? true, english);
-        const loadView = () => buildView(store, prompter.paint, options, tab, toggles, activity);
+        // the Messages tab's search row; kept here so the text outlives each refresh
+        const searchField = {
+            text: "",
+            placeholder: english ? "type text · Enter: topic/sender" : "본문 입력 · Enter: 주제/보낸 이",
+        };
+        const loadView = () => buildView(store, prompter.paint, options, tab, toggles, activity, searchField);
         let view = loadView();
         const frame = () => {
             activity.tick(Date.now());
@@ -812,6 +883,12 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
                 view = loadView();
                 continue;
             }
+            if(picked == "toggle:compact") {
+                toggles.compact = toggles.compact == false;
+                selected[tab] = picked;
+                view = loadView();
+                continue;
+            }
             if(picked == "tidy:posts") {
                 selected[tab] = picked;
                 await askToTidyPosts(prompter, store, view.posters, english);
@@ -837,12 +914,14 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             }
             if(picked == "search:messages") {
                 selected[tab] = picked;
-                await showMessageSearch(prompter, store, options);
+                // text typed on the row shows its results at once; nothing typed asks how to search
+                const typed = searchField.text;
+                await showMessageSearch(prompter, store, { ...options, text: typed, openMessage: (message) => showMessage(prompter, store, message, options) });
                 view = loadView();
                 continue;
             }
             if(picked == "retire:flagged") {
-                const flagged = view.agents.filter((agent) => agent.human == false && isInactive(agent) == false && agent.issues.length > 0);
+                const flagged = view.agents.filter(canTakeDownFlagged);
                 await takeDownCards(prompter, store, flagged, english);
                 view = loadView();
                 continue;

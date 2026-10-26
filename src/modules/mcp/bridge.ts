@@ -27,6 +27,8 @@ import type { AgentStatus, MessageKind } from "../../_defs";
 import { $logger } from "../../_libs/logger";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { CONCOS_VERSION } from "../../_libs/version";
+import { HOST_ADAPTERS } from "../hooks/adapters";
+import { describeWake } from "../hooks/notices";
 import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
@@ -37,6 +39,8 @@ import { inputSchema } from "./tool-schema";
 import type { ValueSchema } from "./tool-schema";
 
 const SHUTDOWN_DEADLINE_MS = 3000;
+/** Hosts whose sessions can be woken from outside (Codex): an MCP server wakes them when no watch did. */
+const WAKE_HOSTS = HOST_ADAPTERS.filter((adapter) => adapter.deliverWake != null);
 
 /**
  * check_in's answer split in two: what the call did to the caller's own card, and the room's
@@ -156,7 +160,7 @@ export async function runBridge(): Promise<void> {
             display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role. Rename later with check_in display_name." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
             working_directory: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH, description: "Absolute path of the folder this session started in. It keeps your card with its project; joining again from another folder records that folder as current_directory." },
-            workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory." },
+            workspace_root: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute project root when it differs from working_directory. With resume_handle, a root holding the folder your session started in moves your card to that project." },
             resume_handle: { type: "string", description: "Handle from an earlier join, to come back as the same agent." },
         }, ["display_name", "client", "working_directory"]),
     }, (values) => runTool("join", () => {
@@ -358,6 +362,23 @@ export async function runBridge(): Promise<void> {
         }
         catch(ex) {
             _logger.error(ex, "heartbeat or clean-up failed");
+        }
+        // a turn that fails ends without the Stop hook, so no watch wakes the session; its MCP
+        // server, still running, wakes it once a message has waited too long (2026-10-27)
+        for(const agentId of joinedAgentIds) {
+            try {
+                const wake = store.fallbackWake(agentId, WAKE_HOSTS.map((adapter) => adapter.id));
+                if(wake == null) {
+                    continue;
+                }
+                const adapter = WAKE_HOSTS.find((item) => item.id == wake.host);
+                adapter?.deliverWake?.(wake.sessionId, describeWake(wake.notices, wake.unread)).catch((ex) => {
+                    _logger.error(ex, "fallback wake was not delivered");
+                });
+            }
+            catch(ex) {
+                _logger.error(ex, "fallback wake check failed");
+            }
         }
     }, HEARTBEAT_INTERVAL_MS);
     heartbeatTimer.unref();

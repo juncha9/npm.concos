@@ -724,7 +724,7 @@ function addWake(change: SetupChange, input: SetupTarget): void {
     setJson(change, ["hooks", item.event, groups.length], item.group, true);
     change.notes.push(
         `A waiting ${HOST_LABELS[input.host]} session wakes by itself when a question, an answer to its question, or a note or notice addressed to it arrives: `
-        + `after ${WAKE_IDLE_MS / 1000} seconds without input, for up to ${WAKE_WATCH_MS / 60_000} minutes after each turn.`
+        + `after ${WAKE_IDLE_MS / 1000} seconds without input, until the session ends, for up to ${WAKE_WATCH_MS / 3_600_000} hours after each turn.`
         + (input.host == "codex" ? " concos sends one line to that session with codex queue to wake it." : ""),
     );
     if(input.host == "codex" && change.notes.includes(CODEX_HOOK_TRUST_NOTE) == false) {
@@ -797,11 +797,24 @@ export function planUpdate(input: SetupTarget): SetupChange[] {
         groups.forEach((group, groupIndex) => {
             handlersOf(group).forEach((handler, handlerIndex) => {
                 const target = targets.get(concosHookKind(handler) ?? "");
-                if(target == null || startOutdated(handler, target, launch) == false) {
+                if(target == null) {
+                    return;
+                }
+                const startChanged = startOutdated(handler, target, launch);
+                // a Claude Code watch registered with less time is cut off before the day it now waits
+                // (2026-10-26); other timeouts, and a longer one, are the user's to set
+                const timeout = (handler as { timeout?: unknown }).timeout;
+                const timeoutShort = target.asyncRewake == true && (typeof timeout != "number" || timeout < (target.timeout as number));
+                if(startChanged == false && timeoutShort == false) {
                     return;
                 }
                 hooksFile.removals.push({ key: `hooks.${event}.${groupIndex}.hooks.${handlerIndex}`, value: handler });
-                setJson(hooksFile, ["hooks", event, groupIndex, "hooks", handlerIndex], target);
+                // only the timeout differs: the handler keeps how it starts, which this run may not offer
+                let updated = target;
+                if(startChanged == false) {
+                    updated = { ...(handler as Record<string, unknown>), timeout: target.timeout };
+                }
+                setJson(hooksFile, ["hooks", event, groupIndex, "hooks", handlerIndex], updated);
             });
         });
     }

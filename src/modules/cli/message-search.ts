@@ -8,6 +8,10 @@ import type { StatusRenderOptions } from "./status-renderer";
 export interface MessageSearchOptions extends StatusRenderOptions {
     /** Most recent matches to show, from 1 to 100; defaults to 50. */
     limit?: number;
+    /** Message text typed on the board's search row: its results come at once, and Back returns to the board. */
+    text?: string;
+    /** The board supplies its message actions; standalone search remains read-only. */
+    openMessage?: (message: RoomOverviewMessage) => Promise<void>;
 }
 
 type SearchField = "text" | "topic" | "sender";
@@ -34,13 +38,13 @@ function resultItem(message: RoomOverviewMessage, prompter: Prompter, options: M
     const english = options.language == "en";
     const labels = SEARCH_LABELS[options.language ?? "ko"];
     const unicode = options.unicode ?? true;
-    const from = participantName(message.from_name, message.from_client, message.from_human);
     const to = messageRecipientNames(message, english);
     let arrow = "→";
     if(unicode == false) {
         arrow = "->";
     }
-    const header = `#${message.id} ${from} ${arrow} ${to}`;
+    // the sender heads the group the row sits in
+    const header = `#${message.id} ${arrow} ${to}`;
     const firstLine = plain(message.text).split("\n").find((line) => line.trim() != "") ?? "";
     return {
         value: `message:${message.id}`,
@@ -76,10 +80,9 @@ async function showDetail(prompter: Prompter, message: RoomOverviewMessage, opti
     const labels = SEARCH_LABELS[options.language ?? "ko"];
     const mark = prompter.mark();
     try {
-        prompter.write(`\n${renderMessageDetail(message, options)}\n\n`);
         await prompter.select(`${labels.message} #${message.id}`, [
             { value: "back", label: labels.back },
-        ], { cancelValue: "back" });
+        ], { cancelValue: "back", preface: renderMessageDetail(message, options).split("\n") });
     }
     finally {
         prompter.eraseTo(mark);
@@ -110,7 +113,22 @@ async function showResults(prompter: Prompter, result: MessageSearchResult, quer
         summary += ` · ${labels.narrowSearch}`;
     }
     const title = `${labels.search} · ${plain(query).replace(/\s+/g, " ")} · ${summary}`;
-    const items: SelectItem<SearchValue>[] = result.messages.map((message) => resultItem(message, prompter, options));
+    // grouped by sender as on the board (2026-10-26 user request): results come newest first, so the
+    // sender of the newest match leads, and each group stays newest first
+    const groups = new Map<string, RoomOverviewMessage[]>();
+    for(const message of result.messages) {
+        const sender = participantName(message.from_name, message.from_client, message.from_human);
+        groups.set(sender, [...(groups.get(sender) ?? []), message]);
+    }
+    const items: SelectItem<SearchValue>[] = [];
+    for(const [sender, messages] of groups) {
+        let hint = `메시지 ${messages.length}개`;
+        if(english == true) {
+            hint = `${messages.length} message${messages.length == 1 ? "" : "s"}`;
+        }
+        items.push({ separator: true, rule: true, label: sender, hint: hint });
+        items.push(...messages.map((message) => resultItem(message, prompter, options)));
+    }
     if(count > 0) {
         items.push({ separator: true });
     }
@@ -124,12 +142,17 @@ async function showResults(prompter: Prompter, result: MessageSearchResult, quer
         selected = picked;
         const message = result.messages.find((entry) => `message:${entry.id}` == picked);
         if(message != null) {
-            await showDetail(prompter, message, options);
+            if(options.openMessage != null) {
+                await options.openMessage(message);
+            }
+            else {
+                await showDetail(prompter, message, options);
+            }
         }
     }
 }
 
-/** A read-only search: field → query → results → detail; Esc returns exactly one level. */
+/** Field → query → results → detail; standalone search is read-only, the board supplies its actions. */
 export async function showMessageSearch(prompter: Prompter, store: RoomStore, options: MessageSearchOptions = {}): Promise<void> {
     const labels = SEARCH_LABELS[options.language ?? "ko"];
     const mark = prompter.mark();
@@ -138,6 +161,25 @@ export async function showMessageSearch(prompter: Prompter, store: RoomStore, op
     let selectedField: SearchField = "text";
     const queries: Partial<Record<SearchField, string>> = {};
     try {
+        const typed = options.text?.trim() ?? "";
+        if(typed != "") {
+            queries.text = typed;
+            let result: MessageSearchResult | null = null;
+            try {
+                result = store.searchMessages({ text: typed, limit: options.limit });
+            }
+            catch(error) {
+                if((error instanceof RoomError) == false) {
+                    throw error;
+                }
+                // the usual screen follows, with the text kept for editing
+                await prompter.select(plain(error.message), [{ value: "back", label: labels.tryAgain }], { cancelValue: "back" });
+            }
+            if(result != null) {
+                await showResults(prompter, result, typed, options);
+                return;
+            }
+        }
         for(;;) {
             const items: SelectItem<SearchField | "back">[] = [
                 { value: "text", label: labels.text },

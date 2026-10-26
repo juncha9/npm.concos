@@ -62,13 +62,22 @@ async function search(answers: string, options: Partial<MessageSearchOptions> = 
 }
 
 describe("message search screen", () => {
+    it("goes straight to the results of text typed on the board, and back to the board from them", async () => {
+        send();
+        const output = await search("ESC\n", { text: "  needle " });
+        expect(output).toContain("? Message search · needle · 1 result");
+        expect(output).not.toContain("? Search messages by");
+    });
+
     it("goes from query to results to full detail and returns one level at a time with Esc in line mode", async () => {
         const id = send();
         send(bob, "Unrelated agent traffic");
         database.exec("PRAGMA query_only = ON");
         const output = await search("text\nneedle\n1\nESC\nESC\nESC\nESC\n");
 
-        expect(output).toContain(`#${id} Alice / API (Codex) → Reviewer`);
+        // grouped by sender: the group names Alice, the row only whom it went to
+        expect(output).toMatch(/Alice \/ API \(Codex\) +1 message\n/);
+        expect(output).toContain(`#${id} → Reviewer`);
         expect(output).toContain("Topics webapp_login_redirect");
         expect(output).toContain("Needle first line");
         expect(output).toContain(`#${id} [QUESTION]`);
@@ -79,6 +88,20 @@ describe("message search screen", () => {
         expect(output.match(/\? Search messages by/g)).toHaveLength(2);
         expect(database.prepare("SELECT delivered_at, received_at FROM message_receipt WHERE message_id = ? AND agent_id = ?").get(id, viewer))
             .toEqual({ delivered_at: null, received_at: null });
+    });
+
+    it("groups results by sender, the sender of the newest match first and each group newest first", async () => {
+        const older = send(viewer, "Needle one");
+        const fromBob = store.sendMessage(bob, { to: viewer, text: "Needle from Bob", topics: [], kind: "note", replyTo: null, requestId: null }).message_id;
+        const newest = send(viewer, "Needle three");
+        const output = await search("text\nneedle\nESC\nESC\nESC\n");
+        const alice = output.search(/Alice \/ API \(Codex\) +2 messages\n/);
+        const bobGroup = output.search(/Bob \/ UI \(Codex\) +1 message\n/);
+        expect(alice).toBeGreaterThan(-1);
+        expect(bobGroup).toBeGreaterThan(alice);
+        expect(output.indexOf(`#${newest} → Reviewer`)).toBeGreaterThan(alice);
+        expect(output.indexOf(`#${older} → Reviewer`)).toBeGreaterThan(output.indexOf(`#${newest} → Reviewer`));
+        expect(output.indexOf(`#${fromBob} → Reviewer`)).toBeGreaterThan(bobGroup);
     });
 
     it("reports no matches and allows a new query from that screen", async () => {
@@ -92,7 +115,7 @@ describe("message search screen", () => {
     it("shows messages addressed to agents, matching the board's scope", async () => {
         const id = send(bob, "Needle between agents\nAgent detail.");
         const output = await search("text\nneedle\n1\nESC\nESC\nESC\nESC\n");
-        expect(output).toContain(`#${id} Alice / API (Codex) → Bob / UI (Codex)`);
+        expect(output).toContain(`#${id} → Bob / UI (Codex)`);
         expect(output).toContain("Agent detail.");
     });
 
@@ -118,7 +141,7 @@ describe("message search screen", () => {
         const latest = send(viewer, "Needle newer\nDetails.");
         const output = await search("text\nneedle\nESC\nESC\nESC\n", { limit: 1 });
         expect(output).toContain("Newest 1 result · narrow your search for more");
-        expect(output).toContain(`#${latest} Alice / API`);
+        expect(output).toContain(`#${latest} → Reviewer`);
     });
 
     it("requires a nonempty query and supports the Korean and ASCII display options", async () => {
@@ -127,7 +150,8 @@ describe("message search screen", () => {
         expect(output).toContain("A value is required.");
         expect(output).toContain("메시지 검색 기준");
         expect(output).toContain("결과 1개");
-        expect(output).toContain(`#${id} Alice / API (Codex) -> Reviewer`);
+        expect(output).toContain(`#${id} -> Reviewer`);
+        expect(output).toMatch(/Alice \/ API \(Codex\) +메시지 1개\n/);
         expect(output).toContain("주제 webapp_login_redirect");
     });
 

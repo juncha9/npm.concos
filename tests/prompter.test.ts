@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { Prompter, PromptBackError, PromptClosedError, displayWidth } from "../src/modules/cli/prompter";
@@ -50,6 +53,56 @@ describe("terminal prompts", () => {
             expect(load).toHaveBeenCalledTimes(1);
         }
         finally { prompter.close(); vi.useRealTimers(); vi.unstubAllEnvs(); }
+    });
+
+    it("traces draws and keys to CONCOS_BOARD_TRACE with values and counts, never row text", async () => {
+        const traceFile = path.join(os.tmpdir(), `concos-trace-${process.pid}-${Date.now()}.jsonl`);
+        vi.stubEnv("CONCOS_BOARD_TRACE", traceFile);
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const picked = prompter.select("Room", [
+                { value: "agent:a", label: "Secret agent name", hint: "private hint" },
+                { value: "agent:b", label: "Other agent" },
+            ]);
+            await press(tty.input, ["\u001b[B", "\r"]);
+            expect(await picked).toBe("agent:b");
+            const events = fs.readFileSync(traceFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+            expect(events.map((entry) => entry.event)).toEqual(expect.arrayContaining(["draw-full", "key"]));
+            expect(events.find((entry) => entry.event == "key")).toMatchObject({ key: JSON.stringify("\u001b[B"), active: "agent:a" });
+            expect(fs.readFileSync(traceFile, "utf8")).not.toMatch(/Secret agent name|private hint|Other agent/);
+        }
+        finally {
+            prompter.close();
+            vi.unstubAllEnvs();
+            fs.rmSync(traceFile, { force: true });
+        }
+    });
+
+    it("types into a row's text field before digits, j/k and Esc mean anything else, across a refresh", async () => {
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        const field = { text: "", placeholder: "type to search" };
+        // a refresh rebuilds the rows; the caller's field object carries the text over
+        const rows = () => [
+            { value: "send", label: "Send a message" },
+            { value: "search", label: "Search messages", hint: "by text", input: field },
+            { value: "back", label: "Back" },
+        ];
+        try {
+            const picked = prompter.select("Messages", rows(), { defaultValue: "search", refresh: { intervalMs: 20, load: () => ({ question: "Messages", items: rows() }) } });
+            await press(tty.input, ["n", "1", "j", "k", "x", "\u007f"]);
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            expect(field.text).toBe("n1jk");
+            expect(tty.screen().replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "")).toContain("Search messages  n1jk");
+            // Esc clears the text first; the row stays
+            await press(tty.input, ["\u001b"]);
+            expect(field.text).toBe("");
+            await press(tty.input, ["a", "b", "\r"]);
+            expect(await picked).toBe("search");
+            expect(field.text).toBe("ab");
+        }
+        finally { prompter.close(); }
     });
 
     it("colors the answer Enter gives, and a warning after a row's hint, on a color terminal", async () => {
@@ -191,7 +244,7 @@ describe("terminal prompts", () => {
         try {
             const pending = prompter.select("Room", rows);
             const lastFrame = () => tty.screen().slice(tty.screen().lastIndexOf("\u001b[J") + 3).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
-            expect(lastFrame()).toMatch(/\d+ lines below · ↑↓ move/);
+            expect(lastFrame()).toMatch(/↑↓ move · Enter select · Esc back · PgUp\/PgDn scroll · ↓\d+/);
             expect(lastFrame()).not.toContain("above");
             await press(tty.input, Array.from({ length: 7 }, () => "\u001b[B"));
             const frame = lastFrame();
@@ -199,7 +252,7 @@ describe("terminal prompts", () => {
             expect(frame).toMatch(/[❯>] Agent 7/);
             expect(frame).toContain("Next  step 7");
             expect(frame).not.toContain("Agent 0");
-            expect(frame).toMatch(/\d+ lines above · ↑↓ move/);
+            expect(frame).toMatch(/↑↓ move · Enter select · Esc back · PgUp\/PgDn scroll · ↑\d+/);
             expect(frame).not.toContain("below");
             await press(tty.input, ["\r"]);
             expect(await pending).toBe("agent7");
@@ -228,6 +281,156 @@ describe("terminal prompts", () => {
             expect(await pending).toBe("setup");
         }
         finally { prompter.close(); }
+    });
+
+    it("pages only the preface, keeps the question and actions fixed, and erases the detail on Esc", async () => {
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 12 });
+        const screen = new TerminalScreen(60, 12);
+        screen.write("$ concos\n");
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        const rowOf = (text: string) => screen.visible().findIndex((line) => line.includes(text));
+        try {
+            const pending = prompter.select("Message detail", [
+                { value: "reply", label: "Reply" }, { value: "back", label: "Back" },
+            ], { cancelValue: "back", preface: Array.from({ length: 40 }, (_, index) => `Detail line ${index}`) });
+            const positions = [rowOf("Message detail"), rowOf("Reply"), rowOf("Back"), rowOf("Enter")];
+            expect(screen.visible().join("\n")).toContain("Detail line 0");
+            await press(tty.input, ["\u001b[B", "\u001b[6~"]);
+            expect([rowOf("Message detail"), rowOf("Reply"), rowOf("Back"), rowOf("Enter")]).toEqual(positions);
+            expect(screen.visible().join("\n")).not.toContain("Detail line 0\n");
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Back/);
+            await press(tty.input, ["\u001b[A", "\u001b[F"]);
+            expect(screen.visible().join("\n")).toContain("Detail line 39");
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Reply/);
+            await press(tty.input, ["\u001b[H"]);
+            expect(screen.visible().join("\n")).toContain("Detail line 0\n");
+            await press(tty.input, ["\u001b"]);
+            expect(await pending).toBe("back");
+            expect(screen.transcript().join("\n")).toContain("$ concos");
+            expect(screen.transcript().join("\n")).not.toMatch(/Message detail|Detail line|Reply|Back/);
+            expect(tty.raw).toEqual([true, false]);
+        }
+        finally { prompter.close(); }
+    });
+
+    it("wraps styled wide preface text and embedded newlines without overflowing the screen", async () => {
+        vi.stubEnv("NO_COLOR", undefined);
+        const tty = terminal();
+        Object.assign(tty.output, { columns: 18, rows: 8 });
+        const screen = new TerminalScreen(18, 8);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        const frame = () => tty.screen().slice(tty.screen().lastIndexOf("\u001b[J") + 3);
+        try {
+            const pending = prompter.select("Detail", [{ value: "back", label: "Back" }], {
+                preface: ["\u001b[35m가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허\r\n새 줄\n\n끝\u001b[39m"],
+            });
+            expect(screen.visible()[1]).toBe("가나다라마바사아");
+            expect(frame().split("\n")[1]).toBe("\u001b[35m가나다라마바사아\u001b[0m");
+            const actionRow = screen.visible().findIndex((line) => /[❯>] Back/.test(line));
+            await press(tty.input, ["\u001b[6~"]);
+            expect(frame().split("\n")[1]).toMatch(/^\u001b\[35m/);
+            expect(screen.visible().join("\n")).toContain("새 줄\n\n끝");
+            expect(screen.visible().findIndex((line) => /[❯>] Back/.test(line))).toBe(actionRow);
+            for(const line of frame().replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").split("\n")) {
+                expect(displayWidth(line)).toBeLessThanOrEqual(17);
+            }
+            expect(screen.transcript()).toHaveLength(8);
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("back");
+        }
+        finally { prompter.close(); vi.unstubAllEnvs(); }
+    });
+
+    it("keeps detail text readable beside overflowing message choices and pages it independently", async () => {
+        for(const height of [24, 10, 6]) {
+            const tty = terminal();
+            Object.assign(tty.output, { rows: height });
+            const screen = new TerminalScreen(60, height);
+            tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+            const prompter = new Prompter(tty.input, tty.output);
+            const rows = Array.from({ length: 8 }, (_, index) => ({
+                value: `message${index}`, label: `Message ${index}`,
+                lines: () => [[{ text: `Message ${index}` }], ...Array.from({ length: 10 }, (_, line) => [{ text: `  Delivery ${index}/${line}` }])],
+            }));
+            try {
+                const pending = prompter.select("Agent detail", rows, { preface: Array.from({ length: 18 }, (_, index) => `Agent summary line ${index}`) });
+                expect(screen.visible().filter((line) => line.startsWith("Agent summary line")).length).toBeGreaterThanOrEqual(Math.min(4, height - 4));
+                await press(tty.input, Array.from({ length: 7 }, () => "\u001b[B"));
+                const choiceStart = screen.visible().findIndex((line) => /[❯>] Message 7/.test(line));
+                expect(choiceStart).toBeGreaterThan(1);
+                const choiceRows = screen.visible().slice(choiceStart, height - 2);
+                await press(tty.input, ["\u001b[6~", "\u001b[F"]);
+                expect(screen.visible().join("\n")).toContain("Agent summary line 17");
+                expect(screen.visible().slice(choiceStart, height - 2)).toEqual(choiceRows);
+                expect(screen.transcript()).toHaveLength(height);
+                await press(tty.input, ["\r"]);
+                expect(await pending).toBe("message7");
+            }
+            finally { prompter.close(); }
+        }
+    });
+
+    it("keeps Enter, Esc and tab switching in narrow footers before scroll counts", async () => {
+        for(const columns of [54, 28, 16]) {
+            for(const withTabs of [false, true]) {
+                const tty = terminal();
+                Object.assign(tty.output, { columns: columns, rows: 10 });
+                const screen = new TerminalScreen(columns, 10);
+                tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+                const prompter = new Prompter(tty.input, tty.output);
+                try {
+                    let tabs;
+                    if(withTabs == true) {
+                        tabs = { active: "agents", items: [{ value: "agents", label: "Agents" }, { value: "messages", label: "Messages" }] };
+                    }
+                    const pending = prompter.select("Room", Array.from({ length: 20 }, (_, index) => ({ value: `agent${index}`, label: `Agent ${index}` })), { tabs: tabs });
+                    const footer = screen.visible().find((line) => line.includes("Enter"))!;
+                    expect(footer).toContain("Esc");
+                    expect(footer).not.toMatch(/…|\.\.\./);
+                    expect(displayWidth(footer)).toBeLessThanOrEqual(columns - 1);
+                    if(withTabs == true) {
+                        expect(footer).toMatch(/←→|Tab/);
+                    }
+                    await press(tty.input, ["\r"]);
+                    expect(await pending).toBe("agent0");
+                }
+                finally { prompter.close(); }
+            }
+        }
+    });
+
+    it("prints unstyled preface text before line-mode choices and still accepts number, key and label", async () => {
+        for(const answer of ["2", "back", "Go back"]) {
+            const output = new PassThrough();
+            let written = "";
+            output.on("data", (chunk) => { written += chunk.toString(); });
+            const prompter = new Prompter(Readable.from([`${answer}\n`]), output);
+            try {
+                expect(await prompter.select("Detail", [{ value: "reply", label: "Reply" }, { value: "exit", key: "back", label: "Go back" }], {
+                    preface: ["\u001b[35m상세\n두 줄\u001b[39m"],
+                })).toBe("exit");
+                expect(written).toMatch(/Detail\n상세\n두 줄\n\s+1\) Reply/);
+                expect(written).not.toContain("\u001b");
+            }
+            finally { prompter.close(); }
+        }
+    });
+
+    it("honors NO_COLOR for a preface supplied with ANSI styles", async () => {
+        vi.stubEnv("NO_COLOR", "1");
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const pending = prompter.select("Detail", [{ value: "back", label: "Back" }], { preface: ["\u001b[35mColored detail\u001b[39m"] });
+            expect(tty.screen()).toContain("Colored detail");
+            expect(tty.screen()).not.toMatch(/\u001b\[[0-9;]*m/);
+            await press(tty.input, ["\r"]);
+            await pending;
+        }
+        finally { prompter.close(); vi.unstubAllEnvs(); }
     });
 
     it("erases back to a mark, wrapped lines included, and leaves rows above the window in the scrollback", async () => {
@@ -307,6 +510,77 @@ describe("terminal prompts", () => {
             expect(await pending).toBe("message");
         }
         finally { prompter.close(); }
+    });
+
+    it("keeps the selected card visible when its body shrinks after paging and rows above change", async () => {
+        vi.useFakeTimers();
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 10 });
+        const screen = new TerminalScreen(60, 10);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        let changed = false;
+        const rows = () => Array.from({ length: 8 }, (_, index) => {
+            let count = 3;
+            if(index == 2) {
+                count = 26;
+                if(changed == true) {
+                    count = 2;
+                }
+            }
+            if(index == 0 && changed == true) {
+                count = 5;
+            }
+            return { value: `card${index}`, label: `Card ${index}`, lines: () => Array.from({ length: count }, (_, line) => [{ text: line == 0 ? `Card ${index}` : `  Task ${index}/${line}` }]) };
+        });
+        try {
+            const picked = prompter.select("Room", rows(), { defaultValue: "card2", refresh: { intervalMs: 20, load: () => ({ question: "Room", items: rows() }) } });
+            tty.input.write("\u001b[6~");
+            tty.input.write("\u001b[6~");
+            changed = true;
+            await vi.advanceTimersByTimeAsync(40);
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Card 2/);
+            tty.input.write("\r");
+            expect(await picked).toBe("card2");
+        }
+        finally { prompter.close(); vi.useRealTimers(); }
+    });
+
+    it("anchors the selected card when rows above grow during animation before the next refresh", async () => {
+        vi.useFakeTimers();
+        vi.stubEnv("CONCOS_REDUCED_MOTION", "0");
+        vi.stubEnv("TERM", "xterm");
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 10 });
+        const screen = new TerminalScreen(60, 10);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        let changed = false;
+        const rows = Array.from({ length: 8 }, (_, index) => ({
+            value: `card${index}`, label: `Card ${index}`,
+            lines: () => {
+                let count = 3;
+                if(index < 4 && changed == true) {
+                    count = 7;
+                }
+                return Array.from({ length: count }, (_, line) => [{ text: line == 0 ? `Card ${index}` : `  Task ${index}/${line}` }]);
+            },
+        }));
+        const load = vi.fn(() => ({ question: "Room", items: rows }));
+        try {
+            const picked = prompter.select("Room", rows, {
+                defaultValue: "card4", refresh: { intervalMs: 1000, load },
+                animation: { intervalMs: 40, frame: () => ({}) },
+            });
+            const before = screen.visible().findIndex((line) => /[❯>] Card 4/.test(line));
+            changed = true;
+            await vi.advanceTimersByTimeAsync(120);
+            expect(load).not.toHaveBeenCalled();
+            expect(screen.visible().findIndex((line) => /[❯>] Card 4/.test(line))).toBe(before);
+            tty.input.write("\r");
+            expect(await picked).toBe("card4");
+        }
+        finally { prompter.close(); vi.useRealTimers(); vi.unstubAllEnvs(); }
     });
 
     it("selects the visible message when a page starts on the blank space between messages", async () => {

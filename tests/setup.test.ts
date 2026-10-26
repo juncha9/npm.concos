@@ -321,7 +321,7 @@ describe("hooks", () => {
         expect(() => planWake(input, "on")).toThrow(/Turn on hooks before idle wake/);
         applySetup(planHooks(input, "on"));
         const on = planWake(input, "on");
-        expect(on[0].notes.join(" ")).toContain("for up to 60 minutes after each turn");
+        expect(on[0].notes.join(" ")).toContain("until the session ends, for up to 24 hours after each turn");
         if(host == "codex") {
             expect(on[0].notes.join(" ")).toContain("codex queue");
             expect(on[0].notes.filter((note) => note.includes("open /hooks in Codex"))).toHaveLength(1);
@@ -330,7 +330,7 @@ describe("hooks", () => {
         const file = path.join(directory, host == "claude" ? ".claude/settings.json" : ".codex/hooks.json");
         expect(parseJson(fs.readFileSync(file, "utf8")).hooks.Stop.map((group: { hooks: unknown[] }) => group.hooks[0])).toEqual([
             { type: "command", command: `concos hook turn-end --host ${host}`, timeout: 10 },
-            { type: "command", command: `concos hook watch --host ${host}`, timeout: 3660, ...(host == "claude" ? { asyncRewake: true } : { async: true }) },
+            { type: "command", command: `concos hook watch --host ${host}`, ...(host == "claude" ? { timeout: 86460, asyncRewake: true } : { timeout: 3660, async: true }) },
         ]);
         expect(inspectWake(input)).toBe(true);
         expect(inspectHooks(input).state).toBe("on");
@@ -651,7 +651,7 @@ describe("starting node directly", () => {
         expect(readJson(".claude.json").mcpServers.concos).toEqual(start("mcp"));
         const hooks = readJson(".claude/settings.json").hooks;
         expect(hooks.SessionStart[0].hooks[0]).toEqual({ type: "command", ...start("hook", "session-start", "--host", "claude"), timeout: 10 });
-        expect(hooks.Stop[1].hooks[0]).toEqual({ type: "command", ...start("hook", "watch", "--host", "claude"), timeout: 3660, asyncRewake: true });
+        expect(hooks.Stop[1].hooks[0]).toEqual({ type: "command", ...start("hook", "watch", "--host", "claude"), timeout: 86460, asyncRewake: true });
         expect(inspectHooks(claude).state).toBe("on");
         expect(inspectWake(claude)).toBe(true);
         expect(planUpdate(claude)).toEqual([]);
@@ -688,6 +688,28 @@ describe("starting node directly", () => {
         applySetup(codexUpdate);
         expect(readToml(".codex/config.toml").mcp_servers.concos).toEqual({ ...start("mcp"), env: { CONCOS_HOME: path.join(directory, "data") } });
         expect(readJson(".codex/hooks.json")).toEqual(hooksBefore);
+    });
+
+    it("updates a Claude Code watch registered for an hour to the day's timeout, keeping how it starts", () => {
+        const claude = { host: "claude", home: directory };
+        const codex = { host: "codex", home: directory };
+        applySetup(planRegistration(claude, { wake: true }));
+        applySetup(planRegistration(codex, { wake: true }));
+        // as 0.1.12 and earlier registered the watch; the prompt hook's timeout the user raised
+        const settings = readJson(".claude/settings.json");
+        settings.hooks.Stop[1].hooks[0].timeout = 3660;
+        settings.hooks.UserPromptSubmit[0].hooks[0].timeout = 77;
+        fs.writeFileSync(path.join(directory, ".claude", "settings.json"), JSON.stringify(settings, null, 2));
+
+        const update = planUpdate(claude);
+        expect(update.map((change) => change.path)).toEqual([path.join(directory, ".claude", "settings.json")]);
+        applySetup(update);
+        const hooks = readJson(".claude/settings.json").hooks;
+        expect(hooks.Stop[1].hooks[0]).toEqual({ type: "command", ...start("hook", "watch", "--host", "claude"), timeout: 86460, asyncRewake: true });
+        expect(hooks.UserPromptSubmit[0].hooks[0].timeout).toBe(77);
+        expect(planUpdate(claude)).toEqual([]);
+        // the Codex watch hook only starts the watch, so it keeps its registered timeout and trust
+        expect(planUpdate(codex)).toEqual([]);
     });
 
     it("keeps a direct start a copy run through npx cannot improve on, and replaces one whose cli.js is gone", () => {

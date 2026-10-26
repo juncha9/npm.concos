@@ -43,7 +43,8 @@ export async function runStatus(options: { room?: string | null; json: boolean }
 
 /**
  * Stores a message from the person at the terminal. `to` is "all", or one or more agent ids or
- * display names; `topics` are snake_case keys the message is filed under.
+ * display names; `topics` are snake_case keys the message is filed under; `replyTo` the message
+ * an answer answers.
  */
 export async function runSay(options: {
     room?: string | null;
@@ -53,6 +54,7 @@ export async function runSay(options: {
     senderName: string | null;
     language?: "ko" | "en";
     topics?: string[];
+    replyTo?: number | null;
 }): Promise<string> {
     const { store, close } = await openStore();
     try {
@@ -69,7 +71,7 @@ export async function runSay(options: {
             to: recipients,
             kind: options.kind,
             text: options.text,
-            replyTo: null,
+            replyTo: options.replyTo ?? null,
             requestId: null,
             topics: options.topics ?? [],
         });

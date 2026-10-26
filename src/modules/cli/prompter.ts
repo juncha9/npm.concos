@@ -1,5 +1,6 @@
 // Adapted from an in-house MCP tool's terminal interface. Copyright © 2026 Alkemic Studio, the author's
 // company, which brings it into concos under concos's license (AGPL-3.0-or-later).
+import fs from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 /**
@@ -43,6 +44,13 @@ export interface SelectChoice<T extends string> {
     lines?: (active: boolean, width: number) => LinePart[][];
     /** What a line-mode answer may type besides the number and the label; defaults to `value`. */
     key?: string;
+    /**
+     * A text field on the row, on a terminal: while the row is active, typed characters (digits and
+     * `j`/`k` too) edit `text`; Backspace deletes one, Ctrl+U clears it, and Esc clears it before
+     * it goes back. The caller keeps the object, so the text outlives a refresh that rebuilds the
+     * items, and reads it when the row is picked. Line mode picks the row as any other.
+     */
+    input?: { text: string; placeholder?: string };
 }
 
 /** A non-selectable divider between groups of choices. */
@@ -86,6 +94,13 @@ export interface SelectOptions<T extends string> {
     refresh?: { intervalMs: number; load: () => { question: string; banner?: LinePart[]; items: SelectItem<T>[]; tabs?: SelectTabs<T> } };
     /** A styled line under the question, such as a status bar; its plain text off a TTY. */
     banner?: LinePart[];
+    /**
+     * Detail text before the choices, with ANSI styles and embedded newlines allowed. On a TTY,
+     * it wraps to the available columns; PgUp/PgDn and Home/End scroll only this text while the
+     * question, choice viewport and footer stay in place. Up/Down still move between choices.
+     * Off a TTY the unstyled text precedes the numbered choices.
+     */
+    preface?: string[];
     /**
      * Tab / → and Shift+Tab / ← finish the list with the next or previous tab's value, so the
      * caller can show that tab's list in its place. Line mode accepts a tab's key or label.
@@ -190,6 +205,58 @@ export function displayWidth(text: string): number {
     }
 
     return width;
+}
+
+/** Wraps detail text without counting SGR codes as columns or letting a style escape its row. */
+function wrapPreface(preface: string[], width: number): string[] {
+    const lines: string[] = [];
+    for(const text of preface) {
+        let style = "";
+        for(const source of text.replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n")) {
+            let line = style;
+            let used = 0;
+            const finishLine = (): void => {
+                let end = "";
+                if(style != "") {
+                    end = `${ESC}[0m`;
+                }
+                lines.push(`${line}${end}`);
+                line = style;
+                used = 0;
+            };
+            for(const token of source.match(/\u001b\[[0-?]*[ -/]*[@-~]|./gu) ?? []) {
+                if(token.startsWith(ESC) == true) {
+                    if(token.endsWith("m") == true) {
+                        if(token == `${ESC}[m` || token == `${ESC}[0m`) {
+                            style = "";
+                        }
+                        else {
+                            style += token;
+                        }
+                        line += token;
+                    }
+                    continue;
+                }
+                if(token < " " || token == "\u007f") {
+                    continue;
+                }
+                const columns = charWidth(token.codePointAt(0) ?? 0);
+                if(used > 0 && used + columns > width) {
+                    finishLine();
+                }
+                if(columns > width) {
+                    line += "?";
+                    used += 1;
+                }
+                else {
+                    line += token;
+                    used += columns;
+                }
+            }
+            finishLine();
+        }
+    }
+    return lines;
 }
 
 /** Pads with spaces to `width` terminal columns, counting wide characters as two. */
@@ -338,7 +405,8 @@ export class Prompter {
     /** Columns already used on the row being written, when the output so far does not end in a newline. */
     private openRowWidth = 0;
     private readonly style: Style;
-    private readonly symbols: { question: string; pointer: string; tick: string; rule: string; ellipsis: string };
+    /** `caret`: where typing goes in a row's text field, since the terminal cursor stays hidden in a list. */
+    private readonly symbols: { question: string; pointer: string; tick: string; rule: string; ellipsis: string; caret: string };
 
     constructor(private readonly input: Readable, private readonly output: Writable) {
         const ttyInput = input as TtyInput;
@@ -347,10 +415,10 @@ export class Prompter {
         this.style = createStyle(this.interactive == true && process.env.NO_COLOR == null);
 
         if(supportsUnicode() == true) {
-            this.symbols = { question: "?", pointer: "❯", tick: "✔", rule: "─", ellipsis: "…" };
+            this.symbols = { question: "?", pointer: "❯", tick: "✔", rule: "─", ellipsis: "…", caret: "▏" };
         }
         else {
-            this.symbols = { question: "?", pointer: ">", tick: "√", rule: "-", ellipsis: "..." };
+            this.symbols = { question: "?", pointer: ">", tick: "√", rule: "-", ellipsis: "...", caret: "_" };
         }
 
         this.inputEnded = input.readableEnded;
@@ -559,11 +627,11 @@ export class Prompter {
         }
 
         if(this.interactive == true) {
-            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation, options?.banner);
+            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation, options?.banner, options?.preface);
             return picked;
         }
 
-        const picked = await this.selectWithLines(question, items, startIndex, options?.cancelValue, options?.tabs, options?.banner);
+        const picked = await this.selectWithLines(question, items, startIndex, options?.cancelValue, options?.tabs, options?.banner, options?.preface);
         return picked;
     }
 
@@ -671,6 +739,7 @@ export class Prompter {
         cancelValue: T | undefined,
         tabs: SelectTabs<T> | undefined,
         banner: LinePart[] | undefined,
+        preface: string[] | undefined,
     ): Promise<T> {
         const choices = items.filter((item): item is SelectChoice<T> => "value" in item);
         const labelWidths = groupLabelWidths(items);
@@ -687,6 +756,10 @@ export class Prompter {
                 return tab.label;
             });
             this.output.write(`  ${bar.join("  ")}\n`);
+        }
+
+        for(const line of preface ?? []) {
+            this.output.write(`${line.replace(ANSI_PATTERN, "")}\n`);
         }
 
         let number = 0;
@@ -978,6 +1051,7 @@ export class Prompter {
         initialTabs: SelectTabs<T> | undefined,
         animation: SelectOptions<T>["animation"],
         initialBanner: LinePart[] | undefined,
+        preface: string[] | undefined,
     ): Promise<T> {
         const ttyInput = this.input as TtyInput;
         let question = initialQuestion;
@@ -1010,11 +1084,49 @@ export class Prompter {
         let viewportHeight = 0;
         let bodyLineCount = 0;
         let followSelection = true;
-        let refreshOffset: number | null = null;
+        let anchorValue: string | null = null;
+        let anchorStart = 0;
+        let anchorHeaderHeight = 0;
+        let prefaceScrollTop = 0;
+        let prefaceHeight = 0;
+        let prefaceLineCount = 0;
+        const hasPreface = preface != null && preface.length > 0;
         const bounds = new Map<number, { start: number; end: number }>();
+        /** First body line of the active row in the last build, for the trace. */
+        let tracedActiveStart = 0;
+
+        // CONCOS_BOARD_TRACE=<file>: one JSON line per draw, refresh, key and resize, to find where a
+        // real terminal and this list disagree (2026-10-26, a board that shifted only on real
+        // terminals). Values and counts only, never the text of a row or what was typed.
+        const tracePath = process.env.CONCOS_BOARD_TRACE;
+        const valueAt = (index: number): string | null => {
+            const item = items[index];
+            if(item != null && "value" in item) {
+                return item.value;
+            }
+            return null;
+        };
+        const trace = (event: Record<string, unknown>): void => {
+            if(tracePath == null || tracePath == "") {
+                return;
+            }
+            try {
+                fs.appendFileSync(tracePath, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
+            }
+            catch {
+                // a trace that cannot be written must not break the list
+            }
+        };
 
         const draw = (lines: string[], incremental = false): void => {
-            if(incremental && lines.length == renderedLines && renderedLines > 0) {
+            const partial = incremental && lines.length == renderedLines && renderedLines > 0;
+            trace({
+                event: partial ? "draw-partial" : "draw-full", lines: lines.length, drawnBefore: renderedLines,
+                rows: this.rows(), columns: this.columns(), active: valueAt(active), activeStart: tracedActiveStart,
+                scrollTop: scrollTop, viewport: viewportHeight, body: bodyLineCount,
+                prefaceTop: prefaceScrollTop, prefaceViewport: prefaceHeight, prefaceLines: prefaceLineCount,
+            });
+            if(partial) {
                 const previous = drawnText.split("\n");
                 let cursor = renderedLines - 1;
                 let changes = "";
@@ -1139,7 +1251,18 @@ export class Prompter {
                     else {
                         parts.push({ text: padToWidth(item.label, labelWidths[index]) });
                     }
-                    if(item.hint != null && item.hint !== "") {
+                    // a text field shows what was typed, and on the active row where typing goes
+                    const field = item.input;
+                    if(field != null && (isActive == true || field.text != "")) {
+                        parts.push({ text: `  ${field.text}`, paint: isActive == true ? undefined : this.style.dim });
+                        if(isActive == true) {
+                            parts.push({ text: this.symbols.caret, paint: this.style.accent });
+                        }
+                        if(field.text == "" && field.placeholder != null) {
+                            parts.push({ text: ` ${field.placeholder}`, paint: this.style.dim });
+                        }
+                    }
+                    else if(item.hint != null && item.hint !== "") {
                         const hint = item.hintStatus == "success" ? `${this.symbols.tick} ${item.hint}` : item.hint;
                         parts.push({ text: `  ${hint}`, paint: item.hintStatus == "success" ? this.style.success : this.style.dim });
                     }
@@ -1158,13 +1281,6 @@ export class Prompter {
                 bounds.set(index, { start: rowStart, end: rowEnd });
             }
 
-            let footer = "↑↓ move · Enter select · Esc back";
-            if(tabs != null) {
-                footer = "↑↓ move · ←→ tab · Enter select · Esc back";
-            }
-            if(refresh != null) {
-                footer += " · updates live";
-            }
             let trailerCount = 1;
             if(refreshError != null) {
                 trailerCount = 2;
@@ -1172,16 +1288,34 @@ export class Prompter {
             // question and tab lines, footer lines, and one spare row so the last line never scrolls the screen;
             // a short terminal still gets a list that fits, down to one body line, since the cursor cannot
             // climb above the window to redraw the part that would not
-            const height = Math.max(1, this.rows() - header.length - trailerCount - 1);
+            const available = Math.max(1, this.rows() - header.length - trailerCount - 1);
+            let detailLines = wrapPreface(preface ?? [], width);
+            if(process.env.NO_COLOR != null) {
+                detailLines = detailLines.map((line) => line.replace(ANSI_PATTERN, ""));
+            }
+            prefaceLineCount = detailLines.length;
+            prefaceHeight = 0;
+            if(hasPreface == true) {
+                // A long action list must not squeeze the detail into one line: reserve half the
+                // space (at least four rows when possible), leaving at least one selectable row.
+                const minimumDetailHeight = Math.min(detailLines.length, Math.max(0, available - 1), Math.max(4, Math.floor(available / 2)));
+                const choiceHeight = Math.min(lines.length, available - minimumDetailHeight);
+                prefaceHeight = Math.min(detailLines.length, available - choiceHeight);
+            }
+            prefaceScrollTop = Math.min(prefaceScrollTop, Math.max(0, detailLines.length - prefaceHeight));
+            const detail = detailLines.slice(prefaceScrollTop, prefaceScrollTop + prefaceHeight);
+            const height = available - prefaceHeight;
             viewportHeight = height;
             bodyLineCount = lines.length;
-            if(refreshOffset != null) {
-                scrollTop = activeStart + refreshOffset;
-                refreshOffset = null;
+            const headerHeight = header.length + prefaceHeight;
+            if(followSelection == false && anchorValue == valueAt(active)) {
+                // Every draw can change row heights, including animation between data refreshes.
+                scrollTop += activeStart - anchorStart + headerHeight - anchorHeaderHeight;
             }
             let body = lines;
             if(lines.length > height) {
-                if(followSelection == true) {
+                const selectedOutside = activeEnd < scrollTop || activeStart >= scrollTop + height;
+                if(followSelection == true || selectedOutside == true) {
                     if(activeEnd - activeStart + 1 > height) {
                         // A long message starts at its title; its body is reached by scrolling.
                         scrollTop = activeStart;
@@ -1197,23 +1331,66 @@ export class Prompter {
                 }
                 scrollTop = Math.min(Math.max(0, scrollTop), lines.length - height);
                 body = lines.slice(scrollTop, scrollTop + height);
-                const below = lines.length - scrollTop - height;
-                const hidden: string[] = [];
-                if(scrollTop > 0) {
-                    hidden.push(`${scrollTop} lines above`);
-                }
-                if(below > 0) {
-                    hidden.push(`${below} lines below`);
-                }
-                // first in the footer, so a narrow terminal cuts the key help rather than this
-                footer = `PgUp/PgDn scroll · ${hidden.join(" · ")} · ${footer}`;
             }
             else {
                 scrollTop = 0;
             }
             followSelection = false;
+            anchorValue = valueAt(active);
+            anchorStart = activeStart;
+            anchorHeaderHeight = headerHeight;
+            tracedActiveStart = activeStart;
 
-            const result = [...header, ...body, this.fitLine([{ text: footer, paint: this.style.dim }], width)];
+            let above = scrollTop;
+            let below = Math.max(0, lines.length - scrollTop - height);
+            if(hasPreface == true) {
+                above = prefaceScrollTop;
+                below = Math.max(0, detailLines.length - prefaceScrollTop - prefaceHeight);
+            }
+            const scrollable = above > 0 || below > 0;
+            const hints = [
+                "↑↓ move · Enter select · Esc back",
+                "↑↓ · Enter select · Esc back",
+                "↑↓ · Enter · Esc",
+                "Enter Esc",
+            ];
+            if(tabs != null) {
+                hints.splice(0, hints.length,
+                    "↑↓ move · ←→ tab · Enter select · Esc back",
+                    "↑↓ · ←→ tab · Enter select · Esc back",
+                    "↑↓ · ←→ tab · Enter · Esc",
+                    "←→ · Enter · Esc",
+                    "Tab Enter Esc",
+                );
+            }
+            let footer: string | undefined;
+            if(scrollable == true) {
+                footer = hints.map((hint) => `${hint} · PgUp/PgDn scroll`).find((hint) => displayWidth(hint) <= width);
+            }
+            footer ??= hints.find((hint) => displayWidth(hint) <= width) ?? hints[hints.length - 1];
+            if(scrollable == true) {
+                const hidden: string[] = [];
+                const compact: string[] = [];
+                if(above > 0) {
+                    hidden.push(`${above} lines above`);
+                    compact.push(`↑${above}`);
+                }
+                if(below > 0) {
+                    hidden.push(`${below} lines below`);
+                    compact.push(`↓${below}`);
+                }
+                for(const counts of [hidden.join(" · "), compact.join(" ")]) {
+                    if(displayWidth(`${footer} · ${counts}`) <= width) {
+                        footer += ` · ${counts}`;
+                        break;
+                    }
+                }
+            }
+            if(refresh != null && displayWidth(`${footer} · updates live`) <= width) {
+                footer += " · updates live";
+            }
+
+            const result = [...header, ...detail, ...body, this.fitLine([{ text: footer, paint: this.style.dim }], width)];
             if(refreshError != null) {
                 result.push(this.fitLine([{ text: `refresh failed: ${refreshError}`, paint: this.style.warning }], width));
             }
@@ -1237,8 +1414,7 @@ export class Prompter {
         const reload = (): void => {
             const activeValue = (items[active] as SelectChoice<T>).value;
             const activePosition = selectableIndexes.indexOf(active);
-            const previousStart = bounds.get(active)?.start ?? scrollTop;
-            refreshOffset = scrollTop - previousStart;
+            const refreshOffset = scrollTop - (bounds.get(active)?.start ?? scrollTop);
             try {
                 const next = refresh!.load();
                 question = next.question;
@@ -1264,9 +1440,9 @@ export class Prompter {
             }
             else {
                 active = selectableIndexes[Math.min(activePosition, selectableIndexes.length - 1)];
-                refreshOffset = null;
                 followSelection = true;
             }
+            trace({ event: "reload", from: activeValue, kept: sameValue >= 0, to: valueAt(active), items: items.length, refreshOffset: refreshOffset });
             redraw(animation != null);
         };
 
@@ -1281,6 +1457,7 @@ export class Prompter {
             let timer: NodeJS.Timeout | null = null;
             let animationTimer: NodeJS.Timeout | null = null;
             const onResize = (): void => {
+                trace({ event: "resize", rows: this.rows(), columns: this.columns() });
                 followSelection = true;
                 redraw();
             };
@@ -1313,10 +1490,35 @@ export class Prompter {
             };
 
             this.keyHandler = (key: string) => {
+                let keyName = "char";
+                if(key.startsWith(ESC) == true || /^[\u0000-\u001f\u007f]$/u.test(key) == true) {
+                    keyName = JSON.stringify(key);
+                }
+                trace({ event: "key", key: keyName, active: valueAt(active) });
                 if(key === KEY_CTRL_C || key === KEY_CTRL_D) {
                     finish();
                     reject(new PromptClosedError());
                     return;
+                }
+
+                // a row's text field takes typing before Esc, digits and j/k mean anything else
+                const field = (items[active] as SelectChoice<T>).input;
+                if(field != null) {
+                    if(KEY_BACKSPACE.includes(key) == true) {
+                        field.text = [...field.text].slice(0, -1).join("");
+                        redraw();
+                        return;
+                    }
+                    if(key === KEY_CTRL_U || (key === ESC && field.text != "")) {
+                        field.text = "";
+                        redraw();
+                        return;
+                    }
+                    if(key.startsWith(ESC) == false && /^[^\u0000-\u001f\u007f]+$/u.test(key) == true) {
+                        field.text += key;
+                        redraw();
+                        return;
+                    }
                 }
 
                 if(KEY_ENTER.includes(key) == true) {
@@ -1353,29 +1555,44 @@ export class Prompter {
 
                 if(KEY_UP.includes(key) == true) {
                     const row = bounds.get(active)!;
-                    if(row.end - row.start + 1 > viewportHeight && scrollTop > row.start) scrollTop -= 1;
+                    if(hasPreface == false && row.end - row.start + 1 > viewportHeight && scrollTop > row.start) scrollTop -= 1;
                     else move(-1);
                 }
                 else if(KEY_DOWN.includes(key) == true) {
                     const row = bounds.get(active)!;
-                    if(row.end - row.start + 1 > viewportHeight && scrollTop + viewportHeight <= row.end) scrollTop += 1;
+                    if(hasPreface == false && row.end - row.start + 1 > viewportHeight && scrollTop + viewportHeight <= row.end) scrollTop += 1;
                     else move(1);
                 }
                 else if(key === KEY_PAGE_UP || key === KEY_PAGE_DOWN) {
                     const step = key === KEY_PAGE_UP ? -1 : 1;
-                    scrollTop = Math.min(Math.max(0, bodyLineCount - viewportHeight), Math.max(0, scrollTop + step * Math.max(1, viewportHeight - 1)));
-                    const row = bounds.get(active)!;
-                    if(row.end < scrollTop || row.start >= scrollTop + viewportHeight) {
-                        active = selectableIndexes.find((index) => bounds.get(index)!.end >= scrollTop && bounds.get(index)!.start < scrollTop + viewportHeight) ?? active;
+                    if(hasPreface == true) {
+                        prefaceScrollTop = Math.min(Math.max(0, prefaceLineCount - prefaceHeight), Math.max(0, prefaceScrollTop + step * Math.max(1, prefaceHeight - 1)));
+                    }
+                    else {
+                        scrollTop = Math.min(Math.max(0, bodyLineCount - viewportHeight), Math.max(0, scrollTop + step * Math.max(1, viewportHeight - 1)));
+                        const row = bounds.get(active)!;
+                        if(row.end < scrollTop || row.start >= scrollTop + viewportHeight) {
+                            active = selectableIndexes.find((index) => bounds.get(index)!.end >= scrollTop && bounds.get(index)!.start < scrollTop + viewportHeight) ?? active;
+                        }
                     }
                 }
                 else if(KEY_HOME.includes(key) == true) {
-                    active = selectableIndexes[0];
-                    followSelection = true;
+                    if(hasPreface == true) {
+                        prefaceScrollTop = 0;
+                    }
+                    else {
+                        active = selectableIndexes[0];
+                        followSelection = true;
+                    }
                 }
                 else if(KEY_END.includes(key) == true) {
-                    active = selectableIndexes[selectableIndexes.length - 1];
-                    followSelection = true;
+                    if(hasPreface == true) {
+                        prefaceScrollTop = Math.max(0, prefaceLineCount - prefaceHeight);
+                    }
+                    else {
+                        active = selectableIndexes[selectableIndexes.length - 1];
+                        followSelection = true;
+                    }
                 }
                 else if(/^[1-9]$/.test(key) == true && Number(key) <= selectableIndexes.length) {
                     active = selectableIndexes[Number(key) - 1];

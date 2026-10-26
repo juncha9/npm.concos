@@ -31,6 +31,7 @@ import {
     SHARED_ROOM,
     STALE_CARD_MS,
     TOPIC_KEY_PATTERN,
+    WAKE_FALLBACK_MS,
 } from "../../_defs";
 import type { AgentStatus, MessageKind } from "../../_defs";
 import { CONCOS_VERSION } from "../../_libs/version";
@@ -41,6 +42,7 @@ import type { HookEvent } from "../hooks/types";
 interface AgentRow {
     id: string;
     room: string;
+    host_session_id: string | null;
     display_name: string;
     client: string;
     is_human: number;
@@ -120,7 +122,7 @@ export interface EditResult {
 }
 
 const AGENT_COLUMNS = `
-    id, room, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
+    id, room, host_session_id, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
     status, role, task, summary, next_step, blocker, reference_list, editing_list,
     revision, changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, last_call_at, disconnected_at, left_at
@@ -150,6 +152,10 @@ export interface JoinResult {
     resumed: boolean;
     /** The card a session-start hook made, when an earlier card of the name took its session over; that agent_id is gone. */
     merged_from?: string;
+    /** Joining again with a workspace_root above the folder the session started in moved the card there: the project it left. */
+    moved_from_project?: string;
+    /** Why a workspace_root given on joining again was not applied; the card stays in its project. */
+    workspace_root_ignored?: string;
 }
 
 export interface InboxCounts {
@@ -157,7 +163,7 @@ export interface InboxCounts {
     notes: number;
 }
 
-/** An unread message a hook points the model at: a question to it, an answer to its own question, or on a prompt a note to it. */
+/** An unread message a hook points the model at: a question to it, an answer to its own question, or on a prompt or wake a note to it or an answer to its note. */
 export interface HookNotice {
     id: number;
     seq: number;
@@ -174,6 +180,8 @@ export interface HookOutcome {
     notices?: HookNotice[];
     /** Set when the turn end should continue the turn: the messages it continues for. */
     continueFor?: HookNotice[];
+    /** Every unread message for the agent, with those no hook points out; set with `notices` or `continueFor`. */
+    unread?: number;
 }
 
 /** An idle-wake watch: the session it watches, and the generation that keeps it live. */
@@ -185,7 +193,15 @@ export interface WakeWatch {
 export type WakeCheck =
     | { state: "stop" }
     | { state: "wait" }
-    | { state: "wake"; notices: HookNotice[] };
+    | { state: "wake"; notices: HookNotice[]; unread: number };
+
+/** A wake no watch made: the host session to wake and what to tell it. */
+export interface FallbackWake {
+    host: string;
+    sessionId: string;
+    notices: HookNotice[];
+    unread: number;
+}
 
 export interface CompactCard {
     agent_id: string;
@@ -286,6 +302,29 @@ export interface FullMessage {
     received: boolean;
 }
 
+export type PendingWakeExclusion =
+    | "reply_to_your_reply" | "reply_to_other_reply" | "reply_to_other_question"
+    | "reply_to_your_note" | "reply_to_other_note"
+    | "reply_to_your_notice" | "reply_to_other_notice" | "reply_target_missing";
+
+/** Unreceived messages on a card, for diagnosis; querying them never acknowledges a message. */
+export interface PendingMessage {
+    id: number;
+    kind: MessageKind;
+    from: string;
+    from_name: string;
+    from_client: string;
+    from_human: boolean;
+    created_at: string;
+    delivered_at: string | null;
+    wake_target: boolean;
+    wake_reason: PendingWakeExclusion | null;
+    /** Its seq is at or below the hook's notice cursor; this does not prove it was read. */
+    notified: boolean;
+    /** Only the first logical line, bounded by MESSAGE_PREVIEW_LENGTH. */
+    preview: string;
+}
+
 export interface RoomOverviewAgent {
     agent_id: string;
     name: string;
@@ -311,7 +350,7 @@ export interface RoomOverviewAgent {
     pending_count: number;
     /** The concos version of its MCP bridge, when one from 0.1.11 on has touched the card. */
     concos_version: string | null;
-    /** Why a live card looks wrong, for the person at the board to take it down; empty when it does not. */
+    /** Why a live card needs attention; empty when there is no issue to report. */
     issues: AgentIssue[];
 }
 
@@ -319,11 +358,13 @@ export interface RoomOverviewAgent {
  * Why a live card looks wrong. `old_concos`: its bridge runs an older concos than the one
  * reading, so it misses newer behaviour until the session restarts. `duplicate`: a more recently
  * active card has its name in its project. `stuck`: it says working but has not acted for an hour.
+ * `unread_unwoken`: a waiting host session has wake targets not yet pointed out for over ten minutes.
  */
 export type AgentIssue =
     | { kind: "old_concos"; version: string }
     | { kind: "duplicate"; newer_agent_id: string }
-    | { kind: "stuck"; since: string };
+    | { kind: "stuck"; since: string }
+    | { kind: "unread_unwoken"; count: number; since: string };
 
 export interface RoomOverviewParticipant {
     name: string;
@@ -570,6 +611,16 @@ function resolveWorkspacePath(rawPath: string): { displayPath: string; comparePa
     catch {
         return { displayPath: displayPath, comparePath: `unverified:${displayPath}`, isVerified: false };
     }
+}
+
+/** Whether `folder` is the folder `root` names or one inside it, both as real paths; false when either cannot be reached. */
+function isWithin(root: { comparePath: string; isVerified: boolean }, folder: string): boolean {
+    const inner = resolveWorkspacePath(folder);
+    if(root.isVerified == false || inner.isVerified == false) {
+        return false;
+    }
+    const relative = path.relative(root.comparePath, inner.comparePath);
+    return path.isAbsolute(relative) == false && relative.split(path.sep)[0] != "..";
 }
 
 /**
@@ -884,9 +935,33 @@ export class RoomStore {
                 // or compacts the session from where it has moved, records that folder instead.
                 let startedIn = { workspaceId: workspaceId, directory: workingDirectory };
                 let currentDirectory: string | null = null;
+                let movedFromProject: string | undefined;
+                let rootIgnored: string | undefined;
+                // editing claims are paths from the project; null leaves them as they are
+                let editingList: string | null = null;
                 if(resumed.workspace_id != null && resumed.working_directory != null) {
                     startedIn = { workspaceId: resumed.workspace_id, directory: resumed.working_directory };
                     currentDirectory = currentDirectoryOf(workingDirectory, resumed.working_directory);
+                    // The model may move its card up to a project root holding the folder its session
+                    // started in, never down into a folder below it (2026-10-26 user decision, after an
+                    // agent told its project root could only leave and join as a new card).
+                    if(session == null && input.workspaceRoot != null && workspaceId != resumed.workspace_id) {
+                        if(isWithin(workspacePath, resumed.working_directory)) {
+                            const left = this.prepare(`
+                                SELECT display_path FROM workspace WHERE id = :id
+                            `).get({ id: resumed.workspace_id }) as { display_path: string } | undefined;
+                            movedFromProject = left?.display_path ?? resumed.workspace_id;
+                            startedIn.workspaceId = workspaceId;
+                            if(left != null) {
+                                // `src/a.ts` claimed under the repository reads `repo/src/a.ts` under the root above it
+                                editingList = JSON.stringify(parseList(resumed.editing_list).map((entry) =>
+                                    path.relative(workspacePath.displayPath, path.resolve(left.display_path, entry)).replaceAll(path.sep, "/") || "."));
+                            }
+                        }
+                        else {
+                            rootIgnored = `workspace_root must hold the folder this session started in (${resumed.working_directory}); the card stays in its project`;
+                        }
+                    }
                 }
                 this.prepare(`
                     UPDATE agent
@@ -895,6 +970,7 @@ export class RoomStore {
                         workspace_id = :workspace_id,
                         working_directory = :working_directory,
                         current_directory = :current_directory,
+                        editing_list = COALESCE(:editing_list, editing_list),
                         concos_version = COALESCE(:concos_version, concos_version),
                         changed_seq = :changed_seq,
                         last_seen_at = :now,
@@ -910,6 +986,7 @@ export class RoomStore {
                     workspace_id: startedIn.workspaceId,
                     working_directory: startedIn.directory,
                     current_directory: currentDirectory,
+                    editing_list: editingList,
                     concos_version: input.concosVersion ?? null,
                     changed_seq: seq,
                     now: nowText,
@@ -924,6 +1001,12 @@ export class RoomStore {
                 // the agent was told the hook card's id; say why another came back (2026-10-25 report)
                 if(cardId != resumed.id) {
                     result.merged_from = resumed.id;
+                }
+                if(movedFromProject != null) {
+                    result.moved_from_project = movedFromProject;
+                }
+                if(rootIgnored != null) {
+                    result.workspace_root_ignored = rootIgnored;
                 }
                 return result;
             }
@@ -1053,9 +1136,9 @@ export class RoomStore {
      * Unread messages a hook may point out, newer than `afterSeq`: questions named to this agent,
      * alone or in a group, and answers to its own questions. Room-wide messages would continue
      * every session in the room, and answers to answers would bounce between agents, so neither
-     * counts. `includeNotes` adds notes and notices named to it, for the line a prompt or session
-     * start shows and for idle wake; they never continue a turn. Reading this list acknowledges
-     * nothing.
+     * counts. `includeNotes` adds notes and notices named to it and answers to its own notes and
+     * notices, for the line a prompt or session start shows and for idle wake; they never continue
+     * a turn. Reading this list acknowledges nothing.
      */
     hookNotices(agentId: string, afterSeq = 0, includeNotes = false): HookNotice[] {
         return this.prepare(`
@@ -1091,12 +1174,58 @@ export class RoomStore {
                             FROM message AS Q
                             WHERE Q.id = M.reply_to_message_id
                                 AND Q.sender_agent_id = :agent_id
-                                AND Q.kind = 'question'
+                                -- work is often handed over as a note and its result comes back as
+                                -- the answer, so idle wake counts those too (2026-10-27 user decision)
+                                AND (Q.kind = 'question' OR (:include_notes = 1 AND Q.kind IN ('note', 'notice')))
                         )
                     )
                 )
             ORDER BY M.seq
         `).all({ agent_id: agentId, after_seq: afterSeq, include_notes: Number(includeNotes) }) as unknown as HookNotice[];
+    }
+
+    /** Card diagnostics, oldest first: previews only, with the same wake targets as the hooks. */
+    pendingFor(agentId: string): PendingMessage[] {
+        const rows = this.prepare(`
+            SELECT M.id, M.kind, M.sender_agent_id AS from_id,
+                S.display_name AS from_name, S.client AS from_client, S.is_human AS from_human,
+                M.created_at, R.delivered_at, M.seq <= A.hook_nudged_seq AS notified,
+                SUBSTR(M.body, 1, :preview_length) AS preview,
+                Q.kind AS reply_kind, Q.sender_agent_id AS reply_author
+            FROM message_receipt AS R
+            JOIN message AS M ON M.id = R.message_id
+            JOIN agent AS A ON A.id = R.agent_id
+            JOIN agent AS S ON S.id = M.sender_agent_id
+            LEFT JOIN message AS Q ON Q.id = M.reply_to_message_id
+            WHERE R.agent_id = :agent_id AND R.received_at IS NULL
+                AND (M.recipient_scope = 'group' OR (M.recipient_scope = 'direct' AND M.recipient_agent_id IS NOT NULL))
+            ORDER BY M.created_at, M.id
+        `).all({ agent_id: agentId, preview_length: MESSAGE_PREVIEW_LENGTH }) as unknown as {
+            id: number; kind: MessageKind; from_id: string; from_name: string; from_client: string; from_human: number;
+            created_at: string; delivered_at: string | null; notified: number; preview: string;
+            reply_kind: MessageKind | null; reply_author: string | null;
+        }[];
+        if(rows.length == 0) return [];
+        const targets = new Set(this.hookNotices(agentId, 0, true).map((notice) => notice.id));
+        return rows.map((row) => {
+            const target = targets.has(row.id);
+            const own = row.reply_author == agentId;
+            let reason: PendingWakeExclusion | null = null;
+            if(target == false) {
+                if(row.reply_kind == "reply") reason = own ? "reply_to_your_reply" : "reply_to_other_reply";
+                else if(row.reply_kind == "question") reason = "reply_to_other_question";
+                else if(row.reply_kind == "note") reason = own ? "reply_to_your_note" : "reply_to_other_note";
+                else if(row.reply_kind == "notice") reason = own ? "reply_to_your_notice" : "reply_to_other_notice";
+                else reason = "reply_target_missing";
+            }
+            return {
+                id: row.id, kind: row.kind, from: row.from_id,
+                from_name: row.from_name, from_client: row.from_client, from_human: row.from_human == 1,
+                created_at: row.created_at, delivered_at: row.delivered_at,
+                wake_target: target, wake_reason: reason, notified: row.notified == 1,
+                preview: row.preview.split(/\r\n?|\n/, 1)[0],
+            };
+        });
     }
 
     /**
@@ -1134,7 +1263,7 @@ export class RoomStore {
                 workingDirectory: event.cwd, workspaceRoot: null, resumeHandle: null,
                 hookSession: { host: event.host, sessionId: event.sessionId },
             });
-            return { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id, 0, true) };
+            return { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id, 0, true), unread: this.countPending(joined.agent_id) };
         }
         return runInTransaction(this.database, () => {
             // (2) Participant
@@ -1159,7 +1288,7 @@ export class RoomStore {
                         SET hook_nudged_seq = :nudged_seq, last_seen_at = :now, last_call_at = :now, disconnected_at = NULL
                         WHERE id = :id
                     `).run({ nudged_seq: continueFor[continueFor.length - 1].seq, now: now, id: row.id });
-                    return { agentId: row.id, continueFor: continueFor };
+                    return { agentId: row.id, continueFor: continueFor, unread: this.countPending(row.id) };
                 }
             }
 
@@ -1196,6 +1325,7 @@ export class RoomStore {
             const outcome: HookOutcome = { agentId: row.id };
             if(event.kind == "prompt") {
                 outcome.notices = this.hookNotices(row.id, 0, true);
+                outcome.unread = this.countPending(row.id);
             }
             return outcome;
         });
@@ -1259,7 +1389,7 @@ export class RoomStore {
             }
             // wake times of the last hour, kept on the card for diagnosis
             const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
-            return { check: { state: "wake", notices: notices }, woken: woken };
+            return { check: { state: "wake", notices: notices, unread: this.countPending(watch.agentId) }, woken: woken };
         };
         const first = look();
         if(first.check.state != "wake") {
@@ -1282,6 +1412,64 @@ export class RoomStore {
                 id: watch.agentId,
             });
             return confirmed.check;
+        });
+    }
+
+    /**
+     * Idle wake that no watch made. A turn that fails ends without the Stop hook, so no watch
+     * starts and the card stays working; a watch may also have run out or failed to start. When a
+     * message to wake for has waited `WAKE_FALLBACK_MS` without being pointed out, and the agent,
+     * bound to a session of one of `hosts`, has not acted for as long, the wake is recorded as a
+     * watch records it, any watch still running ends, and the session to wake comes back.
+     *
+     * Reads take no lock; the wake is checked again under the write lock before it is recorded.
+     */
+    fallbackWake(agentId: string, hosts: string[], nowMs: number = Date.now()): FallbackWake | null {
+        // the wake, and the wake times within the last hour
+        const look = (): { wake: FallbackWake; woken: string[] } | null => {
+            const row = this.prepare(`
+                SELECT host, host_session_id, hook_nudged_seq, woken_at_list, last_call_at
+                FROM agent
+                WHERE id = :id AND left_at IS NULL AND disconnected_at IS NULL
+            `).get({ id: agentId }) as {
+                host: string | null; host_session_id: string | null; hook_nudged_seq: number; woken_at_list: string; last_call_at: string | null;
+            } | undefined;
+            if(row == null || row.host == null || row.host_session_id == null || hosts.includes(row.host) == false) {
+                return null;
+            }
+            if(row.last_call_at != null && nowMs - Date.parse(row.last_call_at) < WAKE_FALLBACK_MS) {
+                return null;
+            }
+            const notices = this.hookNotices(agentId, row.hook_nudged_seq, true);
+            if(notices.length == 0) {
+                return null;
+            }
+            const oldest = this.prepare(`SELECT created_at FROM message WHERE id = :id`).get({ id: notices[0].id }) as { created_at: string };
+            if(nowMs - Date.parse(oldest.created_at) < WAKE_FALLBACK_MS) {
+                return null;
+            }
+            const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
+            return { wake: { host: row.host, sessionId: row.host_session_id, notices: notices, unread: this.countPending(agentId) }, woken: woken };
+        };
+        if(look() == null) {
+            return null;
+        }
+        return runInTransaction(this.database, () => {
+            const confirmed = look();
+            if(confirmed == null) {
+                return null;
+            }
+            const notices = confirmed.wake.notices;
+            this.prepare(`
+                UPDATE agent
+                SET wake_generation = wake_generation + 1, hook_nudged_seq = :nudged_seq, woken_at_list = :woken_at_list
+                WHERE id = :id
+            `).run({
+                nudged_seq: notices[notices.length - 1].seq,
+                woken_at_list: JSON.stringify([...confirmed.woken, new Date(nowMs).toISOString()]),
+                id: agentId,
+            });
+            return confirmed.wake;
         });
     }
 
@@ -2024,6 +2212,27 @@ export class RoomStore {
 
     /** Retained messages visible on the board, newest first, without delivery or receipt changes. */
     searchMessages(input: MessageSearchInput): MessageSearchResult {
+        return this.queryBoardMessages(input, null);
+    }
+
+    /** A retained message by id, including ones older than the board's recent-message list. */
+    messageForBoard(messageId: number): RoomOverviewMessage | null {
+        return this.queryBoardMessages({ limit: 1 }, messageId).messages[0] ?? null;
+    }
+
+    /** Stable sender identity for board actions; names can be shared by several sessions. */
+    messageSender(messageId: number): { agent_id: string; human: boolean; left: boolean } | null {
+        const sender = this.prepare(`
+            SELECT S.id, S.is_human, S.left_at
+            FROM message AS M
+            JOIN agent AS S ON S.id = M.sender_agent_id
+            WHERE M.id = :message_id AND M.room = :room
+        `).get({ message_id: messageId, room: SHARED_ROOM }) as { id: string; is_human: number; left_at: string | null } | undefined;
+        if(sender == null) return null;
+        return { agent_id: sender.id, human: sender.is_human == 1, left: sender.left_at != null };
+    }
+
+    private queryBoardMessages(input: MessageSearchInput, messageId: number | null): MessageSearchResult {
         const limit = input.limit ?? 50;
         if(Number.isInteger(limit) == false || limit < 1 || limit > 100) {
             throw new RoomError("message search limit must be an integer from 1 to 100");
@@ -2055,6 +2264,7 @@ export class RoomStore {
             JOIN agent AS S ON S.id = M.sender_agent_id
             LEFT JOIN agent AS R ON R.id = M.recipient_agent_id
             WHERE M.room = :room
+                AND (:message_id IS NULL OR M.id = :message_id)
                 AND (:text = '' OR instr(lower(M.body), lower(:text)) > 0)
                 AND (:sender = '' OR instr(lower(S.display_name), lower(:sender)) > 0)
                 AND (:topic = '' OR EXISTS (
@@ -2066,6 +2276,7 @@ export class RoomStore {
             LIMIT :limit
         `).all({
             room: SHARED_ROOM,
+            message_id: messageId,
             text: input.text?.trim() ?? "",
             sender: input.sender?.trim() ?? "",
             topic: topic,
@@ -2627,7 +2838,19 @@ export class RoomStore {
         `).run({ now: new Date().toISOString(), concos_version: concosVersion ?? null, agent_ids: JSON.stringify(agentIds) });
     }
 
-    /** Bridge shutdown: releases editing claims at once (a visible change) and marks the agents disconnected. */
+    /** An idle-wake watch still running: its session is open and waiting, so the card stays online. */
+    keepAlive(agentId: string): void {
+        this.prepare(`
+            UPDATE agent SET last_seen_at = :now WHERE id = :id AND left_at IS NULL AND disconnected_at IS NULL
+        `).run({ now: new Date().toISOString(), id: agentId });
+    }
+
+    /**
+     * Bridge shutdown: releases editing claims at once (a visible change) and marks the agents
+     * disconnected, except those a host session holds: such a card ends with its session, through
+     * the session-end hook. Clients restart MCP servers within an open session, and a card marked
+     * disconnected then dropped off the board and stopped its idle wake (2026-10-26 report).
+     */
     disconnect(agentIds: string[]): void {
         if(agentIds.length == 0) {
             return;
@@ -2650,7 +2873,7 @@ export class RoomStore {
                     `).run({ now: nowText, changed_seq: this.nextSeq(), id: agentId });
                 }
                 this.prepare(`
-                    UPDATE agent SET disconnected_at = :now WHERE id = :id
+                    UPDATE agent SET disconnected_at = :now WHERE id = :id AND host_session_id IS NULL
                 `).run({ now: nowText, id: agentId });
             }
         });
@@ -2776,6 +2999,13 @@ export class RoomStore {
                 && actedAt(other.row) > actedAt(row));
             if(newer != null) {
                 agent.issues.push({ kind: "duplicate", newer_agent_id: newer.row.id });
+            }
+            if(row.host_session_id != null && row.status == "waiting" && agent.pending_count > 0) {
+                const waiting = this.pendingFor(row.id).filter((message) => message.wake_target && !message.notified);
+                const oldest = waiting[0];
+                if(oldest != null && nowMs - Date.parse(oldest.created_at) > WAKE_FALLBACK_MS) {
+                    agent.issues.push({ kind: "unread_unwoken", count: waiting.length, since: oldest.created_at });
+                }
             }
         }
 

@@ -5,12 +5,14 @@ import { normalizeTopics } from "../store/room-store";
 import { readRoomOverviews, runSay } from "./human-commands";
 import { showRoomBoard } from "./room-board";
 import { participantName } from "./status-renderer";
+import type { RoomOverviewAgent } from "../store/room-store";
 import { Prompter, PromptBackError, PromptClosedError, supportsUnicode } from "./prompter";
 import type { SelectItem } from "./prompter";
 import { HOOK_CLIENTS, MCP_CLIENTS, getMcpClient } from "./clients";
 import { applySetup, ensureUsableSettings, hasWake, HOST_LABELS, inspectHooks, inspectSettings, inspectSetup, inspectWake, planHooks, planRegistration, planSetup, planUnregister, planUpdate, planWake, pruneSettingsBackups, resolveHooksPath, resolveMcpPath, UPDATED_MESSAGE } from "./setup";
 import type { SetupChange, SetupTarget } from "./setup";
 import { checkForSelfUpdate, showSelfUpdate } from "./self-update";
+import { changedHunks, comparableText, hunkHeader, maskSecrets } from "./settings-diff";
 import type { AvailableUpdate, SelfUpdateOptions } from "./self-update";
 
 export interface MenuOptions {
@@ -60,18 +62,44 @@ function registrationSummary(draft: SetupTarget): { hint: string; hintStatus?: "
     catch { return { hint: "Configuration needs attention" }; }
 }
 
+/**
+ * Each file's change as a diff, removed lines in red and added ones in green (2026-10-26 user
+ * request: "git diff처럼, 색깔도"). Only changed lines show, since the lines around them belong to
+ * other servers. A summary of the files, the settings they touch and why ends the preview, right
+ * above the question, so a long diff cannot push it off the screen (UI review, 2026-10-27).
+ */
 function previewChanges(prompter: Prompter, changes: SetupChange[]): void {
-    const writeEntries = (title: string, path: string, entries: { key: string; value: unknown }[]) => {
-        prompter.write(`\n${title}\n\n  ${path}\n`);
-        for(const entry of entries) {
-            prompter.write(`  ${entry.key}\n`);
-            prompter.write(`${JSON.stringify(entry.value, null, 2).split("\n").map((line) => `    ${line}`).join("\n")}\n`);
-        }
-    };
+    const paint = prompter.paint;
     for(const change of changes) {
-        if(change.additions.length > 0) writeEntries("Settings to add", change.path, change.additions);
-        if(change.removals.length > 0) writeEntries("Settings to remove", change.path, change.removals);
-        for(const note of change.notes) prompter.write(`\n${note}\n`);
+        prompter.write(`\n${paint.bold(`Changes to ${change.path}`)}\n`);
+        const before = comparableText(change.path, change.before ?? "");
+        const after = comparableText(change.path, change.after);
+        for(const hunk of changedHunks(before.text, after.text)) {
+            prompter.write(`  ${paint.accent(hunkHeader(hunk))}\n`);
+            for(const line of hunk.lines) {
+                if(line.kind == "add") {
+                    prompter.write(`  ${paint.success(`+${maskSecrets(line.text)}`)}\n`);
+                }
+                else {
+                    prompter.write(`  ${paint.danger(`-${maskSecrets(line.text)}`)}\n`);
+                }
+            }
+        }
+        if(before.formatted == true || after.formatted == true) {
+            prompter.write(`${paint.dim("  Both versions shown formatted, one value per line; line numbers are of that form.")}\n`);
+        }
+    }
+    prompter.write(`\n${paint.bold("Summary")}\n`);
+    for(const change of changes) {
+        const keys = [...new Set([...change.removals, ...change.additions].map((entry) => entry.key))];
+        let line = `  ${change.path}`;
+        if(keys.length > 0) {
+            line += paint.dim(` · ${keys.join(" · ")}`);
+        }
+        prompter.write(`${line}\n`);
+    }
+    for(const note of changes.flatMap((change) => change.notes)) {
+        prompter.write(`\n${note}\n`);
     }
     prompter.write("\nExisting configuration files will be backed up before applying.\n");
 }
@@ -211,19 +239,85 @@ async function editSetup(prompter: Prompter, draft: SetupDraft): Promise<void> {
     }
 }
 
-async function showStatus(prompter: Prompter, options: MenuOptions): Promise<void> {
+/** An answer started from a message's detail: the message answered and the topics it carried. */
+interface SendReply {
+    messageId: number;
+    topics: string[];
+}
+
+/** The send form's values. One unsent draft is kept while the menu runs, for the next send opened the same way. */
+interface SendDraft {
+    /** How the form was opened: "" from the Messages tab, an agent id from its card, `reply:<id>` as an answer. */
+    origin: string;
+    /** "all", or the agent ids picked */
+    to: string[];
+    text: string;
+    topics: string[];
+}
+
+async function showStatus(prompter: Prompter, options: MenuOptions, drafts: { saved: SendDraft | null }): Promise<void> {
     const output = options.output as Writable & { isTTY?: boolean; columns?: number };
     const input = options.input as Readable & { isTTY?: boolean };
     await showRoomBoard(prompter, {
         language: "en", columns: output.columns,
         color: input.isTTY == true && output.isTTY == true && process.env.NO_COLOR == null,
         unicode: supportsUnicode(),
-        send: (agentId) => sendFromMenu(prompter, agentId),
+        send: (agentId?: string, reply?: SendReply) => sendFromMenu(prompter, drafts, agentId, reply),
     });
 }
 
-/** The board's send flow: `presetTo` skips the recipient list, for sends started from an agent's detail view. */
-async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void> {
+/** "all", or the agent ids picked one per round; null when the person goes back. */
+async function pickRecipients(
+    prompter: Prompter,
+    activeAgents: RoomOverviewAgent[],
+    nameOf: (agentId: string) => string
+): Promise<string[] | null> {
+    const agentRow = (agent: RoomOverviewAgent): SelectItem<string> => ({
+        value: agent.agent_id, label: agent.name, hint: `${agent.client} · ${agent.agent_id} · ${agent.online ? agent.status : "offline"}`,
+    });
+    // a post is there for reference: saying so here keeps it from reading as a message to everyone
+    const recipients: SelectItem<string>[] = [{ value: "all", label: "Post to the room", hint: "Agents see it on check_in; nobody is notified" }];
+    if(activeAgents.length > 1) {
+        recipients.push({ value: "several", label: "Several agents", hint: "Pick them one by one" });
+    }
+    recipients.push(...activeAgents.map(agentRow), { separator: true }, { value: "back", label: "Back" });
+    const picked = await prompter.select("Recipient", recipients, { cancelValue: "back" });
+    if(picked == "back") {
+        return null;
+    }
+    if(picked != "several") {
+        return [picked];
+    }
+    // one pick per round; a picked agent leaves the list
+    const to: string[] = [];
+    while(to.length < Math.min(activeAgents.length, MAX_RECIPIENTS)) {
+        const remaining = activeAgents.filter((agent) => to.includes(agent.agent_id) == false);
+        const items: SelectItem<string>[] = [...remaining.map(agentRow), { separator: true }];
+        if(to.length > 0) {
+            items.push({ value: "done", label: `Done · ${to.length} selected` });
+        }
+        items.push({ value: "back", label: "Back" });
+        const question = to.length == 0 ? "Recipients" : `Recipients · ${to.map(nameOf).join(", ")}`;
+        const next = await prompter.select(question, items, { cancelValue: "back" });
+        if(next == "back") {
+            return null;
+        }
+        if(next == "done") {
+            break;
+        }
+        to.push(next);
+    }
+    return to;
+}
+
+/**
+ * The board's send form: To, Message and Topics with their values, then Send (UI review,
+ * 2026-10-27). Picking a row edits it and comes back with the cursor on the next row, so Enter
+ * down the list fills the form in order; Esc inside an edit keeps the value. Leaving without
+ * sending keeps the draft for the next send opened the same way. `presetTo` fills To, for sends
+ * started from an agent's card; `reply` makes the message an answer to the one read.
+ */
+async function sendFromMenu(prompter: Prompter, drafts: { saved: SendDraft | null }, presetTo?: string, reply?: SendReply): Promise<void> {
     const room = (await readRoomOverviews())[0];
     // ended sessions are not offered: nothing reads their messages unless the session comes back
     const activeAgents = (room?.agents ?? []).filter((agent) => !agent.human && !agent.left && !agent.ended);
@@ -237,72 +331,164 @@ async function sendFromMenu(prompter: Prompter, presetTo?: string): Promise<void
         await prompter.pause();
         return;
     }
-    const agentRow = (agent: (typeof activeAgents)[number]): SelectItem<string> => ({
-        value: agent.agent_id, label: agent.name, hint: `${agent.client} · ${agent.agent_id} · ${agent.online ? agent.status : "offline"}`,
-    });
     const nameOf = (agentId: string) => {
         const agent = room?.agents.find((agent) => agent.agent_id == agentId);
         return agent == null ? agentId : participantName(agent.name, agent.client, agent.human);
     };
-    // "all", or the agent ids picked
-    let to: string[] = [];
-    if(presetTo != null) {
-        to = [presetTo];
+
+    let origin = presetTo ?? "";
+    if(reply != null) {
+        origin = `reply:${reply.messageId}`;
     }
-    else {
-        const recipients: SelectItem<string>[] = [{ value: "all", label: "All agents", hint: "Posted for reference" }];
-        if(activeAgents.length > 1) {
-            recipients.push({ value: "several", label: "Several agents", hint: "Pick them one by one" });
-        }
-        recipients.push(...activeAgents.map(agentRow), { separator: true }, { value: "back", label: "Back" });
-        const picked = await prompter.select("Recipient", recipients, { cancelValue: "back" });
-        if(picked == "back") return;
-        if(picked != "several") {
-            to = [picked];
-        }
-        else {
-            // one pick per round; a picked agent leaves the list
-            while(to.length < Math.min(activeAgents.length, MAX_RECIPIENTS)) {
-                const remaining = activeAgents.filter((agent) => to.includes(agent.agent_id) == false);
-                const items: SelectItem<string>[] = [...remaining.map(agentRow), { separator: true }];
-                if(to.length > 0) {
-                    items.push({ value: "done", label: `Done · ${to.length} selected` });
-                }
+    const fresh: SendDraft = { origin: origin, to: presetTo == null ? [] : [presetTo], text: "", topics: reply?.topics ?? [] };
+    let draft: SendDraft = { ...fresh };
+    if(drafts.saved != null && drafts.saved.origin == origin) {
+        draft = { ...drafts.saved };
+    }
+    const changed = () => JSON.stringify(draft) != JSON.stringify(fresh);
+
+    type Row = "to" | "message" | "topics" | "send" | "discard" | "back";
+    let cursor: Row = "send";
+    if(draft.text === "") {
+        cursor = "message";
+    }
+    if(draft.to.length == 0) {
+        cursor = "to";
+    }
+    // what is wrong with a row, shown on it until the next pick
+    let problem: { row: Row; text: string } | null = null;
+    const previousTransient = prompter.transient;
+    // the form shows every value, so answered edits leave no lines behind
+    prompter.transient = true;
+    try {
+        for(;;) {
+            let toHint = "(required)";
+            if(draft.to.includes("all")) {
+                toHint = "Post to the room";
+            }
+            else if(draft.to.length > 0) {
+                toHint = draft.to.map((agentId) => `${nameOf(agentId)} (${agentId})`).join(", ");
+            }
+            let textHint = "(required)";
+            if(draft.text !== "") {
+                textHint = draft.text.length > 60 ? `${draft.text.slice(0, 59)}…` : draft.text;
+            }
+            // nothing until To is filled: that row already says it is required
+            let sendHint = "";
+            if(draft.to.length > 0) {
+                sendHint = `to ${draft.to.length} agent${draft.to.length == 1 ? "" : "s"}`;
+            }
+            if(draft.to.includes("all")) {
+                sendHint = "Agents see it on check_in; nobody is notified";
+            }
+            else if(reply != null) {
+                sendHint = `as an answer to #${reply.messageId}`;
+            }
+            const withProblem = (row: Row) => problem?.row == row ? { hintWarning: problem.text } : {};
+            const items: SelectItem<Row>[] = [
+                { value: "to", label: "To", hint: toHint, ...withProblem("to") },
+                { value: "message", label: "Message", hint: textHint, ...withProblem("message") },
+                { value: "topics", label: "Topics", hint: draft.topics.length == 0 ? "none" : draft.topics.join(", "), ...withProblem("topics") },
+                { separator: true },
+                { value: "send", label: draft.to.includes("all") ? "Post" : "Send", hint: sendHint },
+            ];
+            if(changed() == true) {
+                items.push({ value: "discard", label: "Discard draft", hint: "Drops what you entered" });
+                items.push({ value: "back", label: "Back", hint: "Keeps the draft for the next send" });
+            }
+            else {
                 items.push({ value: "back", label: "Back" });
-                const question = to.length == 0 ? "Recipients" : `Recipients · ${to.map(nameOf).join(", ")}`;
-                const next = await prompter.select(question, items, { cancelValue: "back" });
-                if(next == "back") return;
-                if(next == "done") break;
-                to.push(next);
+            }
+            const question = reply != null ? `Answer to #${reply.messageId}` : "New message";
+            const row: Row = await prompter.select(question, items, { defaultValue: cursor, cancelValue: "back" });
+            problem = null;
+            cursor = row;
+            if(row == "back") {
+                if(changed() == true) {
+                    drafts.saved = draft;
+                }
+                return;
+            }
+            try {
+                if(row == "discard") {
+                    if(await prompter.askYesNo("Discard this draft?", false) == true) {
+                        if(drafts.saved?.origin == origin) {
+                            drafts.saved = null;
+                        }
+                        return;
+                    }
+                    cursor = "send";
+                }
+                else if(row == "to") {
+                    const picked = await pickRecipients(prompter, activeAgents, nameOf);
+                    if(picked != null) {
+                        draft.to = picked;
+                        cursor = "message";
+                    }
+                }
+                else if(row == "message") {
+                    const typed = await prompter.ask(draft.text === "" ? "Message" : "Message (Enter keeps the current text)");
+                    if(typed.length > MAX_MESSAGE_LENGTH) {
+                        problem = { row: "message", text: `At most ${MAX_MESSAGE_LENGTH} characters` };
+                    }
+                    else {
+                        if(typed !== "") {
+                            draft.text = typed;
+                        }
+                        cursor = "topics";
+                    }
+                }
+                else if(row == "topics") {
+                    let question = "Topics (snake_case, comma-separated; Enter for none)";
+                    if(draft.topics.length > 0) {
+                        question = "Topics (snake_case, comma-separated; Enter keeps them, - for none)";
+                    }
+                    const typed = await prompter.ask(question);
+                    if(typed == "-") {
+                        draft.topics = [];
+                    }
+                    else if(typed !== "") {
+                        draft.topics = normalizeTopics(typed.split(","));
+                    }
+                    cursor = "send";
+                }
+                else if(draft.to.length == 0) {
+                    problem = { row: "to", text: "Pick who gets it" };
+                    cursor = "to";
+                }
+                else if(draft.text === "") {
+                    problem = { row: "message", text: "Write the message" };
+                    cursor = "message";
+                }
+                else {
+                    break;
+                }
+            }
+            catch(error) {
+                if(error instanceof RoomError) {
+                    // a mistyped topic: the form keeps everything entered and says what to fix
+                    problem = { row: "topics", text: error.message };
+                    continue;
+                }
+                // Esc inside an edit is one level back: the form, with the value unchanged
+                if((error instanceof PromptBackError) == false) {
+                    throw error;
+                }
             }
         }
     }
-    const text = await prompter.askRequired("Message");
-    if(text.length > MAX_MESSAGE_LENGTH) throw new RoomError(`Message must contain at most ${MAX_MESSAGE_LENGTH} characters.`);
-    // A mistyped topic is asked again instead of dropping the text already typed.
-    let topics: string[] = [];
-    for(;;) {
-        const typed = await prompter.ask("Topics (snake_case, comma-separated; Enter for none)");
-        try {
-            topics = normalizeTopics(typed.split(","));
-            break;
-        }
-        catch(error) {
-            if(!(error instanceof RoomError)) throw error;
-            prompter.write(`  ${error.message}\n`);
-        }
+    finally {
+        prompter.transient = previousTransient;
     }
-    let recipientLabel = "All agents";
-    if(to.includes("all") == false) {
-        recipientLabel = to.map((agentId) => `${nameOf(agentId)} (${agentId})`).join(", ");
+
+    const result = await runSay({
+        room: room?.room ?? null, to: draft.to, text: draft.text, kind: reply != null ? "reply" : "note",
+        senderName: null, language: "en", topics: draft.topics, replyTo: reply?.messageId ?? null,
+    });
+    if(drafts.saved?.origin == origin) {
+        drafts.saved = null;
     }
-    let summary = `\nRecipient: ${recipientLabel}\nText: ${text}\n`;
-    if(topics.length > 0) {
-        summary += `Topics: ${topics.join(", ")}\n`;
-    }
-    prompter.write(summary);
-    if(!await prompter.askYesNo("Send this message?", false)) return;
-    prompter.write(`\n${await runSay({ room: room?.room ?? null, to, text, kind: "note", senderName: null, language: "en", topics })}\n\n`);
+    prompter.write(`\n${result}\n\n`);
     await prompter.pause();
 }
 
@@ -316,6 +502,8 @@ export async function runMenu(options: MenuOptions): Promise<void> {
         return [resolveMcpPath(target)];
     }));
     const draft: SetupDraft = { host: options.host ?? "codex", home: options.home };
+    // the send form's unsent draft, kept while the menu runs
+    const sendDrafts: { saved: SendDraft | null } = { saved: null };
     const prompter = new Prompter(options.input, options.output);
     let selected: "setup" | "status" | "update" | "quit" = "status";
     let startWithSetup = options.startWithSetup ?? false;
@@ -340,7 +528,7 @@ export async function runMenu(options: MenuOptions): Promise<void> {
                 if(action == "quit") return;
                 selected = action;
                 if(action == "setup") await editSetup(prompter, draft);
-                else if(action == "status") await showStatus(prompter, options);
+                else if(action == "status") await showStatus(prompter, options, sendDrafts);
                 else if(action == "update") {
                     if(update != null && await showSelfUpdate(prompter, update, options.selfUpdate || undefined)) return;
                 }
