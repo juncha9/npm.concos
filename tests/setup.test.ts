@@ -11,6 +11,106 @@ let directory: string;
 beforeEach(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), "concos-setup-")); });
 afterEach(() => { fs.rmSync(directory, { recursive: true, force: true }); });
 
+describe("settings replacement retries", () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+
+    function fixture() {
+        const file = path.join(directory, ".claude.json");
+        const before = '{"theme":"original"}';
+        fs.writeFileSync(file, before);
+        return { file, before, changes: planSetup({ host: "claude", home: directory }) };
+    }
+
+    function mockWaiting(onWait?: () => void) {
+        let now = 0;
+        const waits: number[] = [];
+        vi.spyOn(performance, "now").mockImplementation(() => now);
+        vi.spyOn(Atomics, "wait").mockImplementation((_buffer, _index, _value, timeout) => {
+            waits.push(timeout!);
+            now += timeout!;
+            onWait?.();
+            return "timed-out";
+        });
+        return waits;
+    }
+
+    it("retries transient rename failures with increasing delays until publishing succeeds", () => {
+        const { file, changes } = fixture();
+        const waits = mockWaiting();
+        const codes = ["EPERM", "EACCES", "EBUSY"];
+        const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+            const code = codes.shift();
+            if(code != null) throw Object.assign(new Error("temporarily locked"), { code });
+        });
+        expect(() => applySetup(changes)).not.toThrow();
+        expect(rename).toHaveBeenCalledTimes(4);
+        expect(rename.mock.calls.at(-1)?.[1]).toBe(file);
+        expect(waits).toEqual([25, 50, 100]);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-mcp-tmp-"))).toBe(false);
+    });
+
+    it("stops within two seconds and throws the last original rename error", () => {
+        const { file, before, changes } = fixture();
+        const waits = mockWaiting();
+        const errors: NodeJS.ErrnoException[] = [];
+        vi.spyOn(fs, "renameSync").mockImplementation(() => {
+            const error = Object.assign(new Error(`locked ${errors.length + 1}`), { code: "EBUSY" });
+            errors.push(error);
+            throw error;
+        });
+        let failure: unknown;
+        try { applySetup(changes); }
+        catch(error) { failure = error; }
+        expect(errors.length).toBeGreaterThan(1);
+        expect(failure).toBe(errors.at(-1));
+        expect(waits.reduce((sum, delay) => sum + delay, 0)).toBe(2000);
+        expect(fs.readFileSync(file, "utf8")).toBe(before);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-mcp-tmp-"))).toBe(false);
+    });
+
+    it("preserves a user edit made while waiting rather than retrying over it", () => {
+        const { file, changes } = fixture();
+        const concurrent = '{"theme":"newer user edit"}';
+        const waits = mockWaiting(() => fs.writeFileSync(file, concurrent));
+        const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+            throw Object.assign(new Error("temporarily locked"), { code: "EPERM" });
+        });
+        expect(() => applySetup(changes)).toThrow(/changed since preview/);
+        expect(rename).toHaveBeenCalledOnce();
+        expect(waits).toEqual([25]);
+        expect(fs.readFileSync(file, "utf8")).toBe(concurrent);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-mcp-tmp-"))).toBe(false);
+    });
+
+    it("throws non-transient errors immediately", () => {
+        const { changes } = fixture();
+        const waits = mockWaiting();
+        const error = Object.assign(new Error("not enough space"), { code: "ENOSPC" });
+        const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => { throw error; });
+        let failure: unknown;
+        try { applySetup(changes); }
+        catch(caught) { failure = caught; }
+        expect(failure).toBe(error);
+        expect(rename).toHaveBeenCalledOnce();
+        expect(waits).toEqual([]);
+    });
+
+    it("keeps new-file link failures outside the rename retry path", () => {
+        const changes = planSetup({ host: "claude", home: directory });
+        const waits = mockWaiting();
+        const error = Object.assign(new Error("link refused"), { code: "EPERM" });
+        const link = vi.spyOn(fs, "linkSync").mockImplementation(() => { throw error; });
+        let failure: unknown;
+        try { applySetup(changes); }
+        catch(caught) { failure = caught; }
+        expect(failure).toBe(error);
+        expect(link).toHaveBeenCalledOnce();
+        expect(waits).toEqual([]);
+        expect(fs.existsSync(changes[0].path)).toBe(false);
+        expect(fs.readdirSync(directory).some((name) => name.includes(".concos-mcp-tmp-"))).toBe(false);
+    });
+});
+
 describe("user-wide setup", () => {
     it.each(HOST_ADAPTERS)("previews, applies and repeats $id registration without duplicates", (adapter) => {
         const input = { host: adapter.id, home: directory };

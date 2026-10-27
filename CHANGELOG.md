@@ -4,6 +4,98 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.15] - 2026-10-27
+
+### Added
+
+- **The board summarizes recent activity and attention.** A 30-minute graph counts
+  stored messages and checkpoints, with the number of agents active in five
+  minutes. An optional warning line groups card issues and exact normalized edit
+  overlaps within each project. ASCII and narrow displays retain readable labels.
+- **Recent edit folders are available on detailed cards.** Edit hooks retain up
+  to three distinct folders with their last edit times, newest first, across
+  turns. The board and `inspect_agent` receive them as `recent_folders`; they
+  stay out of `check_in` cards and do not advance card change sequences on their
+  own. Schema 14 clears them on session end or leave, including writes from
+  older bridges and hooks that were already open before migration.
+- **Rename agents from their detail cards.** Names must be nonempty, at most 60
+  characters, and unused by another live card in the waiting room. Board edits
+  leave agent activity times unchanged; a later name reported by the agent takes
+  precedence.
+
+### Changed
+
+- **Board menus sit above their lists.** Agents starts with Compact view,
+  Show/Hide ended sessions, flagged-card removal and Back; Messages starts with
+  Search, notice cleanup and Back. Entering a tab selects its first object,
+  while toggles keep their selection. New messages start from an agent card,
+  whose To field can also select several recipients or post to the room.
+- **Card actions precede long details.** Identity, Name, Role, Send, Take down
+  and Back appear before waiting messages and work details. Long details scroll
+  below them; Enter returns to an offscreen menu before selecting an action.
+  Separators keep Take down apart from Send and Back.
+- **Agent details work as a form.** Name and Role show their current values under
+  Card. Saving reloads the detail and selects the next row; cancelling preserves
+  the value and selection. Sending a message returns to the same detail.
+- **The latest folder sits beside each agent name.** Regular and compact rows and
+  detail headers show one location; the detail's Recent folders section lists up
+  to three, each with its own edit age. Paths shorten by whole leading folders.
+  Reported project roots are hidden, while actual edits at the root show `(root)`.
+  A new folder pulses only its path for 3.2 seconds; repeated edits in that folder
+  do not. Active edit locations use normal
+  brightness, past locations dim, and a reported location is marked when no edit
+  history exists. Details also refresh while open.
+- **Board counts and headings match their scope.** The version sits in the title,
+  Messages shows all retained messages and the viewer's unread count, and a notice
+  identifies the latest-50 limit. Project paths appear only for duplicate names.
+- **Repeated status updates carry smaller cards.** The room still includes every
+  project. Known cards whose content is unchanged use `detail: "status"` and
+  explicit empty/false state fields; first deliveries, content changes and
+  explicit cursor replay include full previews. Rejoining restores the full
+  card baseline. Schema 13 records content delivery per viewer and tracks
+  already-running older writers through database triggers.
+- **Room history is optional to drain.** Unread direct messages remain available
+  through `read_messages`. Hook-bound cards advertise
+  `hooks_manage_status_and_editing` at join so agents can skip waiting-only
+  reports. Shorter instructions retain work reporting and ask agents to send
+  substantive results or questions without receipt confirmations or restatements.
+
+### Fixed
+
+- **The five-minute active count matches current agents.** Recently ended or
+  departed sessions no longer inflate the count beside the activity graph.
+- **Settings replacement retries temporary file locks.** Rename failures with
+  `EPERM`, `EACCES` or `EBUSY` wait with increasing delays for at most two seconds.
+  Each retry checks the preview's original content again, preserving an edit made
+  while waiting. Other failures and exhausted retries retain the original error.
+- **Message and Topics reopen with editable current text.** Enter keeps it, Esc
+  discards the edit, and clearing text updates the form. Returning from the main
+  menu or a detail edit leaves no redundant answered-choice line above the board.
+- **Name and role fields start with editable current text.** The cursor starts at
+  the end, Enter keeps unedited text, Esc cancels, and replacing a role with `-`
+  clears it. Scripted line input keeps its Enter-default behavior.
+- **Already received messages no longer prompt another read.** A `check_in`
+  without `cursor` skips direct messages already acknowledged as received,
+  including messages sent to several agents. Passing an explicit `cursor` still
+  replays them, and room posts and their edits are delivered as before.
+
+### Known issues
+
+- **Persistent Windows settings locks remain unresolved.** Tests observed rename
+  attempts on the same settings file failing with `EPERM` for over ten seconds;
+  the cause is unconfirmed. Such failures still return an error, with settings
+  preserved through atomic replacement and backups.
+
+### Notes
+
+- The first process of this version to open the database backs it up and
+  migrates it from schema 12 to 14. concos 0.1.14 processes that are already
+  running keep working against it; one started afterwards refuses the newer
+  database, so update concos before restarting older sessions.
+- Agents receive the shorter instructions and the new `check_in` behavior once
+  their concos MCP server restarts (`/mcp` in Claude Code, or a new session).
+  Hooks use the installed version on their next event.
+
 ## [0.1.14] - 2026-10-27
 
 ### Changed

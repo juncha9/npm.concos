@@ -228,4 +228,76 @@ export const SCHEMA_STEPS: readonly string[] = [
     -- from this version on touches the card.
     ALTER TABLE agent ADD COLUMN concos_version TEXT;
     `,
+    `
+    -- Last change to card content, apart from status, editing and activity.
+    ALTER TABLE agent ADD COLUMN content_changed_seq INTEGER NOT NULL DEFAULT 0;
+    UPDATE agent SET content_changed_seq = changed_seq WHERE content_changed_seq = 0;
+
+    -- Full card content actually delivered to each viewer; a room cursor is not this record.
+    CREATE TABLE card_delivery (
+        viewer_agent_id  TEXT    NOT NULL,
+        agent_id         TEXT    NOT NULL,
+        content_seq      INTEGER NOT NULL,
+
+        CONSTRAINT pk_card_delivery PRIMARY KEY (viewer_agent_id, agent_id),
+        CONSTRAINT fk_card_delivery_viewer_agent_id
+            FOREIGN KEY (viewer_agent_id) REFERENCES agent (id) ON DELETE RESTRICT,
+        CONSTRAINT fk_card_delivery_agent_id
+            FOREIGN KEY (agent_id) REFERENCES agent (id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX idx_card_delivery_agent_id ON card_delivery (agent_id);
+
+    -- Bridges already open before migration keep writing schema-12 statements. Track those
+    -- writes too; their version string is not a reliable signal of content tracking support.
+    CREATE TRIGGER trg_agent_content_insert AFTER INSERT ON agent
+    BEGIN
+        UPDATE agent SET content_changed_seq = NEW.changed_seq WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER trg_agent_content_update
+    AFTER UPDATE OF display_name, client, workspace_id, working_directory, role, task, summary, next_step, blocker, reference_list ON agent
+    WHEN NEW.display_name IS NOT OLD.display_name OR NEW.client IS NOT OLD.client
+        OR NEW.workspace_id IS NOT OLD.workspace_id OR NEW.working_directory IS NOT OLD.working_directory
+        OR NEW.role IS NOT OLD.role OR NEW.task IS NOT OLD.task OR NEW.summary IS NOT OLD.summary
+        OR NEW.next_step IS NOT OLD.next_step OR NEW.blocker IS NOT OLD.blocker OR NEW.reference_list IS NOT OLD.reference_list
+    BEGIN
+        UPDATE agent SET content_changed_seq = NEW.changed_seq WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER trg_checkpoint_content_insert AFTER INSERT ON checkpoint
+    BEGIN
+        UPDATE agent SET content_changed_seq = changed_seq WHERE id = NEW.agent_id;
+    END;
+
+    -- Merging moves checkpoints before updating the surviving card's sequence.
+    CREATE TRIGGER trg_checkpoint_card_delivery_move AFTER UPDATE OF agent_id ON checkpoint
+    WHEN NEW.agent_id IS NOT OLD.agent_id
+    BEGIN
+        DELETE FROM card_delivery WHERE agent_id IN (OLD.agent_id, NEW.agent_id);
+    END;
+
+    -- Only join/merge writes these session identity columns, including when values stay equal.
+    CREATE TRIGGER trg_agent_card_delivery_resume AFTER UPDATE OF client, working_directory ON agent
+    BEGIN
+        DELETE FROM card_delivery WHERE viewer_agent_id = NEW.id;
+        UPDATE agent SET delivered_seq = 0 WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER trg_agent_card_delivery_delete BEFORE DELETE ON agent
+    BEGIN
+        DELETE FROM card_delivery WHERE viewer_agent_id = OLD.id OR agent_id = OLD.id;
+    END;
+    `,
+    `
+    -- Recent folders come only from file-edited hooks; they never advance card delivery.
+    ALTER TABLE agent ADD COLUMN recent_folder_list TEXT NOT NULL DEFAULT '[]';
+
+    -- Already-open older bridges/hooks also end sessions and leave without naming this column.
+    CREATE TRIGGER trg_agent_recent_folders_end AFTER UPDATE OF disconnected_at, left_at ON agent
+    WHEN (NEW.disconnected_at IS NOT NULL OR NEW.left_at IS NOT NULL) AND NEW.recent_folder_list <> '[]'
+    BEGIN
+        UPDATE agent SET recent_folder_list = '[]' WHERE id = NEW.id;
+    END;
+    `,
 ];

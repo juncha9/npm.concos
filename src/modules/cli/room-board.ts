@@ -1,5 +1,6 @@
 import os from "node:os";
-import { MAX_ROLE_LENGTH, SHARED_ROOM } from "../../_defs";
+import path from "node:path";
+import { MAX_DISPLAY_NAME_LENGTH, MAX_ROLE_LENGTH, SHARED_ROOM } from "../../_defs";
 import { CONCOS_VERSION } from "../../_libs/version";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { openDatabase } from "../store/database";
@@ -7,7 +8,7 @@ import { RoomStore } from "../store/room-store";
 import type { RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth, padToWidth, PromptBackError } from "./prompter";
 import type { LinePart, Prompter, SelectChoice, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
-import { age, issueText, plain, renderAgentDetail, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, workFolder, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
+import { age, issueText, plain, renderAgentDetailHeader, renderAgentDetailBody, recentFolderLines, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, agentLocation, shortenPath, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
 import type { State, StatusRenderOptions } from "./status-renderer";
 import { showMessageSearch } from "./message-search";
 import { RoomActivity } from "./room-activity";
@@ -34,14 +35,14 @@ const RECEDING_STATES: State[] = ["idle", "finished", "offline", "left"];
 const PEOPLE_GROUP = "\u0000people";
 
 export interface RoomBoardOptions extends StatusRenderOptions {
-    /** Opens the send flow: to `agentId` when given (an agent's card), else asking for all, several agents or one (the Messages tab). */
-    send: (agentId?: string, reply?: { messageId: number; topics: string[] }) => Promise<void>;
+    /** Opens the send form for this agent, optionally as an answer to a message. */
+    send: (agentId: string, reply?: { messageId: number; topics: string[] }) => Promise<void>;
 }
 
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "send:message" | "search:messages" | "retire:flagged" | "back";
+type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "search:messages" | "retire:flagged" | "back";
 
 type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
@@ -57,10 +58,10 @@ function canTakeDownFlagged(agent: RoomOverviewAgent): boolean {
 
 interface BoardView {
     question: string;
-    /** The status bar under the question: state shares, counts and this concos's version. */
-    banner: LinePart[];
+    /** Status shares, recent activity, and any issues under the question. */
+    banner: LinePart[][];
     items: SelectItem<BoardValue>[];
-    /** The row the cursor starts on until one of this tab is picked: on the Messages tab the first message, below the actions. */
+    /** The first object row below the tab's actions. */
     defaultValue?: BoardValue;
     tabs: SelectTabs<BoardValue>;
     agents: RoomOverviewAgent[];
@@ -119,10 +120,7 @@ function barMark(state: State, unicode: boolean): string {
     return unicode ? wide : ascii;
 }
 
-/**
- * The status bar under the board's question (2026-10-26 user choice): the agents around now as
- * a bar split by state in the states' colors, the count of each state, and this concos's version.
- */
+/** The agents around now, as a bar split by state and the count of each state. */
 function statusBanner(agents: RoomOverviewAgent[], style: Style, english: boolean, unicode: boolean): LinePart[] {
     const shown = STATE_PRIORITY.filter((state) => state != "human")
         .map((state) => ({ state: state, count: agents.filter((agent) => stateOf(agent) == state).length }))
@@ -143,7 +141,6 @@ function statusBanner(agents: RoomOverviewAgent[], style: Style, english: boolea
         parts.push({ text: index == 0 ? "  " : " · ", paint: style.dim });
         parts.push({ text: `${entry.count} ${stateLabel(entry.state, english).toLowerCase()}`, paint: statePaint(style, entry.state) });
     });
-    parts.push({ text: `${total > 0 ? "  ·  " : ""}concos ${CONCOS_VERSION}`, paint: style.dim });
     return parts;
 }
 
@@ -154,9 +151,8 @@ function writtenLineCount(text: string): number {
 
 /**
  * The Agents tab, grouped by project in a fixed order, by project and then agent name. Each agent is a
- * state column, its name with the unread count right after it, then its role, the folder it works
- * in when that is not its project's root, its blocker, task and next step on lines aligned under
- * the name.
+ * state column, its name and unread count followed by recent edit locations. Role, blocker,
+ * task and next step sit on lines aligned under the name.
  */
 function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: boolean, nowMs: number, showEnded: boolean, activity: RoomActivity, unicode = true, compact = false): {
     items: SelectItem<BoardValue>[];
@@ -166,10 +162,17 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
     const inactive = allAgents.filter((agent) => isInactive(agent) == true);
     // fixed widths from every possible value, so a refresh never shifts the columns
     const stateWidth = Math.max(...STATE_PRIORITY.map((state) => displayWidth(stateLabel(state, english).toLowerCase()))) + 2 + (activity.enabled ? 2 : 0);
-    const fieldLabels = { check: english ? "Check" : "확인", role: english ? "Role" : "역할", folder: english ? "Folder" : "폴더", blocker: english ? "Blocker" : "막힘", task: english ? "Task" : "작업", next: english ? "Next" : "다음" };
+    const fieldLabels = { check: english ? "Check" : "확인", role: english ? "Role" : "역할", blocker: english ? "Blocker" : "막힘", task: english ? "Task" : "작업", next: english ? "Next" : "다음" };
     const fieldWidth = Math.max(...Object.values(fieldLabels).map(displayWidth)) + 2;
 
-    const agentRow = (agent: RoomOverviewAgent): SelectItem<BoardValue> => {
+    const unreadText = (agent: RoomOverviewAgent): string => {
+        if(agent.pending_count == 0) {
+            return "";
+        }
+        return english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`;
+    };
+    const nameWidthOf = (agent: RoomOverviewAgent): number => displayWidth(participantName(agent.name, agent.client, agent.human) + unreadText(agent));
+    const agentRow = (agent: RoomOverviewAgent, groupNameWidth: number): SelectItem<BoardValue> => {
         const state = stateOf(agent);
         const receding = RECEDING_STATES.includes(state);
         // label, text, tone, lines shown: the role stays put, so one line is enough
@@ -177,8 +180,6 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
             // what looks wrong comes first, in yellow, so the person at the board can take the card down
             ...agent.issues.map((issue): [string, string, "warning", number] => [fieldLabels.check, issueText(issue, nowMs, english), "warning", 1]),
             [fieldLabels.role, oneLine(agent.role), "plain", 1],
-            // the card stays with the project its session started in; this is where it works now
-            [fieldLabels.folder, workFolder(agent), "plain", 1],
             [fieldLabels.blocker, oneLine(agent.blocker), "danger", 1],
             [fieldLabels.task, oneLine(agent.task), "plain", 2],
             [fieldLabels.next, oneLine(agent.next_step), "plain", 2],
@@ -195,28 +196,49 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                 else if(receding == true) {
                     paintName = style.dim;
                 }
-                const unread = agent.pending_count > 0 ? (english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`) : "";
+                const unread = unreadText(agent);
                 const first: LinePart[] = [
                     { text: padToWidth(activity.indicator(`agent:${agent.agent_id}`, state == "working") + stateLabel(state, english).toLowerCase(), stateWidth), paint: statePaint(style, state) },
                 ];
                 const name = participantName(agent.name, agent.client, agent.human);
-                if(compact == true) {
+                const nameWidth = Math.min(groupNameWidth, Math.max(4, width - stateWidth - 17));
+                const shownName = compactText(name, Math.max(4, nameWidth - displayWidth(unread)), unicode);
+                first.push({ text: shownName, paint: paintName });
+                if(unread != "") first.push({ text: unread, paint: style.warning });
+                const badges = compact ? [] : activity.badge(`agent:${agent.agent_id}`, style);
+                let trailing = compact ? [] : [...badges, { text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim }];
+                const padding = " ".repeat(Math.max(2, nameWidth - displayWidth(shownName + unread) + 2));
+                const used = first.reduce((total, part) => total + displayWidth(part.text), 0) + padding.length;
+                const trailingWidth = trailing.reduce((total, part) => total + displayWidth(part.text), 0);
+                let location = agentLocation(agent, Math.max(0, width - used - trailingWidth), unicode, english);
+                if(!compact) {
+                    const badgeWidth = badges.reduce((total, part) => total + displayWidth(part.text), 0);
+                    const expanded = agentLocation(agent, Math.max(0, width - used - badgeWidth), unicode, english);
+                    if(displayWidth(expanded.paths[0] ?? "") > displayWidth(location.paths[0] ?? "")) {
+                        location = expanded;
+                        trailing = badges;
+                    }
+                }
+                if(location.paths.length > 0) {
+                    first.push({ text: padding });
+                    const baseline = location.reported || agent.editing.length == 0 ? style.dim : undefined;
+                    location.paths.forEach((folder, index) => {
+                        if(index > 0) {
+                            first.push({ text: " · ", paint: style.dim });
+                        }
+                        const paint = index == 0 && !location.reported ? activity.folderPaint(agent.agent_id, style, baseline) : baseline;
+                        first.push({ text: folder, paint });
+                    });
+                }
+                first.push(...trailing);
+                if(compact) {
                     const task = oneLine(agent.task);
-                    const taskWidth = task == "" ? 0 : Math.min(displayWidth(task), 20, Math.floor(width / 3)) + 3;
-                    const nameWidth = Math.max(4, width - stateWidth - displayWidth(unread) - taskWidth);
-                    first.push({ text: compactText(name, nameWidth, unicode), paint: paintName });
-                    first.push({ text: unread, paint: style.warning });
-                    if(task != "") {
-                        first.push({ text: " · ", paint: style.dim });
-                        const used = first.reduce((total, part) => total + displayWidth(part.text), 0);
-                        first.push({ text: compactText(task, Math.max(1, width - used), unicode), paint: receding ? style.dim : undefined });
+                    const remaining = width - first.reduce((total, part) => total + displayWidth(part.text), 0) - 3;
+                    if(task != "" && remaining >= 6) {
+                        first.push({ text: " · ", paint: style.dim }, { text: compactText(task, remaining, unicode), paint: receding ? style.dim : undefined });
                     }
                     return [first];
                 }
-                first.push({ text: name, paint: paintName });
-                if(unread != "") first.push({ text: unread, paint: style.warning });
-                first.push(...activity.badge(`agent:${agent.agent_id}`, style));
-                first.push({ text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim });
 
                 const rows = [first];
                 for(const [label, text, tone, lineLimit] of fields) {
@@ -263,19 +285,31 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
             || projectName(leftKey, english).localeCompare(projectName(rightKey, english))
             || leftKey.localeCompare(rightKey);
     });
+    const projectNameCounts = new Map<string, number>();
+    for(const [key] of sortedGroups) {
+        if(key != PEOPLE_GROUP) {
+            const name = projectName(key, english);
+            projectNameCounts.set(name, (projectNameCounts.get(name) ?? 0) + 1);
+        }
+    }
 
     const items: SelectItem<BoardValue>[] = [];
     for(const [key, members] of sortedGroups) {
-        // a rule across the list, `── akms · d:\workspace\projects\akms ───`, sets each project apart
         if(key == PEOPLE_GROUP) {
             items.push({ separator: true, rule: true, label: english ? "People" : "사람" });
         }
         else {
-            items.push({ separator: true, rule: true, label: projectName(key, english), hint: key });
+            const name = projectName(key, english);
+            let hint: string | undefined;
+            if(projectNameCounts.get(name)! > 1) {
+                hint = key;
+            }
+            items.push({ separator: true, rule: true, label: name, hint });
         }
         const sortedMembers = [...members].sort((left, right) => left.name.localeCompare(right.name));
+        const groupNameWidth = Math.max(...members.map(nameWidthOf));
         for(const agent of sortedMembers) {
-            items.push(agentRow(agent));
+            items.push(agentRow(agent, groupNameWidth));
         }
     }
 
@@ -287,8 +321,9 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
             hint: english ? "left, closed, or silent for 30 minutes" : "퇴장, 종료, 또는 30분 동안 신호 없음",
         });
         const newestFirst = [...inactive].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+        const groupNameWidth = Math.max(...inactive.map(nameWidthOf));
         for(const agent of newestFirst) {
-            items.push(agentRow(agent));
+            items.push(agentRow(agent, groupNameWidth));
         }
     }
     return { items: items, inactiveCount: inactive.length };
@@ -497,13 +532,11 @@ function buildView(
 
     let items: SelectItem<BoardValue>[];
     let defaultValue: BoardValue | undefined;
-    let inactiveCount = 0;
     let posters: Poster[] = [];
     if(tab == "tab:messages") {
         posters = store.livePosters(nowMs);
         // the actions sit above the list, which can run long (2026-10-26 user decision); the list opens with its own heading
         items = [
-            { value: "send:message", key: "send", label: english ? "Send a message" : "메시지 보내기", hint: english ? "to all, several agents or one" : "전체·여러 에이전트·한 에이전트에게" },
             // typing on the row searches message text at once (2026-10-26 user request)
             { value: "search:messages", key: "search", label: english ? "Search messages" : "메시지 검색", hint: english ? "by text, topic or sender" : "내용·주제·보낸 이로", input: searchField },
         ];
@@ -515,49 +548,116 @@ function buildView(
                 hint: english ? `${posters.length} agent${posters.length == 1 ? "" : "s"}` : `에이전트 ${posters.length}명`,
             });
         }
+        items.push({ value: "back", label: english ? "Back" : "뒤로" }, { separator: true });
+        if(overview.message_count > overview.messages.length) {
+            items.push({
+                separator: true,
+                label: english ? `Showing ${overview.messages.length} of ${overview.message_count} messages` : `메시지 ${overview.message_count}개 중 ${overview.messages.length}개 표시`,
+            });
+        }
         const messageItems = buildMessageItems(overview.messages, style, options, nowMs, activity);
         defaultValue = messageItems.find((item): item is SelectChoice<BoardValue> => "value" in item)?.value;
         items.push(...messageItems);
     }
     else {
         const built = buildAgentItems(overview.agents, style, english, nowMs, toggles.showEnded, activity, options.unicode ?? true, toggles.compact);
-        items = built.items;
-        inactiveCount = built.inactiveCount;
-    }
-    items.push({ separator: true });
-    if(tab == "tab:agents") {
-        items.push({ value: "toggle:compact", key: "compact", label: english ? "Compact view" : "간단히 보기", hint: toggles.compact ? (english ? "on" : "켬") : (english ? "off" : "끔") });
-    }
-    if(inactiveCount > 0) {
-        let toggleLabel = english ? `Show ended sessions (${inactiveCount})` : `종료된 세션 보기 (${inactiveCount})`;
-        if(toggles.showEnded == true) {
-            toggleLabel = english ? "Hide ended sessions" : "종료된 세션 숨기기";
+        defaultValue = built.items.find((item): item is SelectChoice<BoardValue> => "value" in item)?.value;
+        items = [{ value: "toggle:compact", key: "compact", label: english ? "Compact view" : "간단히 보기", hint: toggles.compact ? (english ? "on" : "켬") : (english ? "off" : "끔") }];
+        if(built.inactiveCount > 0) {
+            let toggleLabel = english ? `Show ended sessions (${built.inactiveCount})` : `종료된 세션 보기 (${built.inactiveCount})`;
+            if(toggles.showEnded == true) {
+                toggleLabel = english ? `Hide ended sessions (${built.inactiveCount})` : `종료된 세션 숨기기 (${built.inactiveCount})`;
+            }
+            items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
         }
-        items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
+        const flagged = agents.filter(canTakeDownFlagged);
+        if(flagged.length > 0) {
+            items.push({
+                value: "retire:flagged", key: "retire",
+                label: english ? `Take down flagged cards (${flagged.length})` : `확인 표시된 카드 내리기 (${flagged.length})`,
+                hint: flagged.map((agent) => agent.name).join(", "),
+            });
+        }
+        items.push({ value: "back", label: english ? "Back" : "뒤로" }, { separator: true }, ...built.items);
     }
-    const flagged = agents.filter(canTakeDownFlagged);
-    if(tab == "tab:agents" && flagged.length > 0) {
-        items.push({
-            value: "retire:flagged",
-            key: "retire",
-            label: english ? `Take down flagged cards (${flagged.length})` : `확인 표시된 카드 내리기 (${flagged.length})`,
-            hint: flagged.map((agent) => agent.name).join(", "),
-        });
-    }
-    items.push({ value: "back", label: english ? "Back" : "뒤로" });
 
-    // the counts went into the status bar under the question
-    const question = english ? "Waiting room" : "대합실";
-    // each tab counts the rows it lists
-    const messageCount = overview.messages.length;
+    const question = `${english ? "Waiting room" : "대합실"} · concos ${CONCOS_VERSION}`;
+    const person = overview.agents.find((agent) => agent.human == true && agent.name == os.userInfo().username);
+    const pendingCount = person?.pending_count ?? 0;
+    const messageLabel = english
+        ? `Messages ${overview.message_count} · ${pendingCount} for you`
+        : `메시지 ${overview.message_count} · 내 미확인 ${pendingCount}`;
     const tabs: SelectTabs<BoardValue> = {
         active: tab,
         items: [
             { value: "tab:agents", key: "agents", label: english ? `Agents ${agents.length}` : `에이전트 ${agents.length}` },
-            { value: "tab:messages", key: "messages", label: english ? `Messages ${messageCount}` : `메시지 ${messageCount}` },
+            { value: "tab:messages", key: "messages", label: messageLabel },
         ],
     };
-    const banner = statusBanner(agents, style, english, options.unicode ?? true);
+    const unicode = options.unicode ?? true;
+    const banner = [statusBanner(agents, style, english, unicode)];
+    const levels = unicode ? "▁▂▃▄▅▆▇█" : "_.,:;ox#";
+    const peak = Math.max(1, ...overview.activity.events_per_minute);
+    const sparkline = overview.activity.events_per_minute.map((count) => {
+        return levels[Math.ceil(count / peak * (levels.length - 1))];
+    }).join("");
+    const activityLabel = english ? `last 30m · ${overview.activity.active_agent_count} active in 5m` : `최근 30분 · 5분 내 활동 ${overview.activity.active_agent_count}명`;
+    const summaryWidth = (options.columns ?? 100) - 3;
+    if(displayWidth(`${sparkline}  ${activityLabel}`) > summaryWidth) {
+        banner.push([{ text: sparkline, paint: style.accent }], [{ text: activityLabel, paint: style.dim }]);
+    }
+    else {
+        banner.push([{ text: sparkline, paint: style.accent }, { text: `  ${activityLabel}`, paint: style.dim }]);
+    }
+
+    const warnings: string[] = [];
+    const issueLabels = {
+        old_concos: english ? "on old concos" : "이전 concos",
+        stuck: english ? "stuck" : "활동 없음",
+        duplicate: english ? "duplicate" : "중복",
+        unread_unwoken: english ? "unwoken" : "미확인·깨우지 못함",
+    };
+    for(const [kind, label] of Object.entries(issueLabels)) {
+        const count = agents.filter((agent) => agent.issues.some((issue) => issue.kind == kind)).length;
+        if(count > 0) {
+            warnings.push(`${count} ${label}`);
+        }
+    }
+    const claims = new Map<string, { agents: Set<string>; path: string }>();
+    for(const agent of agents) {
+        if(agent.workspace_path == null) {
+            continue;
+        }
+        const windows = /^[a-z]:[\\/]|^\\\\/i.test(agent.workspace_path);
+        const paths = windows ? path.win32 : path.posix;
+        const workspace = paths.normalize(agent.workspace_path.replaceAll("\\", "/"));
+        for(const editing of agent.editing) {
+            const absolute = paths.resolve(workspace, editing.replaceAll("\\", "/"));
+            let key = `${workspace}\0${absolute}`;
+            if(windows) {
+                key = key.toLowerCase();
+            }
+            const claim = claims.get(key) ?? { agents: new Set<string>(), path: paths.relative(workspace, absolute).replaceAll("\\", "/") || "." };
+            claim.agents.add(agent.agent_id);
+            claims.set(key, claim);
+        }
+    }
+    const overlaps = [...claims.values()].filter((claim) => claim.agents.size > 1);
+    if(overlaps.length > 0) {
+        warnings.push(english ? `${overlaps.length} edit overlap${overlaps.length == 1 ? "" : "s"}` : `편집 겹침 ${overlaps.length}곳`);
+    }
+    if(warnings.length > 0) {
+        let text = `! ${warnings.join(" · ")}`;
+        if(overlaps.length > 0) {
+            const available = summaryWidth - displayWidth(text) - 2;
+            if(available >= 4) {
+                text += `: ${shortenPath(overlaps[0].path, available, unicode)}`;
+            }
+        }
+        for(const line of wrap(text, summaryWidth)) {
+            banner.push([{ text: line, paint: style.warning }]);
+        }
+    }
     return { question: question, banner: banner, items: items, defaultValue: defaultValue, tabs: tabs, agents: overview.agents, messages: overview.messages, posters: posters };
 }
 
@@ -579,17 +679,61 @@ async function selectInPlace<T extends string>(
     }
 }
 
-/** The person at the board writes an agent's role: Enter keeps it, `-` clears it, Esc goes back. */
-async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, english: boolean): Promise<void> {
+async function setName(options: { prompter: Prompter; store: RoomStore; agent: RoomOverviewAgent; english: boolean }): Promise<boolean> {
+    const { prompter, store, agent, english } = options;
     const previous = prompter.transient;
     prompter.transient = true;
-    let typed: string;
+    let name: string;
+    let label = "이름";
+    if(english == true) {
+        label = "Name";
+    }
     try {
-        typed = await prompter.ask(english ? "Role (Enter keeps it, - clears it)" : "역할 (Enter는 그대로, -는 지우기)", agent.role);
+        name = await prompter.ask(label, { initialValue: agent.name });
     }
     catch(error) {
         if(error instanceof PromptBackError) {
-            return;
+            return false;
+        }
+        throw error;
+    }
+    finally {
+        prompter.transient = previous;
+    }
+    if(name.length == 0 || name.length > MAX_DISPLAY_NAME_LENGTH) {
+        let report = `이름은 1~${MAX_DISPLAY_NAME_LENGTH}자여야 합니다. 바꾸지 않았습니다.`;
+        if(english == true) {
+            report = `A name must contain 1 to ${MAX_DISPLAY_NAME_LENGTH} characters; it was not changed.`;
+        }
+        await reportInPlace(prompter, report);
+        return false;
+    }
+    if(store.setNameFromBoard(agent.agent_id, name) == false) {
+        let report = "같은 방의 다른 활동 중인 카드가 사용 중인 이름입니다. 바꾸지 않았습니다.";
+        if(english == true) {
+            report = "Another active card in this room already uses that name; it was not changed.";
+        }
+        await reportInPlace(prompter, report);
+        return false;
+    }
+    return true;
+}
+
+/** The role entered in the card form; an empty value or `-` clears it, Esc keeps the saved value. */
+async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, english: boolean): Promise<boolean> {
+    const previous = prompter.transient;
+    prompter.transient = true;
+    let typed: string;
+    let label = english ? "Role (clear to remove)" : "역할 (비우면 삭제)";
+    if(prompter.isInteractive == false) {
+        label = english ? "Role (- to remove)" : "역할 (-로 삭제)";
+    }
+    try {
+        typed = await prompter.ask(label, { initialValue: agent.role });
+    }
+    catch(error) {
+        if(error instanceof PromptBackError) {
+            return false;
         }
         throw error;
     }
@@ -602,62 +746,110 @@ async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverview
     }
     if(role.trim().length > MAX_ROLE_LENGTH) {
         await reportInPlace(prompter, english ? `A role holds at most ${MAX_ROLE_LENGTH} characters; it was not changed.` : `역할은 ${MAX_ROLE_LENGTH}자까지입니다. 바꾸지 않았습니다.`);
-        return;
+        return false;
     }
     store.setRoleFromBoard(agent.agent_id, role);
+    return true;
 }
 
-async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions): Promise<void> {
+async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions, activity: RoomActivity): Promise<void> {
     const english = options.language == "en";
-    type AgentAction = `message:${number}` | "say" | "role" | "retire" | "back";
-    let selected: AgentAction | undefined;
+    type AgentAction = `message:${number}` | "say" | "name" | "role" | "retire" | "back";
+    let selected: AgentAction = "name";
     for(;;) {
+        const found = store.getRoomOverview(SHARED_ROOM, 0).agents.find((candidate) => candidate.agent_id == agent.agent_id);
+        if(found == null) {
+            return;
+        }
+        let current = found;
         // the agent itself is the viewer: inspectAgent only requires both to be in the same room
-        const detail = store.inspectAgent(agent.agent_id, {
-            agentId: agent.agent_id,
+        let detail = store.inspectAgent(current.agent_id, {
+            agentId: current.agent_id,
             checkpointLimit: DETAIL_CHECKPOINT_LIMIT,
             beforeCheckpointId: null,
         });
-        const pending = store.pendingFor(agent.agent_id);
-        const card = renderAgentDetail(agent, detail, { ...options, pendingMessages: pending.length == 0 ? [] : undefined });
-
-        const items: SelectItem<AgentAction>[] = [];
-        if(pending.length > 0) {
-            items.push({ separator: true, rule: true, label: english ? "Waiting messages" : "미확인 메시지" });
-            for(const message of pending) {
-                items.push({
-                    value: `message:${message.id}`,
-                    key: String(message.id),
-                    label: `#${message.id}`,
-                    lines: (active, width) => pendingMessageLines(message, width, options).map((line) => [{
-                        text: line.text,
-                        paint: active ? prompter.paint.accent : line.tone == "bold" ? prompter.paint.bold : line.tone == "warning" ? prompter.paint.warning : prompter.paint.dim,
-                    }]),
-                });
+        let pending = store.pendingFor(current.agent_id);
+        let rendered: { header: string; body: string } | null = null;
+        let renderedWidth = 0;
+        const sections = (width: number) => {
+            if(rendered == null || renderedWidth != width) {
+                const locationPaint = activity.folderPaint(current.agent_id, prompter.paint, current.editing.length == 0 ? prompter.paint.dim : undefined);
+                const renderOptions = { ...options, columns: width + 1, locationPaint };
+                const body = renderAgentDetailBody(current, detail, renderOptions).split("\n");
+                const folders = recentFolderLines(current, { ...renderOptions, columns: width - 1 });
+                if(folders.length > 0) {
+                    body.push("", prompter.paint.bold(english ? "Recent folders" : "최근 폴더"));
+                    body.push(...folders.map((folder) => `  ${folder.tone == "dim" ? prompter.paint.dim(folder.text) : folder.text}`));
+                }
+                rendered = { header: renderAgentDetailHeader(current, detail, renderOptions), body: body.join("\n") };
+                renderedWidth = width;
             }
-            items.push({ separator: true });
-        }
-        if(agent.human == false && agent.left == false) {
-            items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기" });
-        }
-        if(agent.human == false) {
-            items.push({ value: "role", label: english ? "Set role" : "역할 정하기", hint: english ? "What this agent is responsible for" : "이 에이전트가 맡은 일" });
-        }
-        if(agent.human == false && agent.left == false) {
-            // taking a card down sits apart from the everyday actions
-            items.push({ separator: true });
-            items.push({
-                value: "retire",
-                label: english ? "Take down this card" : "이 카드 내리기",
-                hint: english ? "it leaves the room; unread messages go to the live card of its name" : "대합실에서 빠짐 · 미확인 메시지는 같은 이름의 살아 있는 카드로",
-            });
-        }
-        if(items.length > 0) {
-            items.push({ separator: true });
-        }
-        items.push({ value: "back", label: english ? "Back" : "뒤로" });
-        const action: AgentAction = await selectInPlace(prompter, participantName(agent.name, agent.client, agent.human), items, {
-            cancelValue: "back", defaultValue: selected, preface: card.split("\n"),
+            return rendered;
+        };
+        const frame = () => {
+            activity.tick(Date.now());
+            rendered = null;
+            return {};
+        };
+
+        const detailItems = (): SelectItem<AgentAction>[] => {
+            const items: SelectItem<AgentAction>[] = [
+                { separator: true, lines: (width: number) => sections(width).header.split("\n") },
+                { separator: true, rule: true, label: english ? "Card" : "카드" },
+            ];
+            if(current.human == false) {
+                items.push({
+                    value: "name", label: english ? "Name" : "이름",
+                    hint: `${oneLine(current.name)} · ${english ? "its next join may set it back" : "다음 참가 때 세션 이름으로 돌아갈 수 있음"}`,
+                });
+                items.push({ value: "role", label: english ? "Role" : "역할", hint: oneLine(current.role) || (english ? "none" : "없음") });
+            }
+            if(current.human == false && current.left == false) {
+                items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기", hint: english ? "to this agent" : "이 에이전트에게" });
+                items.push({ separator: true });
+                items.push({
+                    value: "retire",
+                    label: english ? "Take down this card" : "이 카드 내리기",
+                    hint: english ? "it leaves the room; unread messages go to the live card of its name" : "대합실에서 빠짐 · 미확인 메시지는 같은 이름의 살아 있는 카드로",
+                });
+                items.push({ separator: true });
+            }
+            items.push({ value: "back", label: english ? "Back" : "뒤로" });
+            if(pending.length > 0) {
+                items.push({ separator: true, rule: true, label: english ? `Waiting messages (${pending.length})` : `미확인 메시지 (${pending.length})` });
+                for(const message of pending) {
+                    items.push({
+                        value: `message:${message.id}`, key: String(message.id), label: `#${message.id}`,
+                        lines: (active, width) => pendingMessageLines(message, width, options).map((line) => [{
+                            text: line.text,
+                            paint: active ? prompter.paint.accent : line.tone == "bold" ? prompter.paint.bold : line.tone == "warning" ? prompter.paint.warning : prompter.paint.dim,
+                        }]),
+                    });
+                }
+            }
+            items.push({ separator: true, lines: (width: number) => {
+                const body = sections(width).body;
+                return body.trim() == "" ? [] : ["", ...body.split("\n")];
+            } });
+            return items;
+        };
+        const action: AgentAction = await selectInPlace(prompter, participantName(current.name, current.client, current.human), detailItems(), {
+            cancelValue: "back", defaultValue: selected, ...frame(),
+            animation: { intervalMs: ANIMATION_FRAME_MS, frame },
+            refresh: {
+                intervalMs: BOARD_REFRESH_MS,
+                load: () => {
+                    const overview = store.getRoomOverview(SHARED_ROOM, BOARD_MESSAGE_LIMIT);
+                    activity.update(overview.agents, overview.messages, "tab:agents", Date.now());
+                    const refreshed = overview.agents.find((candidate) => candidate.agent_id == current.agent_id);
+                    if(refreshed != null) {
+                        current = refreshed;
+                        detail = store.inspectAgent(current.agent_id, { agentId: current.agent_id, checkpointLimit: DETAIL_CHECKPOINT_LIMIT, beforeCheckpointId: null });
+                        pending = store.pendingFor(current.agent_id);
+                    }
+                    return { question: participantName(current.name, current.client, current.human), items: detailItems(), ...frame() };
+                },
+            },
         });
         if(action == "back") {
             return;
@@ -668,29 +860,37 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
             if(message != null) await showMessage(prompter, store, message, options);
             continue;
         }
+        if(action == "name") {
+            selected = "name";
+            if(await setName({ prompter, store, agent: current, english }) == true) {
+                selected = "role";
+            }
+            continue;
+        }
         if(action == "role") {
-            await setRole(prompter, store, agent, english);
-            return;
+            selected = "role";
+            if(await setRole(prompter, store, current, english) == true) {
+                selected = current.left == false ? "say" : "back";
+            }
+            continue;
         }
         if(action == "retire") {
-            await takeDownCards(prompter, store, [agent], english);
+            await takeDownCards(prompter, store, [current], english);
             return;
         }
+        selected = "say";
         const mark = prompter.mark();
         try {
-            await options.send(agent.agent_id);
+            await options.send(current.agent_id);
         }
         catch(error) {
-            // Esc inside the send flow is one level back: the board, not the main menu
-            if(error instanceof PromptBackError) {
-                return;
+            if((error instanceof PromptBackError) == false) {
+                throw error;
             }
-            throw error;
         }
         finally {
             prompter.eraseTo(mark);
         }
-        return;
     }
 }
 
@@ -851,7 +1051,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             return;
         }
 
-        // the row each tab was on, so switching back returns to it
+        // The current tab keeps its row after actions; entering another tab starts at its list.
         const selected: Partial<Record<BoardTab, BoardValue>> = {};
         for(;;) {
             const display = frame();
@@ -874,6 +1074,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             }
             if(picked == "tab:agents" || picked == "tab:messages") {
                 tab = picked;
+                delete selected[tab];
                 view = loadView();
                 continue;
             }
@@ -892,23 +1093,6 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             if(picked == "tidy:posts") {
                 selected[tab] = picked;
                 await askToTidyPosts(prompter, store, view.posters, english);
-                view = loadView();
-                continue;
-            }
-            if(picked == "send:message") {
-                selected[tab] = picked;
-                // the flow's prompts and result go once it is done, so the board comes back in place
-                const mark = prompter.mark();
-                try {
-                    await options.send();
-                }
-                catch(error) {
-                    // Esc inside the send flow is one level back: the board, not the main menu
-                    if(!(error instanceof PromptBackError)) throw error;
-                }
-                finally {
-                    prompter.eraseTo(mark);
-                }
                 view = loadView();
                 continue;
             }
@@ -937,7 +1121,7 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             else {
                 const agent = view.agents.find((candidate) => `agent:${candidate.agent_id}` == picked);
                 if(agent != null) {
-                    await showAgent(prompter, store, agent, options);
+                    await showAgent(prompter, store, agent, options, activity);
                 }
             }
             view = loadView();

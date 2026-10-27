@@ -125,17 +125,18 @@ describe("terminal prompts", () => {
         finally { prompter.close(); vi.unstubAllEnvs(); }
     });
 
-    it("draws a banner line under the question, styled on a color terminal and as plain text off one", async () => {
+    it("draws banner lines under the question, styled on a color terminal and as plain text off one", async () => {
         vi.stubEnv("NO_COLOR", undefined);
         const tty = terminal();
         const prompter = new Prompter(tty.input, tty.output);
         try {
             const picked = prompter.select("Room", [{ value: "a", label: "Agent" }], {
-                banner: [{ text: "██", paint: prompter.paint.success }, { text: "  2 working" }],
+                banner: [[{ text: "██", paint: prompter.paint.success }, { text: "  2 working" }], [{ text: "__  last 30m" }]],
             });
             await press(tty.input, ["\r"]);
             expect(await picked).toBe("a");
             expect(tty.screen()).toContain("\u001b[32m██\u001b[39m  2 working");
+            expect(tty.screen()).toContain("__  last 30m");
         }
         finally { prompter.close(); vi.unstubAllEnvs(); }
 
@@ -144,10 +145,10 @@ describe("terminal prompts", () => {
         output.on("data", (chunk) => { text += chunk.toString(); });
         const lines = new Prompter(Readable.from(["1\n"]), output);
         try {
-            expect(await lines.select("Room", [{ value: "a", label: "Agent" }], { banner: [{ text: "##" }, { text: "  2 working" }] })).toBe("a");
+            expect(await lines.select("Room", [{ value: "a", label: "Agent" }], { banner: [[{ text: "##" }, { text: "  2 working" }], [{ text: "__  last 30m" }]] })).toBe("a");
         }
         finally { lines.close(); }
-        expect(text).toContain("? Room\n  ##  2 working\n");
+        expect(text).toContain("? Room\n  ##  2 working\n  __  last 30m\n");
     });
 
     it("keeps reduced-motion frames static", async () => {
@@ -192,6 +193,83 @@ describe("terminal prompts", () => {
             await press(tty.input, ["입력", "\u001b"]);
             await cancelled;
             expect(tty.raw.at(-1)).toBe(false);
+        }
+        finally { prompter.close(); }
+    });
+
+    it("prefills editable text with the cursor at the end, including wide characters", async () => {
+        const tty = terminal();
+        const screen = new TerminalScreen(60, 24);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        try {
+            const edited = prompter.ask("Name", { initialValue: "한😀끝" });
+            expect(screen.visible().join("\n")).toContain("Name 한😀끝");
+            expect(screen.visible().join("\n")).not.toContain("(한😀끝)");
+            await press(tty.input, ["\u007f", "!", "\u001b[H", ">", "\u001b[F", "\r"]);
+            expect(await edited).toBe(">한😀!");
+            expect(screen.visible().join("\n").trim()).toBe("");
+            expect(tty.raw).toEqual([true, false]);
+
+            const kept = prompter.ask("Role", { initialValue: "API owner" });
+            await press(tty.input, ["\r"]);
+            expect(await kept).toBe("API owner");
+
+            const cleared = prompter.ask("Role", { initialValue: "API owner" });
+            await press(tty.input, ["\u0015", "\r"]);
+            expect(await cleared).toBe("");
+
+            const cancelled = expect(prompter.ask("Role", { initialValue: "API owner" })).rejects.toBeInstanceOf(PromptBackError);
+            await press(tty.input, ["x", "\u001b"]);
+            await cancelled;
+            expect(tty.raw.at(-1)).toBe(false);
+            expect(screen.visible().join("\n").trim()).toBe("");
+        }
+        finally { prompter.close(); }
+        expect(tty.screen()).toContain("\u001b[?25h");
+    });
+
+    it("preserves Enter defaults for existing callers and prefilled values in line mode", async () => {
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const answer = prompter.ask("Name", "Original");
+            await press(tty.input, ["New", "\r"]);
+            expect(await answer).toBe("New");
+            const kept = prompter.ask("Name", "Original");
+            await press(tty.input, ["\r"]);
+            expect(await kept).toBe("Original");
+        }
+        finally { prompter.close(); }
+
+        const output = new PassThrough();
+        let text = "";
+        output.on("data", (chunk) => { text += chunk.toString(); });
+        const lines = new Prompter(Readable.from(["\nNew\nESC\n"]), output);
+        try {
+            expect(await lines.ask("Name", { initialValue: "Original" })).toBe("Original");
+            expect(await lines.ask("Name", { initialValue: "Original" })).toBe("New");
+            await expect(lines.ask("Name", { initialValue: "Original" })).rejects.toBeInstanceOf(PromptBackError);
+            expect(text).toContain("? Name (Original)");
+        }
+        finally { lines.close(); }
+    });
+
+    it.each([33, 35, 193])("erases a prefilled field of %i characters without erasing the preceding line", async (length) => {
+        const tty = terminal();
+        tty.output.columns = 40;
+        const screen = new TerminalScreen(40, 24);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        try {
+            prompter.write("Keep this line\n");
+            const value = "x".repeat(length);
+            const edited = prompter.ask("Role", { initialValue: value });
+            await press(tty.input, ["\r"]);
+            expect(await edited).toBe(value);
+            expect(screen.visible().join("\n").trim()).toBe("Keep this line");
         }
         finally { prompter.close(); }
     });
@@ -279,6 +357,77 @@ describe("terminal prompts", () => {
             expect(screen.visible().join("\n")).toMatch(/[❯>] Register MCP/);
             await press(tty.input, ["\r"]);
             expect(await pending).toBe("setup");
+        }
+        finally { prompter.close(); }
+    });
+
+    it.each([54, 80, 100])("reads text after the menu without activating an offscreen choice at %s columns", async (columns) => {
+        const tty = terminal();
+        Object.assign(tty.output, { columns, rows: 16 });
+        const screen = new TerminalScreen(columns, 16);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        let completed = false;
+        try {
+            const pending = prompter.select("Agent detail", [
+                { separator: true, lines: () => ["working  Server", "Codex · online"] },
+                { separator: true, label: "Card" },
+                { value: "name", label: "Name" }, { value: "role", label: "Role" },
+                { value: "back", label: "Back" },
+                { separator: true, lines: () => Array.from({ length: 35 }, (_, index) => `Summary line ${index}`) },
+            ]).then((value) => { completed = true; return value; });
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Name/);
+            expect(screen.visible().join("\n")).toContain("Summary line 0");
+            await press(tty.input, ["\u001b[B", "\u001b[B"]);
+            await press(tty.input, Array.from({ length: 6 }, () => "\u001b[6~"));
+            expect(screen.visible().join("\n")).toContain("Summary line 34");
+            expect(screen.visible().join("\n")).toContain("Enter returns to menu");
+            await press(tty.input, ["\r"]);
+            expect(completed).toBe(false);
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Name/);
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("name");
+            expect(tty.raw.at(-1)).toBe(false);
+        }
+        finally { prompter.close(); }
+    });
+
+    it("selects a visible menu choice immediately after paging back from read-only text", async () => {
+        const tty = terminal();
+        Object.assign(tty.output, { rows: 12 });
+        const screen = new TerminalScreen(60, 12);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const pending = prompter.select("Card", [
+                { value: "name", label: "Name" }, { value: "back", label: "Back" },
+                { separator: true, lines: () => Array.from({ length: 30 }, (_, index) => `Detail ${index}`) },
+            ]);
+            await press(tty.input, Array.from({ length: 5 }, () => "\u001b[6~"));
+            expect(screen.visible().join("\n")).toContain("Enter returns to menu");
+            await press(tty.input, Array.from({ length: 5 }, () => "\u001b[5~"));
+            expect(screen.visible().join("\n")).toMatch(/[>❯] Name/);
+            expect(screen.visible().join("\n")).not.toContain("Enter returns to menu");
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("name");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("prints read-only list text in line mode without adding a numbered choice", async () => {
+        const output = new PassThrough();
+        let written = "";
+        output.on("data", (chunk) => { written += chunk.toString(); });
+        const prompter = new Prompter(Readable.from(["2\n"]), output);
+        try {
+            expect(await prompter.select("Card", [
+                { separator: true, lines: () => ["\u001b[1mServer\u001b[0m"] },
+                { value: "name", label: "Name" }, { value: "back", label: "Back" },
+                { separator: true, lines: () => ["Summary  full detail"] },
+            ])).toBe("back");
+            expect(written).toMatch(/Card\nServer\n\s+1\) Name\n\s+2\) Back\nSummary/);
+            expect(written).not.toContain("\u001b");
+            expect(written).not.toContain("3)");
         }
         finally { prompter.close(); }
     });

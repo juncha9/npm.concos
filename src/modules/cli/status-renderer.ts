@@ -162,6 +162,73 @@ export function workFolder(agent: RoomOverviewAgent): string {
     return folder;
 }
 
+/** Remove leading folders first; shorten the last folder's name only when it alone does not fit. */
+export function shortenPath(text: string, width: number, unicode: boolean): string {
+    const clean = plain(text).replace(/\s+/g, " ").trim();
+    if(displayWidth(clean) <= width) {
+        return clean;
+    }
+    const ellipsis = unicode ? "…" : ".".repeat(Math.min(3, width));
+    const folders = clean.split(/[\\/]+/).filter((folder) => folder != "");
+    while(folders.length > 1) {
+        folders.shift();
+        const candidate = `${ellipsis}/${folders.join("/")}`;
+        if(displayWidth(candidate) <= width) {
+            return candidate;
+        }
+    }
+    const name = folders[0] ?? clean;
+    if(displayWidth(name) <= width) {
+        return name;
+    }
+    let shown = "";
+    for(const character of name) {
+        if(displayWidth(shown + character + ellipsis) > width) {
+            break;
+        }
+        shown += character;
+    }
+    return shown + ellipsis;
+}
+
+/** The latest edited folder, or the reported location when no edits are on record. */
+export function agentLocation(agent: RoomOverviewAgent, width: number, unicode: boolean, english: boolean): { paths: string[]; reported: boolean } {
+    const reported = agent.recent_folders.length == 0;
+    if(agent.human || width < 4) {
+        return { paths: [], reported };
+    }
+    if(reported) {
+        const folder = workFolder(agent);
+        const suffix = english ? " (reported)" : " (보고됨)";
+        if(folder == "" || width < displayWidth(suffix) + 4) {
+            return { paths: [], reported };
+        }
+        return { paths: [shortenPath(folder, width - displayWidth(suffix), unicode) + suffix], reported };
+    }
+    let folder = agent.recent_folders[0].path;
+    if(folder == ".") {
+        folder = english ? "(root)" : "(루트)";
+    }
+    return { paths: [shortenPath(folder, width, unicode)], reported };
+}
+
+/** Each recent edit folder with its own age; callers supply the section heading. */
+export function recentFolderLines(agent: RoomOverviewAgent, options: StatusRenderOptions = {}): { text: string; tone: "plain" | "dim" }[] {
+    const english = options.language == "en";
+    const nowMs = options.nowMs ?? Date.now();
+    const width = detailWidth(options);
+    return agent.recent_folders.slice(0, 3).map((folder, index) => {
+        const elapsed = age(folder.at, nowMs, english);
+        let name = folder.path;
+        if(name == ".") {
+            name = english ? "(root)" : "(루트)";
+        }
+        const text = `${shortenPath(name, Math.max(1, width - displayWidth(elapsed) - 2), options.unicode ?? true)}  ${elapsed}`;
+        const tone = index == 0 && agent.editing.length > 0 ? "plain" : "dim";
+        return { text, tone };
+    });
+}
+
 /** Why a card looks wrong, and what to do about it, in one line. */
 export function issueText(issue: AgentIssue, nowMs: number, english: boolean): string {
     if(issue.kind == "old_concos") {
@@ -310,7 +377,7 @@ function detailWidth(options: StatusRenderOptions): number {
  * One agent's full card and recent checkpoints, for the waiting room board's detail view.
  * The board list shows one line per agent; this is where the long fields are read.
  */
-export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions & { pendingMessages?: PendingMessage[] } = {}): string {
+function agentDetailSections(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions & { pendingMessages?: PendingMessage[]; locationPaint?: (text: string) => string }): { header: string; body: string } {
     const english = options.language == "en";
     const nowMs = options.nowMs ?? Date.now();
     const width = detailWidth(options);
@@ -321,7 +388,7 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
         }
         return text;
     };
-    const lines: string[] = [];
+    let lines: string[] = [];
     const add = (text: string, prefix: string, code: number | null): void => {
         for(const line of wrap(text, width - displayWidth(prefix))) {
             if(code == null) {
@@ -369,6 +436,20 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
         if(lineIndex == nameLines.length - 1 && unread != "") {
             line += paint(unread, 33);
         }
+        if(lineIndex == nameLines.length - 1) {
+            const used = displayWidth(stateText + nameLine + unread) + 2;
+            const location = agentLocation(agent, Math.max(0, width - used), unicode, english);
+            if(location.paths.length > 0) {
+                const dimmed = location.reported || agent.editing.length == 0;
+                const parts = location.paths.map((folder, index) => {
+                    if(index == 0 && !location.reported && options.locationPaint != null) {
+                        return options.locationPaint(folder);
+                    }
+                    return dimmed ? paint(folder, 2) : folder;
+                });
+                line += "  " + parts.join(paint(" · ", 2));
+            }
+        }
         lines.push(line);
     });
     let connection = english ? "online" : "연결됨";
@@ -383,17 +464,16 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
     if(card.workspace != null) {
         add(card.workspace.path, "", 2);
     }
-    lines.push(paint((unicode ? "─" : "-").repeat(width), 2));
+    const header = lines.join("\n");
+    lines = [];
     for(const issue of agent.issues) {
         field(english ? "Check" : "확인", issueText(issue, nowMs, english), 33);
     }
-    field(english ? "Role" : "역할", card.role);
-    field(english ? "Folder" : "폴더", workFolder(agent));
-    field(english ? "Blocker" : "막힘", card.blocker, 31);
     field(english ? "Task" : "작업", card.task);
-    field(english ? "Summary" : "요약", card.summary);
     field(english ? "Next" : "다음", card.next_step);
+    field(english ? "Blocker" : "막힘", card.blocker, 31);
     field(english ? "Editing" : "편집 중", card.editing.join(", "));
+    field(english ? "Summary" : "요약", card.summary);
     field(english ? "References" : "참고", card.references.join(", "));
 
     if(options.pendingMessages != null) {
@@ -416,7 +496,25 @@ export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResul
             add(checkpoint.text, "    ", null);
         }
     }
-    return lines.join("\n");
+    return { header, body: lines.join("\n") };
+}
+
+export function renderAgentDetailHeader(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions & { locationPaint?: (text: string) => string } = {}): string {
+    return agentDetailSections(agent, detail, options).header;
+}
+
+export function renderAgentDetailBody(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions = {}): string {
+    return agentDetailSections(agent, detail, options).body;
+}
+
+/** Full-text card for callers that do not place the header and body in separate viewports. */
+export function renderAgentDetail(agent: RoomOverviewAgent, detail: InspectResult, options: StatusRenderOptions & { pendingMessages?: PendingMessage[]; locationPaint?: (text: string) => string } = {}): string {
+    const sections = agentDetailSections(agent, detail, options);
+    let rule = ((options.unicode ?? true) ? "─" : "-").repeat(detailWidth(options));
+    if(options.color) {
+        rule = `\u001b[2m${rule}\u001b[0m`;
+    }
+    return [sections.header, rule, sections.body].filter((text) => text != "").join("\n");
 }
 
 /** The same waiting-message diagnostics in a full card or a selectable board row. */

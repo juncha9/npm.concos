@@ -179,6 +179,199 @@ describe("join", () => {
 });
 
 describe("check_in", () => {
+    it("sends full content once, then status fields including explicit clears", () => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { role: "storage owner", task: "review", editing: ["src/store.ts"] }, checkpoint: "schema agreed" });
+        const first = emptyCheckIn(viewer.agent_id);
+        expect(first.agents).toEqual([expect.objectContaining({ role: "storage owner", task: "review", checkpoint: "schema agreed" })]);
+        expect(first.agents![0].detail).toBeUndefined();
+
+        const otherDirectory = path.join(workDirectory, "other");
+        emptyCheckIn(peer.agent_id, { update: { status: "waiting", editing: [], currentDirectory: otherDirectory, task: "review" } });
+        expect(emptyCheckIn(viewer.agent_id).agents).toEqual([{
+            agent_id: peer.agent_id, name: "peer", status: "waiting", detail: "status", editing: [],
+            current_directory: otherDirectory, replaced_by: "", left: false, offline: false, stale: false, workspace_id: peer.workspace_id,
+        }]);
+        emptyCheckIn(peer.agent_id, { update: { currentDirectory: "" } });
+        expect(emptyCheckIn(viewer.agent_id).agents).toEqual([expect.objectContaining({ detail: "status", current_directory: "", editing: [] })]);
+        const row = database.prepare("SELECT changed_seq, content_changed_seq FROM agent WHERE id = ?").get(peer.agent_id) as { changed_seq: number; content_changed_seq: number };
+        expect(row.content_changed_seq).toBeLessThan(row.changed_seq);
+    });
+
+    it.each(["role", "task", "summary", "nextStep", "blocker", "references", "displayName", "checkpoint"] as const)("sends a full card after %s changes", (field) => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { task: "existing task" } });
+        emptyCheckIn(viewer.agent_id);
+        const change: Partial<Parameters<RoomStore["checkIn"]>[1]> = field == "checkpoint" ? { checkpoint: "new decision" }
+            : { update: { [field]: field == "references" ? ["docs/design.md"] : "new value" } };
+        emptyCheckIn(peer.agent_id, change);
+        const card = emptyCheckIn(viewer.agent_id).agents![0];
+        expect(card.detail).toBeUndefined();
+        expect(card.task).toBe(field == "task" ? "new value" : "existing task");
+    });
+
+    it("does not infer delivered content from a cursor that skipped a card", () => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { role: "owner", task: "not seen yet" } });
+        const seq = (database.prepare("SELECT changed_seq FROM agent WHERE id = ?").get(peer.agent_id) as { changed_seq: number }).changed_seq;
+        emptyCheckIn(viewer.agent_id, { cursor: `c${seq}` });
+        emptyCheckIn(peer.agent_id, { update: { status: "waiting" } });
+        const first = emptyCheckIn(viewer.agent_id).agents![0];
+        expect(first).toMatchObject({ role: "owner", task: "not seen yet" });
+        expect(first.detail).toBeUndefined();
+    });
+
+    it("records only full cards that fit the page and keeps each viewer's baseline separate", () => {
+        const viewer = joinAgent("viewer");
+        const others = ["a", "b", "c", "d", "e"].map((name) => joinAgent(name));
+        for(const peer of others) {
+            emptyCheckIn(peer.agent_id, { update: { task: "t".repeat(110), role: "r".repeat(110), nextStep: "n".repeat(110) }, checkpoint: "c".repeat(110) });
+        }
+        const first = emptyCheckIn(viewer.agent_id);
+        expect(first.has_more).toBe(true);
+        const recorded = database.prepare("SELECT agent_id FROM card_delivery WHERE viewer_agent_id = ?").all(viewer.agent_id) as { agent_id: string }[];
+        expect(recorded.map((row) => row.agent_id).sort()).toEqual(first.agents!.map((card) => card.agent_id).sort());
+        const unseen = others.find((peer) => !first.agents!.some((card) => card.agent_id == peer.agent_id))!;
+        emptyCheckIn(unseen.agent_id, { update: { status: "waiting" } });
+        const rest = [];
+        for(let page = 0; page < 10; page++) {
+            const result = emptyCheckIn(viewer.agent_id);
+            rest.push(...(result.agents ?? []));
+            if(result.has_more != true) break;
+        }
+        expect(rest.find((card) => card.agent_id == unseen.agent_id)).toMatchObject({ task: "t".repeat(110) });
+        expect(rest.every((card) => card.detail == null)).toBe(true);
+        const newcomer = joinAgent("new viewer");
+        expect(emptyCheckIn(newcomer.agent_id).agents!.every((card) => card.detail == null)).toBe(true);
+    });
+
+    it("explicit cursor replay restores full content even after a status-only page", () => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { task: "keep this context" } });
+        const before = emptyCheckIn(viewer.agent_id);
+        emptyCheckIn(peer.agent_id, { update: { status: "waiting" } });
+        expect(emptyCheckIn(viewer.agent_id).agents![0].detail).toBe("status");
+        const replay = emptyCheckIn(viewer.agent_id, { cursor: before.cursor });
+        expect(replay.agents![0]).toMatchObject({ task: "keep this context", status: "waiting" });
+        expect(replay.agents![0].detail).toBeUndefined();
+        expect(emptyCheckIn(viewer.agent_id, { cursor: before.cursor }).agents).toEqual(replay.agents);
+    });
+
+    it.each(["target", "viewer"])("does not record dangling delivery references when the %s merges after the read", async (mergedSide) => {
+        const earlier = joinAgent("Target");
+        const hook = store.applyHookEvent({ kind: "session-start", host: "codex", sessionId: "merging", cwd: workDirectory, files: [] })!;
+        const viewer = mergedSide == "viewer" ? hook.joined! : joinAgent("viewer");
+        const writerDatabase = await openDatabase(dataDirectory);
+        try {
+            const writer = new RoomStore(writerDatabase);
+            const formatCard = Reflect.get(store, "toCompactCard");
+            let merged = false;
+            Reflect.set(store, "toCompactCard", (input: { row: { id: string } }) => {
+                const card = Reflect.apply(formatCard, store, [input]);
+                if(merged == false) {
+                    const joined = writer.join({ room: "main", displayName: "Target", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: hook.joined!.handle });
+                    expect(joined.agent_id).toBe(earlier.agent_id);
+                    merged = true;
+                }
+                return card;
+            });
+            expect(() => emptyCheckIn(viewer.agent_id)).not.toThrow();
+            expect(merged).toBe(true);
+            expect(database.prepare("SELECT * FROM card_delivery WHERE viewer_agent_id = ? OR agent_id = ?").all(hook.agentId, hook.agentId)).toEqual([]);
+            expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+            if(mergedSide == "target") {
+                expect(emptyCheckIn(viewer.agent_id).agents).toContainEqual(expect.objectContaining({ agent_id: earlier.agent_id }));
+            }
+        }
+        finally {
+            writerDatabase.close();
+        }
+    });
+
+    it("does not overwrite a rejoin's baseline reset with a page read before that rejoin", async () => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { task: "restore after compaction" } });
+        emptyCheckIn(viewer.agent_id);
+        emptyCheckIn(peer.agent_id, { update: { status: "waiting" } });
+        const writerDatabase = await openDatabase(dataDirectory);
+        try {
+            const writer = new RoomStore(writerDatabase);
+            const formatCard = Reflect.get(store, "toCompactCard");
+            let rejoined = false;
+            Reflect.set(store, "toCompactCard", (input: { row: { id: string } }) => {
+                const card = Reflect.apply(formatCard, store, [input]);
+                if(rejoined == false) {
+                    writer.join({ room: "main", displayName: "viewer", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: viewer.handle });
+                    rejoined = true;
+                }
+                return card;
+            });
+            expect(emptyCheckIn(viewer.agent_id).agents![0].detail).toBe("status");
+            const restored = emptyCheckIn(viewer.agent_id).agents![0];
+            expect(restored).toMatchObject({ task: "restore after compaction" });
+            expect(restored.detail).toBeUndefined();
+        }
+        finally {
+            writerDatabase.close();
+        }
+    });
+
+    it.each([false, true])("rejoin restores unchanged cards across pages and connections (hook=%s)", async (hookBound) => {
+        const joinInput = {
+            room: "main", displayName: "viewer", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: null,
+            ...(hookBound ? { hookSession: { host: "codex" as const, sessionId: "resume-viewer" } } : {}),
+        };
+        const viewer = store.join(joinInput);
+        const peers = ["a", "b", "c", "d", "e"].map((name) => joinAgent(name));
+        for(const peer of peers) {
+            emptyCheckIn(peer.agent_id, { update: { task: "t".repeat(110), role: "r".repeat(110), nextStep: "n".repeat(110) } });
+        }
+        for(let page = 0; page < 10 && emptyCheckIn(viewer.agent_id).has_more == true; page++) { /* finish initial delivery */ }
+        expect(emptyCheckIn(viewer.agent_id).agents).toBeUndefined();
+        const secondDatabase = await openDatabase(dataDirectory);
+        try {
+            const resumedStore = new RoomStore(secondDatabase);
+            if(hookBound) {
+                resumedStore.applyHookEvent({ kind: "session-start", host: "codex", sessionId: "resume-viewer", cwd: workDirectory, files: [] });
+            }
+            else {
+                resumedStore.join({ ...joinInput, resumeHandle: viewer.handle });
+            }
+            const cards = [];
+            for(let page = 0; page < 10; page++) {
+                const result = emptyCheckIn(viewer.agent_id);
+                cards.push(...(result.agents ?? []));
+                if(result.has_more != true) break;
+            }
+            expect(cards.map((card) => card.agent_id).sort()).toEqual(peers.map((peer) => peer.agent_id).sort());
+            expect(cards.every((card) => card.detail == null && card.task == "t".repeat(110))).toBe(true);
+        }
+        finally {
+            secondDatabase.close();
+        }
+    });
+
+    it("preserves offline, left and successor fields on status cards and clears them on resume", () => {
+        const viewer = joinAgent("viewer");
+        const peer = joinAgent("peer");
+        emptyCheckIn(peer.agent_id, { update: { task: "saved", editing: ["src/a.ts"] } });
+        emptyCheckIn(viewer.agent_id);
+        store.disconnect([peer.agent_id]);
+        const successor = joinAgent("peer");
+        expect(emptyCheckIn(viewer.agent_id).agents).toContainEqual(expect.objectContaining({
+            agent_id: peer.agent_id, detail: "status", editing: [], offline: true, replaced_by: successor.agent_id,
+        }));
+        store.leave(peer.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        expect(emptyCheckIn(viewer.agent_id).agents![0]).toMatchObject({ detail: "status", left: true });
+        store.join({ room: "main", displayName: "peer", client: "test", workingDirectory: workDirectory, workspaceRoot: null, resumeHandle: peer.handle });
+        expect(emptyCheckIn(viewer.agent_id).agents![0]).toMatchObject({ detail: "status", left: false, offline: false, replaced_by: "" });
+    });
+
     it("shows another agent's change once, and answers briefly when nothing changed", () => {
         const ui = joinAgent("ui");
         const server = joinAgent("server");

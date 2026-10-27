@@ -63,6 +63,52 @@ afterEach(async () => {
 });
 
 describe("concos mcp over stdio", () => {
+    it.each(["claude", "codex"])("keeps full recovery and status-only hook updates across %s bridge processes", async (host) => {
+        const hook = (kind: string, sessionId: string, extra: Record<string, unknown> = {}) => JSON.parse(execFileSync(process.execPath,
+            [CLI_PATH, "hook", kind, "--host", host], {
+                env: childEnvironment(), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+                input: JSON.stringify({ session_id: sessionId, cwd: workDirectory, stop_hook_active: true, ...extra }),
+            }));
+        const viewerStart = hook("session-start", "viewer");
+        const peerStart = hook("session-start", "peer");
+        const viewer = await connectBridge();
+        const peer = await connectBridge();
+        const viewerHandle = /handle=([\w-]+)/.exec(viewerStart.hookSpecificOutput.additionalContext)![1];
+        const peerHandle = /handle=([\w-]+)/.exec(peerStart.hookSpecificOutput.additionalContext)![1];
+        await callTool(viewer, "join", { display_name: "Viewer", client: host, working_directory: workDirectory, resume_handle: viewerHandle });
+        const joinedPeer = await callTool(peer, "join", { display_name: "Peer", client: host, working_directory: workDirectory, resume_handle: peerHandle });
+        await callTool(peer, "check_in", { role: "schema owner", task: "review migration", summary: "kept summary", editing: ["src/store.ts"], checkpoint: "back up first" });
+        expect((await callTool(viewer, "inspect_agent", { agent_id: joinedPeer.agent_id })).card.recent_folders).toEqual([]);
+        hook("file-edited", "peer", host == "claude"
+            ? { tool_name: "Write", tool_input: { file_path: "src/store.ts" } }
+            : { tool_name: "apply_patch", tool_input: { command: "*** Begin Patch\n*** Update File: src/store.ts\n@@\n-old\n+new\n*** End Patch" }, tool_response: "Success. Updated the following files:\nM src/store.ts" });
+        const full = await callTool(viewer, "check_in", {});
+        expect(full.room.agents).toEqual([expect.objectContaining({ task: "review migration", checkpoint: "back up first" })]);
+        expect(full.room.agents[0]).not.toHaveProperty("recent_folders");
+        hook("turn-end", "peer");
+        const partial = await callTool(viewer, "check_in", {});
+        expect(partial.room.agents).toEqual([expect.objectContaining({ agent_id: joinedPeer.agent_id, detail: "status", status: "waiting", editing: [] })]);
+        expect(partial.room.agents[0]).not.toHaveProperty("task");
+        expect(partial.room.agents[0]).not.toHaveProperty("recent_folders");
+        const inspected = await callTool(viewer, "inspect_agent", { agent_id: joinedPeer.agent_id });
+        expect(inspected.card).toMatchObject({ role: "schema owner", task: "review migration", summary: "kept summary" });
+        expect(inspected.card.recent_folders).toEqual([{ path: "src", at: expect.any(String) }]);
+        const replay = await callTool(viewer, "check_in", { cursor: full.room.cursor });
+        expect(replay.room.agents[0]).toMatchObject({ task: "review migration", status: "waiting" });
+        expect(replay.room.agents[0]).not.toHaveProperty("detail");
+        hook("session-start", "viewer");
+        const recovered = await callTool(viewer, "check_in", {});
+        expect(recovered.room.agents[0]).toMatchObject({ task: "review migration", checkpoint: "back up first" });
+        expect(recovered.room.agents[0]).not.toHaveProperty("detail");
+
+        expect(viewer.getInstructions()).toContain("has_more is available history, not an obligation to drain");
+        expect(viewer.getInstructions()).toContain("Do not send receipt confirmations");
+        const tools = await viewer.listTools();
+        expect(tools.tools.find((tool) => tool.name == "check_in")!.description).toContain("detail=status");
+        hook("session-end", "peer");
+        expect((await callTool(viewer, "inspect_agent", { agent_id: joinedPeer.agent_id })).card.recent_folders).toEqual([]);
+    }, E2E_TIMEOUT_MS);
+
     it("shares user hooks, status and messages across projects without room selectors", async () => {
         const otherDirectory = path.join(dataDirectory, "other-project");
         fs.mkdirSync(otherDirectory);
@@ -81,6 +127,8 @@ describe("concos mcp over stdio", () => {
         const peer = await callTool(second, "join", { display_name: "Second", client: "Codex", working_directory: otherDirectory, resume_handle: secondHandle });
         expect(joined.room).toBe("main");
         expect(peer.room).toBe("main");
+        expect(joined.hooks_manage_status_and_editing).toBe(true);
+        expect(peer.hooks_manage_status_and_editing).toBe(true);
         expect(joined.workspace_id).not.toBe(peer.workspace_id);
         expect((await first.listTools()).tools.find((tool) => tool.name == "join")!.inputSchema.properties).not.toHaveProperty("room");
         await callTool(first, "send_message", { to: peer.agent_id, kind: "question", text: "Across projects" });
@@ -229,6 +277,58 @@ describe("concos mcp over stdio", () => {
         expect(receivedAt()).not.toBeNull();
     }, E2E_TIMEOUT_MS);
 
+    it("omits received direct and group messages from default check_in without hiding unread messages", async () => {
+        const writer = await connectBridge();
+        const reader = await connectBridge();
+        const other = await connectBridge();
+        await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const joined = await callTool(reader, "join", { display_name: "reader", client: "test", working_directory: workDirectory });
+        const peer = await callTool(other, "join", { display_name: "other", client: "test", working_directory: workDirectory });
+        await callTool(reader, "check_in", {});
+
+        const direct = await callTool(writer, "send_message", { to: joined.agent_id, text: "direct ".repeat(80) });
+        const group = await callTool(writer, "send_message", { to: [joined.agent_id, peer.agent_id], text: "group ".repeat(80) });
+        const unread = await callTool(writer, "send_message", { to: joined.agent_id, text: "still unread" });
+        const full = await callTool(reader, "read_messages", { message_ids: [direct.message_id, group.message_id] });
+        expect(full.messages.map((message: any) => message.id)).toEqual([direct.message_id, group.message_id]);
+
+        const next = await callTool(reader, "check_in", {});
+        expect(next.room.messages).toEqual([expect.objectContaining({ id: unread.message_id, text: "still unread" })]);
+        expect(next.room.read_in_full).toBeUndefined();
+        expect(next.inbox).toBeUndefined();
+        const others = await callTool(other, "read_messages", {});
+        expect(others.messages).toEqual([expect.objectContaining({ id: group.message_id, received: false })]);
+
+        const acknowledged = await callTool(writer, "send_message", { to: joined.agent_id, text: "acknowledged ".repeat(50) });
+        const cleared = await callTool(reader, "check_in", { received_message_ids: [acknowledged.message_id] });
+        expect(cleared.room.messages).toBeUndefined();
+        expect(cleared.room.read_in_full).toBeUndefined();
+    }, E2E_TIMEOUT_MS);
+
+    it("replays received messages at an explicit cursor and still delivers edited room posts", async () => {
+        const writer = await connectBridge();
+        const reader = await connectBridge();
+        await callTool(writer, "join", { display_name: "writer", client: "test", working_directory: workDirectory });
+        const joined = await callTool(reader, "join", { display_name: "reader", client: "test", working_directory: workDirectory });
+        const before = await callTool(reader, "check_in", {});
+        const sent = await callTool(writer, "send_message", { to: joined.agent_id, text: "long ".repeat(100) });
+        const first = await callTool(reader, "check_in", { cursor: before.room.cursor });
+        expect(first.room.read_in_full).toEqual([sent.message_id]);
+        await callTool(reader, "read_messages", { message_ids: [sent.message_id] });
+        const replay = await callTool(reader, "check_in", { cursor: before.room.cursor });
+        expect(replay.room).toEqual(first.room);
+        expect(replay.inbox).toBeUndefined();
+
+        const posted = await callTool(writer, "send_message", { to: "all", text: "original ".repeat(50) });
+        await callTool(reader, "read_messages", { message_ids: [posted.message_id] });
+        const post = await callTool(reader, "check_in", {});
+        expect(post.room.messages).toEqual([expect.objectContaining({ id: posted.message_id, to: "all" })]);
+        expect(post.room.read_in_full).toEqual([posted.message_id]);
+        await callTool(writer, "send_message", { to: "all", edit: posted.message_id, text: "updated notice" });
+        const edited = await callTool(reader, "check_in", {});
+        expect(edited.room.messages).toEqual([expect.objectContaining({ id: posted.message_id, text: "updated notice", edited_at: expect.any(String) })]);
+    }, E2E_TIMEOUT_MS);
+
     it("tells an agent with its first answer in a session to record what the thread settles in the docs", async () => {
         const asker = await connectBridge();
         const answerer = await connectBridge();
@@ -324,6 +424,8 @@ describe("concos mcp over stdio", () => {
 
         const ui = await callTool(claude, "join", { display_name: "UI", client: "Claude Code", working_directory: workDirectory });
         const server = await callTool(codex, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
+        expect(ui.hooks_manage_status_and_editing).toBeUndefined();
+        expect(server.hooks_manage_status_and_editing).toBeUndefined();
         expect(ui.room).toBe("main");
         await callTool(claude, "check_in", {});
 

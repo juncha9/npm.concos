@@ -151,6 +151,115 @@ describe("hook lifecycle", () => {
     });
 });
 
+describe("recent edited folders", () => {
+    it("keeps three distinct workspace-relative folders in edit order and refreshes repeats", () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        try {
+            vi.setSystemTime("2026-10-27T09:00:00.000Z");
+            const joined = start();
+            store.applyHookEvent(event("file-edited", { files: ["src/a.ts", "README.md", "docs/a.md", "tests/a.ts"] }));
+            expect(card(joined.agent_id).recent_folders).toEqual([
+                { path: "tests", at: "2026-10-27T09:00:00.000Z" },
+                { path: "docs", at: "2026-10-27T09:00:00.000Z" },
+                { path: ".", at: "2026-10-27T09:00:00.000Z" },
+            ]);
+            vi.setSystemTime("2026-10-27T09:01:00.000Z");
+            store.applyHookEvent(event("file-edited", { cwd: path.join(directory, "src"), files: ["../docs/b.md", path.join(directory, "README.md")] }));
+            const folders = [
+                { path: ".", at: "2026-10-27T09:01:00.000Z" },
+                { path: "docs", at: "2026-10-27T09:01:00.000Z" },
+                { path: "tests", at: "2026-10-27T09:00:00.000Z" },
+            ];
+            expect(card(joined.agent_id).recent_folders).toEqual(folders);
+            expect(store.getRoomOverview("main", 10).agents.find((agent) => agent.agent_id == joined.agent_id)?.recent_folders).toEqual(folders);
+        }
+        finally { vi.useRealTimers(); }
+    });
+
+    it("keeps outside-project edits as claims without replacing recent folders", () => {
+        const joined = start();
+        store.applyHookEvent(event("file-edited", { files: [path.join(directory, "..", "outside", "a.ts")] }));
+        expect(card(joined.agent_id)).toMatchObject({ editing: ["../outside/a.ts"], recent_folders: [] });
+        // A name beginning with two dots is still inside the project unless it is a parent segment.
+        store.applyHookEvent(event("file-edited", { files: ["..internal/a.ts"] }));
+        const folders = card(joined.agent_id).recent_folders;
+        expect(folders[0].path).toBe("..internal");
+        const files = [path.join(directory, "..", "outside", "b.ts")];
+        if(process.platform == "win32") {
+            const otherDrive = path.parse(directory).root[0].toUpperCase() == "C" ? "D" : "C";
+            files.push(`${otherDrive}:/outside/c.ts`);
+        }
+        store.applyHookEvent(event("file-edited", { files }));
+        expect(card(joined.agent_id).recent_folders).toEqual(folders);
+        expect(card(joined.agent_id).editing).toContain("../outside/b.ts");
+        if(process.platform == "win32") expect(card(joined.agent_id).editing).toContain(files[1]);
+    });
+
+    it("records only edit hooks and adds no check_in payload or change sequence for a repeated file", () => {
+        const joined = start();
+        const reader = store.join({ displayName: "Reader", client: "test", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const check = (agentId: string, editing?: string[]) => store.checkIn(agentId, {
+            update: editing == null ? {} : { editing }, receivedMessageIds: [], checkpoint: null, cursor: null, expectedRevision: null,
+        });
+        check(joined.agent_id, ["claimed/a.ts"]);
+        expect(card(joined.agent_id).recent_folders).toEqual([]);
+        const empty = check(reader.agent_id);
+        expect(empty.agents!.find((agent) => agent.agent_id == joined.agent_id)).not.toHaveProperty("recent_folders");
+        store.applyHookEvent(event("file-edited", { files: ["src/a.ts"] }));
+        expect(check(reader.agent_id).agents!.find((agent) => agent.agent_id == joined.agent_id)).not.toHaveProperty("recent_folders");
+        const state = () => database.prepare("SELECT revision, changed_seq, content_changed_seq, updated_at, editing_updated_at FROM agent WHERE id = ?").get(joined.agent_id);
+        const before = state();
+        const folders = card(joined.agent_id).recent_folders;
+        vi.useFakeTimers({ toFake: ["Date"] });
+        try {
+            vi.setSystemTime(Date.parse(folders[0].at) + 1000);
+            store.applyHookEvent(event("file-edited", { files: ["src/a.ts"] }));
+        }
+        finally { vi.useRealTimers(); }
+        expect(card(joined.agent_id).recent_folders[0].at).not.toBe(folders[0].at);
+        expect(state()).toEqual(before);
+        expect(check(reader.agent_id).agents).toBeUndefined();
+        store.applyHookEvent(event("file-edited"));
+        expect(state()).toEqual(before);
+    });
+
+    it("keeps folders through turn end, bridge restart and compaction, then clears on session end or leave", () => {
+        const joined = start();
+        store.applyHookEvent(event("file-edited", { files: ["src/a.ts"] }));
+        const folders = card(joined.agent_id).recent_folders;
+        store.applyHookEvent(event("turn-end"));
+        expect(card(joined.agent_id)).toMatchObject({ editing: [], recent_folders: folders });
+        store.disconnect([joined.agent_id]);
+        start();
+        expect(card(joined.agent_id).recent_folders).toEqual(folders);
+        store.applyHookEvent(event("session-end"));
+        expect(card(joined.agent_id).recent_folders).toEqual([]);
+        start();
+        store.applyHookEvent(event("file-edited", { files: ["docs/a.md"] }));
+        store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        expect(card(joined.agent_id).recent_folders).toEqual([]);
+        expect(store.applyHookEvent(event("file-edited", { files: ["late/a.ts"] }))).toBeNull();
+    });
+
+    it("transfers hook folders to the named card and rebases them when the project root moves", () => {
+        const nested = path.join(directory, "repo");
+        fs.mkdirSync(nested);
+        const earlier = store.join({ displayName: "Named", client: "test", workingDirectory: nested, workspaceRoot: null, resumeHandle: null });
+        const hooked = start({ cwd: nested });
+        store.applyHookEvent(event("file-edited", { cwd: nested, files: ["README.md", "src/a.ts"] }));
+        const folders = card(hooked.agent_id).recent_folders;
+        const merged = store.join({ displayName: "Named", client: "test", workingDirectory: nested, workspaceRoot: null, resumeHandle: hooked.handle });
+        expect(merged.agent_id).toBe(earlier.agent_id);
+        expect(card(merged.agent_id).recent_folders).toEqual(folders);
+        store.join({ displayName: "Named", client: "test", workingDirectory: nested, workspaceRoot: directory, resumeHandle: hooked.handle });
+        expect(card(merged.agent_id).recent_folders).toEqual([
+            { path: "repo/src", at: folders[0].at }, { path: "repo", at: folders[1].at },
+        ]);
+        store.applyHookEvent(event("file-edited", { cwd: nested, files: ["src/b.ts"] }));
+        expect(card(merged.agent_id).recent_folders.map((folder) => folder.path)).toEqual(["repo/src", "repo"]);
+    });
+});
+
 describe("turn end", () => {
     function joinOther(displayName: string) {
         return store.join({ room: "main", displayName, client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
@@ -553,6 +662,124 @@ describe("Codex idle wake", () => {
 });
 
 describe("schema migration", () => {
+    it("adds empty folders to version 13 without changing records and lets older writers clear them", async () => {
+        const oldDirectory = path.join(directory, "version13");
+        fs.mkdirSync(oldDirectory);
+        const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
+        old.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON");
+        for(const step of SCHEMA_STEPS.slice(0, 13)) old.exec(step);
+        old.exec("PRAGMA user_version = 13");
+        const now = new Date().toISOString();
+        const insert = old.prepare(`
+            INSERT INTO agent (id, room, handle_hash, display_name, client, changed_seq, joined_at, updated_at, last_seen_at)
+            VALUES (?, 'main', ?, ?, 'legacy', 1, ?, ?, ?)
+        `);
+        insert.run("legacy", "legacy-hash", "Legacy", now, now, now);
+        old.exec("INSERT INTO card_delivery VALUES ('legacy', 'legacy', 1)");
+        const before = old.prepare("SELECT * FROM agent").get();
+        const delivery = old.prepare("SELECT * FROM card_delivery").all();
+        // Prepared on the old schema, then used after another connection migrates it.
+        const end = old.prepare("UPDATE agent SET editing_list = '[]', disconnected_at = ? WHERE id = 'legacy'");
+        const leave = old.prepare("UPDATE agent SET editing_list = '[]', left_at = ? WHERE id = 'legacy'");
+        const upgraded = await openDatabase(oldDirectory);
+        try {
+            expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 14 });
+            expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({ ...before, recent_folder_list: "[]" });
+            expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual(delivery);
+            const folders = JSON.stringify([{ path: "src", at: now }]);
+            const setFolders = upgraded.prepare("UPDATE agent SET recent_folder_list = ? WHERE id = 'legacy'");
+            const get = () => upgraded.prepare("SELECT recent_folder_list, changed_seq, content_changed_seq FROM agent WHERE id = 'legacy'").get();
+            setFolders.run(folders);
+            end.run(null);
+            expect(get()).toEqual({ recent_folder_list: folders, changed_seq: 1, content_changed_seq: 1 });
+            end.run(now);
+            expect(get()).toEqual({ recent_folder_list: "[]", changed_seq: 1, content_changed_seq: 1 });
+            end.run(null);
+            setFolders.run(folders);
+            leave.run(now);
+            expect(get()).toEqual({ recent_folder_list: "[]", changed_seq: 1, content_changed_seq: 1 });
+            insert.run("new-old-card", "new-old-hash", "New old card", now, now, now);
+            expect(old.prepare("SELECT recent_folder_list FROM agent WHERE id = 'new-old-card'").get()).toEqual({ recent_folder_list: "[]" });
+            expect(upgraded.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+            const backupName = fs.readdirSync(oldDirectory).find((name) => name.includes(".bak-v13-"))!;
+            const backup = new DatabaseSync(path.join(oldDirectory, backupName));
+            try {
+                expect(backup.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 13 });
+                expect(backup.prepare("SELECT * FROM agent").get()).toEqual(before);
+                expect(backup.prepare("SELECT * FROM card_delivery").all()).toEqual(delivery);
+            }
+            finally { backup.close(); }
+        }
+        finally { upgraded.close(); old.close(); }
+    });
+
+    it("preserves version 12 records and tracks already-open writers through content, resume and deletion", async () => {
+        const oldDirectory = path.join(directory, "version12");
+        fs.mkdirSync(oldDirectory);
+        const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
+        old.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON");
+        for(const step of SCHEMA_STEPS.slice(0, 12)) old.exec(step);
+        old.exec("PRAGMA user_version = 12");
+        const now = new Date().toISOString();
+        const insert = old.prepare(`
+            INSERT INTO agent (id, room, handle_hash, display_name, client, changed_seq, role, joined_at, updated_at, last_seen_at, last_call_at)
+            VALUES (?, 'main', ?, ?, 'legacy', ?, 'original role', ?, ?, ?, ?)
+        `);
+        insert.run("legacy", "legacy-hash", "Legacy", 1, now, now, now, now);
+        insert.run("reader", "reader-hash", "Reader", 2, now, now, now, now);
+        old.prepare("INSERT INTO checkpoint (agent_id, body, created_at) VALUES ('legacy', 'old checkpoint', ?)").run(now);
+        old.prepare("INSERT INTO message (id, seq, room, sender_agent_id, recipient_agent_id, kind, body, created_at) VALUES (1, 3, 'main', 'legacy', 'reader', 'note', 'keep message', ?)").run(now);
+        old.prepare("INSERT INTO message_receipt (message_id, agent_id, received_at) VALUES (1, 'reader', ?)").run(now);
+        old.exec("UPDATE meta SET value = '3' WHERE key = 'last_seq'");
+        const messageBefore = old.prepare("SELECT * FROM message").all();
+        const receiptsBefore = old.prepare("SELECT * FROM message_receipt").all();
+        const checkpointsBefore = old.prepare("SELECT * FROM checkpoint").all();
+        const upgraded = await openDatabase(oldDirectory);
+        try {
+            expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: SCHEMA_STEPS.length });
+            expect(upgraded.prepare("SELECT id, changed_seq, content_changed_seq FROM agent ORDER BY changed_seq").all()).toEqual([
+                { id: "legacy", changed_seq: 1, content_changed_seq: 1 }, { id: "reader", changed_seq: 2, content_changed_seq: 2 },
+            ]);
+            expect(upgraded.prepare("SELECT * FROM message").all()).toEqual(messageBefore);
+            expect(upgraded.prepare("SELECT * FROM message_receipt").all()).toEqual(receiptsBefore);
+            expect(upgraded.prepare("SELECT * FROM checkpoint").all()).toEqual(checkpointsBefore);
+            expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual([]);
+            const backupName = fs.readdirSync(oldDirectory).find((name) => name.includes(".bak-v12-"))!;
+            const backup = new DatabaseSync(path.join(oldDirectory, backupName));
+            try {
+                expect(backup.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 12 });
+                expect(backup.prepare("SELECT * FROM message").all()).toEqual(messageBefore);
+            }
+            finally { backup.close(); }
+
+            const current = new RoomStore(upgraded);
+            const check = (id: string) => current.checkIn(id, { cursor: null, expectedRevision: null, update: {}, checkpoint: null, receivedMessageIds: [] });
+            expect(check("reader").agents![0].role).toBe("original role");
+            const nextSeq = () => (old.prepare("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'last_seq' RETURNING CAST(value AS INTEGER) AS seq").get() as { seq: number }).seq;
+            // The same schema-12 connection remains open; these statements omit the new column.
+            old.prepare("UPDATE agent SET role = 'changed by old bridge', changed_seq = ? WHERE id = 'legacy'").run(nextSeq());
+            expect(check("reader").agents![0]).toMatchObject({ role: "changed by old bridge", checkpoint: "old checkpoint" });
+            old.prepare("UPDATE agent SET role = 'changed by old bridge', status = 'waiting', changed_seq = ? WHERE id = 'legacy'").run(nextSeq());
+            expect(check("reader").agents![0].detail).toBe("status");
+            old.prepare("UPDATE agent SET changed_seq = ? WHERE id = 'legacy'").run(nextSeq());
+            old.prepare("INSERT INTO checkpoint (agent_id, body, created_at) VALUES ('legacy', 'new checkpoint', ?)").run(now);
+            expect(check("reader").agents![0]).toMatchObject({ role: "changed by old bridge", checkpoint: "new checkpoint" });
+
+            old.exec("UPDATE agent SET client = client, working_directory = working_directory WHERE id = 'reader'");
+            expect(check("reader").agents![0]).toMatchObject({ role: "changed by old bridge" });
+            insert.run("merging", "merging-hash", "Merging", nextSeq(), now, now, now, now);
+            old.prepare("INSERT INTO checkpoint (agent_id, body, created_at) VALUES ('merging', 'transferred checkpoint', ?)").run(now);
+            check("reader");
+            old.exec("UPDATE checkpoint SET agent_id = 'legacy' WHERE agent_id = 'merging'");
+            old.prepare("UPDATE agent SET changed_seq = ? WHERE id = 'legacy'").run(nextSeq());
+            old.exec("DELETE FROM agent WHERE id = 'merging'");
+            expect(check("reader").agents![0]).toMatchObject({ checkpoint: "transferred checkpoint" });
+            expect(upgraded.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+            expect(upgraded.prepare("SELECT * FROM card_delivery WHERE viewer_agent_id = 'merging' OR agent_id = 'merging'").all()).toEqual([]);
+        }
+        finally { upgraded.close(); old.close(); }
+    });
+
     it("merges version 2 rooms without losing identities, messages, receipts, checkpoints or cursor pages", async () => {
         const oldDirectory = path.join(directory, "multiple-rooms");
         fs.mkdirSync(oldDirectory);

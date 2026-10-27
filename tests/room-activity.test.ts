@@ -6,7 +6,7 @@ import type { Style } from "../src/modules/cli/prompter";
 const style: Style = { accent: (text) => text, success: (text) => text, warning: (text) => text, danger: (text) => text, dim: (text) => text, bold: (text) => text, inverse: (text) => text };
 const agent: RoomOverviewAgent = {
     agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting", role: "",
-    task: "storage", next_step: "review", blocker: "", editing: [], workspace_path: "/project", working_directory: "/project", current_directory: null,
+    task: "storage", next_step: "review", blocker: "", editing: [], recent_folders: [], workspace_path: "/project", working_directory: "/project", current_directory: null,
     updated_at: "2026-10-25T00:00:00Z", online: true, stale: false, left: false, ended: false, pending_count: 0,
     concos_version: null, issues: [],
 };
@@ -88,5 +88,28 @@ describe("waiting room activity", () => {
         expect(plain.heading("Waiting room")).toBe("Waiting room");
         expect(plain.tabs(tabs)).toEqual(tabs);
         expect(badge(plain, "message:1")).toBe("");
+    });
+
+    it.each([false, true])("pulses only the newest folder path, not repeated timestamps or card rows (motion=%s)", (motion) => {
+        const colors: Style = { ...style, accent: (text) => `accent(${text})`, dim: (text) => `dim(${text})`, bold: (text) => `bold(${text})` };
+        const activity = new RoomActivity(true, motion, false, true);
+        const initial = { ...agent, recent_folders: [{ path: "src/cli", at: agent.updated_at }] };
+        activity.update([initial], [], "tab:agents", 0);
+        expect(activity.folderPaint(agent.agent_id, colors, colors.dim)?.("path")).toBe("dim(path)");
+        const changed = { ...initial, editing: ["src/store/db.ts"], updated_at: "2026-10-25T00:01:00Z", recent_folders: [{ path: "src/store", at: "2026-10-25T00:01:00Z" }, ...initial.recent_folders] };
+        activity.update([changed], [], "tab:agents", 100);
+        expect(activity.folderPaint(agent.agent_id, colors, colors.dim)?.("path")).toBe("bold(accent(path))");
+        expect(badge(activity, "agent:one")).toBe("");
+        expect(activity.heading("Waiting room")).toBe("Waiting room");
+        const repeated = { ...changed, recent_folders: [{ path: "src/store", at: "2026-10-25T00:02:00Z" }, ...initial.recent_folders] };
+        activity.update([repeated], [], "tab:agents", 2000);
+        activity.tick(2400);
+        expect(activity.folderPaint(agent.agent_id, colors, colors.dim)?.("path")).toBe(motion ? "dim(path)" : "bold(accent(path))");
+        activity.tick(3300);
+        expect(activity.folderPaint(agent.agent_id, colors, colors.dim)?.("path")).toBe("dim(path)");
+        expect(badge(activity, "agent:one")).toBe("");
+        activity.update([{ ...repeated, task: "Changed task", recent_folders: [{ path: "docs", at: "2026-10-25T00:03:00Z" }] }], [], "tab:agents", 3400);
+        expect(badge(activity, "agent:one")).toContain("UPDATED");
+        expect(activity.folderPaint(agent.agent_id, colors)?.("path")).toBe("bold(accent(path))");
     });
 });

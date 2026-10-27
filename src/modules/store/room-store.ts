@@ -61,8 +61,10 @@ interface AgentRow {
     blocker: string;
     reference_list: string;
     editing_list: string;
+    recent_folder_list: string;
     revision: number;
     changed_seq: number;
+    content_changed_seq: number;
     delivered_seq: number;
     joined_at: string;
     updated_at: string;
@@ -121,10 +123,12 @@ export interface EditResult {
     similar_topics?: string[];
 }
 
+const MAX_RECENT_FOLDERS = 3;
+
 const AGENT_COLUMNS = `
     id, room, host_session_id, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
-    status, role, task, summary, next_step, blocker, reference_list, editing_list,
-    revision, changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
+    status, role, task, summary, next_step, blocker, reference_list, editing_list, recent_folder_list,
+    revision, changed_seq, content_changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, last_call_at, disconnected_at, left_at
 `;
 
@@ -150,6 +154,8 @@ export interface JoinResult {
     room: string;
     workspace_id: string;
     resumed: boolean;
+    /** Only a host-session-bound card: hooks report status and editing, including waiting at turn end. */
+    hooks_manage_status_and_editing?: true;
     /** The card a session-start hook made, when an earlier card of the name took its session over; that agent_id is gone. */
     merged_from?: string;
     /** Joining again with a workspace_root above the folder the session started in moved the card there: the project it left. */
@@ -207,6 +213,8 @@ export interface CompactCard {
     agent_id: string;
     name: string;
     status: AgentStatus;
+    /** A partial card: retain content fields; the status fields, including empty lists/strings and false flags, replace prior values. */
+    detail?: "status";
     role?: string;
     task?: string;
     next_step?: string;
@@ -219,9 +227,9 @@ export interface CompactCard {
     /** For a card whose session ended or left: the live card of its name in its project, which messages to it reach. */
     replaced_by?: string;
     human?: true;
-    offline?: true;
-    stale?: true;
-    left?: true;
+    offline?: boolean;
+    stale?: boolean;
+    left?: boolean;
 }
 
 export interface MessagePreview {
@@ -251,6 +259,13 @@ export interface CheckInResult {
     revision: number;
 }
 
+/** A folder actually edited by a hook, newest first; paths are workspace-relative, with "." for its root. */
+export interface RecentFolder {
+    path: string;
+    /** Last edit in this folder, in ISO 8601 UTC. */
+    at: string;
+}
+
 export interface FullCard {
     agent_id: string;
     name: string;
@@ -265,6 +280,7 @@ export interface FullCard {
     references: string[];
     editing: string[];
     editing_updated_at: string | null;
+    recent_folders: RecentFolder[];
     workspace: { id: string; path: string; verified: boolean } | null;
     /** The folder the session started in, which keeps the card with its project. */
     working_directory: string | null;
@@ -336,6 +352,7 @@ export interface RoomOverviewAgent {
     next_step: string;
     blocker: string;
     editing: string[];
+    recent_folders: RecentFolder[];
     workspace_path: string | null;
     /** The folder the agent's session started in. */
     working_directory: string | null;
@@ -437,6 +454,10 @@ function hashHandle(handle: string): string {
 
 function parseList(text: string): string[] {
     return JSON.parse(text) as string[];
+}
+
+function parseRecentFolders(text: string): RecentFolder[] {
+    return JSON.parse(text) as RecentFolder[];
 }
 
 function formatCursor(seq: number): string {
@@ -644,6 +665,7 @@ function currentDirectoryOf(directory: string | null, startedIn: string | null):
 function applyCardUpdate(current: AgentRow, update: CardUpdate): {
     values: Pick<AgentRow, "status" | "role" | "task" | "summary" | "next_step" | "blocker" | "reference_list" | "editing_list" | "current_directory">;
     cardChanged: boolean;
+    contentChanged: boolean;
     editingChanged: boolean;
 } {
     const values = {
@@ -667,16 +689,17 @@ function applyCardUpdate(current: AgentRow, update: CardUpdate): {
         values.editing_list = JSON.stringify(update.editing);
     }
     const editingChanged = values.editing_list != current.editing_list;
-    const cardChanged = editingChanged == true
-        || values.status != current.status
-        || values.role != current.role
+    const contentChanged = values.role != current.role
         || values.task != current.task
         || values.summary != current.summary
         || values.next_step != current.next_step
         || values.blocker != current.blocker
-        || values.reference_list != current.reference_list
+        || values.reference_list != current.reference_list;
+    const cardChanged = editingChanged == true
+        || contentChanged == true
+        || values.status != current.status
         || values.current_directory != current.current_directory;
-    return { values: values, cardChanged: cardChanged, editingChanged: editingChanged };
+    return { values: values, cardChanged: cardChanged, contentChanged: contentChanged, editingChanged: editingChanged };
 }
 
 /**
@@ -939,6 +962,7 @@ export class RoomStore {
                 let rootIgnored: string | undefined;
                 // editing claims are paths from the project; null leaves them as they are
                 let editingList: string | null = null;
+                let recentFolderList: string | null = null;
                 if(resumed.workspace_id != null && resumed.working_directory != null) {
                     startedIn = { workspaceId: resumed.workspace_id, directory: resumed.working_directory };
                     currentDirectory = currentDirectoryOf(workingDirectory, resumed.working_directory);
@@ -956,6 +980,10 @@ export class RoomStore {
                                 // `src/a.ts` claimed under the repository reads `repo/src/a.ts` under the root above it
                                 editingList = JSON.stringify(parseList(resumed.editing_list).map((entry) =>
                                     path.relative(workspacePath.displayPath, path.resolve(left.display_path, entry)).replaceAll(path.sep, "/") || "."));
+                                recentFolderList = JSON.stringify(parseRecentFolders(resumed.recent_folder_list).map((folder) => ({
+                                    path: path.relative(workspacePath.displayPath, path.resolve(left.display_path, folder.path)).replaceAll(path.sep, "/") || ".",
+                                    at: folder.at,
+                                })));
                             }
                         }
                         else {
@@ -963,6 +991,14 @@ export class RoomStore {
                         }
                     }
                 }
+                let displayName = resumed.display_name;
+                let client = resumed.client;
+                if(session == null) {
+                    displayName = input.displayName;
+                    client = input.client;
+                }
+                const contentChanged = displayName != resumed.display_name || client != resumed.client
+                    || startedIn.workspaceId != resumed.workspace_id || startedIn.directory != resumed.working_directory;
                 this.prepare(`
                     UPDATE agent
                     SET display_name = :display_name,
@@ -971,8 +1007,10 @@ export class RoomStore {
                         working_directory = :working_directory,
                         current_directory = :current_directory,
                         editing_list = COALESCE(:editing_list, editing_list),
+                        recent_folder_list = COALESCE(:recent_folder_list, recent_folder_list),
                         concos_version = COALESCE(:concos_version, concos_version),
                         changed_seq = :changed_seq,
+                        content_changed_seq = CASE WHEN :content_changed = 1 THEN :changed_seq ELSE content_changed_seq END,
                         last_seen_at = :now,
                         last_call_at = :now,
                         status = CASE WHEN left_at IS NOT NULL THEN 'working' ELSE status END,
@@ -981,14 +1019,16 @@ export class RoomStore {
                     WHERE id = :id
                 `).run({
                     id: resumed.id,
-                    display_name: session == null ? input.displayName : resumed.display_name,
-                    client: session == null ? input.client : resumed.client,
+                    display_name: displayName,
+                    client: client,
                     workspace_id: startedIn.workspaceId,
                     working_directory: startedIn.directory,
                     current_directory: currentDirectory,
                     editing_list: editingList,
+                    recent_folder_list: recentFolderList,
                     concos_version: input.concosVersion ?? null,
                     changed_seq: seq,
+                    content_changed: Number(contentChanged),
                     now: nowText,
                 });
                 // the model naming the card its session-start hook made, or coming back by its handle
@@ -997,7 +1037,13 @@ export class RoomStore {
                     cardId = this.mergeIntoEarlierCard(resumed.id, input.displayName, startedIn.workspaceId, nowText) ?? resumed.id;
                     this.adoptFromEndedCards(cardId, input.displayName, startedIn.workspaceId, nowMs);
                 }
+                // A rejoin, including a compaction hook, starts a fresh card-content baseline.
+                this.prepare(`DELETE FROM card_delivery WHERE viewer_agent_id = :id`).run({ id: cardId });
+                this.prepare(`UPDATE agent SET delivered_seq = 0 WHERE id = :id`).run({ id: cardId });
                 const result: JoinResult = { agent_id: cardId, handle: resumeHandle, room: room, workspace_id: startedIn.workspaceId, resumed: true };
+                if(this.requireAgent(cardId).host_session_id != null) {
+                    result.hooks_manage_status_and_editing = true;
+                }
                 // the agent was told the hook card's id; say why another came back (2026-10-25 report)
                 if(cardId != resumed.id) {
                     result.merged_from = resumed.id;
@@ -1016,11 +1062,11 @@ export class RoomStore {
             this.prepare(`
                 INSERT INTO agent (
                     id, room, handle_hash, display_name, client, is_human, workspace_id, working_directory, concos_version,
-                    changed_seq, joined_at, updated_at, last_seen_at, last_call_at, host, host_session_id
+                    changed_seq, content_changed_seq, joined_at, updated_at, last_seen_at, last_call_at, host, host_session_id
                 )
                 VALUES (
                     :id, :room, :handle_hash, :display_name, :client, 0, :workspace_id, :working_directory, :concos_version,
-                    :changed_seq, :now, :now, :now, :now, :host, :host_session_id
+                    :changed_seq, :changed_seq, :now, :now, :now, :now, :host, :host_session_id
                 )
             `).run({
                 id: agentId,
@@ -1040,7 +1086,11 @@ export class RoomStore {
             if(session == null) {
                 this.adoptFromEndedCards(agentId, input.displayName, workspaceId, nowMs);
             }
-            return { agent_id: agentId, handle: handle, room: room, workspace_id: workspaceId, resumed: false };
+            const result: JoinResult = { agent_id: agentId, handle: handle, room: room, workspace_id: workspaceId, resumed: false };
+            if(session != null) {
+                result.hooks_manage_status_and_editing = true;
+            }
+            return result;
         });
     }
 
@@ -1057,12 +1107,12 @@ export class RoomStore {
      */
     private mergeIntoEarlierCard(hookCardId: string, displayName: string, workspaceId: string, nowText: string): string | null {
         const hook = this.prepare(`
-            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, current_directory, concos_version, status
+            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, current_directory, recent_folder_list, concos_version, status
             FROM agent
             WHERE id = :id
         `).get({ id: hookCardId }) as {
             handle_hash: string; host: string | null; host_session_id: string | null; hook_nudged_seq: number; wake_generation: number;
-            woken_at_list: string; client: string; working_directory: string | null; current_directory: string | null; concos_version: string | null; status: AgentStatus;
+            woken_at_list: string; client: string; working_directory: string | null; current_directory: string | null; recent_folder_list: string; concos_version: string | null; status: AgentStatus;
         };
         if(hook.host_session_id == null) {
             return null;
@@ -1093,6 +1143,7 @@ export class RoomStore {
         this.prepare(`UPDATE message SET sender_agent_id = :to WHERE sender_agent_id = :from`).run(ids);
         this.prepare(`UPDATE message SET recipient_agent_id = :to WHERE recipient_agent_id = :from`).run(ids);
         this.prepare(`UPDATE checkpoint SET agent_id = :to WHERE agent_id = :from`).run(ids);
+        this.prepare(`DELETE FROM card_delivery WHERE viewer_agent_id = :from OR agent_id = :from`).run({ from: hookCardId });
         // the hook card frees its unique handle and session key before the earlier card takes them
         this.prepare(`DELETE FROM agent WHERE id = :from`).run({ from: hookCardId });
         this.prepare(`
@@ -1106,9 +1157,11 @@ export class RoomStore {
                 client = :client,
                 working_directory = :working_directory,
                 current_directory = :current_directory,
+                recent_folder_list = :recent_folder_list,
                 concos_version = COALESCE(:concos_version, concos_version),
                 status = :status,
                 changed_seq = :changed_seq,
+                content_changed_seq = :changed_seq,
                 last_seen_at = :now,
                 last_call_at = :now,
                 disconnected_at = NULL
@@ -1123,6 +1176,7 @@ export class RoomStore {
             client: hook.client,
             working_directory: hook.working_directory,
             current_directory: hook.current_directory,
+            recent_folder_list: hook.recent_folder_list,
             concos_version: hook.concos_version,
             status: hook.status,
             changed_seq: this.nextSeq(),
@@ -1239,7 +1293,7 @@ export class RoomStore {
      *  3) A turn end receives what went out in full during the turn, then with unread messages not
      *     pointed out yet continues the turn once: it stays working, keeps its editing claims and
      *     records how far it has pointed
-     *  4) Otherwise apply the event to status and editing; a prompt reports what is unread
+     *  4) Otherwise update status, editing and recent edit folders; a prompt reports what is unread
      */
     applyHookEvent(event: HookEvent, room = SHARED_ROOM): HookOutcome | null {
         room = SHARED_ROOM;
@@ -1292,8 +1346,9 @@ export class RoomStore {
                 }
             }
 
-            // (4) Status and editing
+            // (4) Status, editing and recent edit locations
             let editing = parseList(current.editing_list);
+            let recentFolders = parseRecentFolders(current.recent_folder_list);
             if(event.kind == "file-edited") {
                 const files = event.files.map((file) => {
                     const absolute = path.resolve(event.cwd, file);
@@ -1302,13 +1357,19 @@ export class RoomStore {
                     return path.relative(workspace.display_path, absolute).replaceAll(path.sep, "/") || ".";
                 }).filter((file) => file.length <= MAX_LIST_ITEM_LENGTH);
                 editing = [...new Set([...editing, ...files])].slice(0, MAX_LIST_ITEMS);
+                for(const file of files) {
+                    // Claims may include work elsewhere; the board location stays inside this project.
+                    if(file == ".." || file.startsWith("../") || path.isAbsolute(file)) continue;
+                    const folder = path.posix.dirname(file);
+                    recentFolders = [{ path: folder, at: now }, ...recentFolders.filter((entry) => entry.path != folder)].slice(0, MAX_RECENT_FOLDERS);
+                }
             }
             if(event.kind == "turn-end" || event.kind == "session-end") editing = [];
             const status = event.kind == "prompt" ? "working" : event.kind == "turn-end" ? "waiting" : current.status;
             const { values, cardChanged, editingChanged } = applyCardUpdate(current, { status, editing });
             // a prompt means the session is in use: an idle-wake watch from the previous turn ends
             this.prepare(`
-                UPDATE agent SET status = :status, editing_list = :editing,
+                UPDATE agent SET status = :status, editing_list = :editing, recent_folder_list = :recent_folder_list,
                     revision = revision + :changed, changed_seq = :seq,
                     updated_at = CASE WHEN :changed THEN :now ELSE updated_at END,
                     editing_updated_at = CASE WHEN :editing_changed THEN :now ELSE editing_updated_at END,
@@ -1317,6 +1378,7 @@ export class RoomStore {
                 WHERE id = :id
             `).run({
                 id: row.id, status: values.status, editing: values.editing_list,
+                recent_folder_list: JSON.stringify(recentFolders),
                 changed: Number(cardChanged), seq: cardChanged ? this.nextSeq() : current.changed_seq,
                 editing_changed: Number(editingChanged), now,
                 disconnected: event.kind == "session-end" ? now : null,
@@ -1545,7 +1607,7 @@ export class RoomStore {
             }
 
             const checkpoint = input.checkpoint?.trim() ?? "";
-            const { values, cardChanged: fieldsChanged, editingChanged } = applyCardUpdate(current, input.update);
+            const { values, cardChanged: fieldsChanged, contentChanged, editingChanged } = applyCardUpdate(current, input.update);
             let displayName = current.display_name;
             if(input.update.displayName != null && input.update.displayName.trim() != "") {
                 displayName = input.update.displayName.trim();
@@ -1580,6 +1642,7 @@ export class RoomStore {
                     current_directory = :current_directory,
                     revision = :revision,
                     changed_seq = :changed_seq,
+                    content_changed_seq = CASE WHEN :content_changed = 1 THEN :changed_seq ELSE content_changed_seq END,
                     updated_at = :now,
                     editing_updated_at = :editing_updated_at,
                     last_seen_at = :now,
@@ -1591,6 +1654,7 @@ export class RoomStore {
                 display_name: displayName,
                 revision: revision,
                 changed_seq: this.nextSeq(),
+                content_changed: Number(contentChanged || displayName != current.display_name || checkpoint != ""),
                 now: nowText,
                 editing_updated_at: editingUpdatedAt,
                 id: agentId,
@@ -1610,7 +1674,9 @@ export class RoomStore {
         // a session that ended or left before this agent joined never reaches it; one that ended
         // later (or in the same millisecond) was seen alive, so its final card is delivered once
         const changedAgents = this.prepare(`
-            SELECT ${AGENT_COLUMNS}
+            SELECT ${AGENT_COLUMNS},
+                (SELECT CD.content_seq FROM card_delivery AS CD
+                 WHERE CD.viewer_agent_id = :agent_id AND CD.agent_id = A.id) AS delivered_content_seq
             FROM agent AS A
             WHERE A.room = :room
                 AND A.id <> :agent_id
@@ -1627,7 +1693,7 @@ export class RoomStore {
             active_since: activeSince(nowMs),
             viewer_joined_at: agent.joined_at,
             limit: CHECK_IN_MAX_AGENTS + 1,
-        }) as unknown as AgentRow[];
+        }) as unknown as (AgentRow & { delivered_content_seq: number | null })[];
         const newMessages = this.prepare(`
             SELECT
                 M.id,
@@ -1650,25 +1716,28 @@ export class RoomStore {
             JOIN agent AS S
                 ON S.id = M.sender_agent_id
             WHERE M.seq > :start_seq AND M.seq <= :bound_seq
-                -- messages to this agent, and others' posts to the room, again after each edit
-                AND (MR.agent_id IS NOT NULL OR (M.recipient_scope = 'all' AND M.sender_agent_id <> :agent_id))
+                -- unread messages to this agent (all on explicit replay), and others' posts after each edit
+                AND ((MR.agent_id IS NOT NULL AND (MR.received_at IS NULL OR :replay = 1))
+                    OR (M.recipient_scope = 'all' AND M.sender_agent_id <> :agent_id))
             ORDER BY M.seq
             LIMIT :limit
         `).all({
             agent_id: agentId,
             start_seq: startSeq,
             bound_seq: boundSeq,
+            replay: Number(input.cursor != null),
             limit: CHECK_IN_MAX_MESSAGES + 1,
         }) as unknown as MessageRow[];
 
         // (3) Page
-        const events: ({ seq: number; agent: AgentRow } | { seq: number; message: MessageRow })[] = [
+        const events = [
             ...changedAgents.map((row) => ({ seq: row.changed_seq, agent: row })),
             ...newMessages.map((row) => ({ seq: row.seq, message: row })),
         ].sort((left, right) => left.seq - right.seq);
 
         const pendingCount = this.countPending(agentId);
         const cards: CompactCard[] = [];
+        const deliveredCards: AgentRow[] = [];
         const previews: MessagePreview[] = [];
         let deliveredSeq = startSeq;
         let hasMore = false;
@@ -1693,7 +1762,9 @@ export class RoomStore {
                     hasMore = true;
                     break;
                 }
-                item = this.toCompactCard(event.agent, nowMs);
+                const statusOnly = input.cursor == null && event.agent.delivered_content_seq != null
+                    && event.agent.content_changed_seq <= event.agent.delivered_content_seq;
+                item = this.toCompactCard({ row: event.agent, nowMs, statusOnly });
             }
             else {
                 if(previews.length >= CHECK_IN_MAX_MESSAGES) {
@@ -1710,6 +1781,9 @@ export class RoomStore {
             usedLength += itemLength;
             if("agent" in event) {
                 cards.push(item as CompactCard);
+                if((item as CompactCard).detail != "status") {
+                    deliveredCards.push(event.agent);
+                }
             }
             else {
                 previews.push(item as MessagePreview);
@@ -1720,10 +1794,30 @@ export class RoomStore {
             deliveredSeq = Math.max(startSeq, boundSeq);
         }
 
-        // (4) Remember the position
-        this.prepare(`
-            UPDATE agent SET delivered_seq = :delivered_seq WHERE id = :id
-        `).run({ delivered_seq: deliveredSeq, id: agentId });
+        // (4) The position and the full card content included in this page.
+        runInTransaction(this.database, () => {
+            // A rejoin during the read reset this viewer's context. Do not overwrite that reset
+            // with the old page; other concurrent viewer changes safely leave it available again.
+            const sameViewer = this.prepare(`
+                SELECT 1 FROM agent WHERE id = :id AND changed_seq = :changed_seq
+            `).get({ id: agentId, changed_seq: agent.changed_seq });
+            if(sameViewer == null) {
+                return;
+            }
+            this.prepare(`
+                UPDATE agent SET delivered_seq = :delivered_seq WHERE id = :id
+            `).run({ delivered_seq: deliveredSeq, id: agentId });
+            for(const card of deliveredCards) {
+                // Another connection may have merged the target since the page was read.
+                this.prepare(`
+                    INSERT INTO card_delivery (viewer_agent_id, agent_id, content_seq)
+                    SELECT :viewer_agent_id, :agent_id, :content_seq
+                    WHERE EXISTS (SELECT 1 FROM agent WHERE id = :agent_id)
+                    ON CONFLICT (viewer_agent_id, agent_id) DO UPDATE
+                        SET content_seq = MAX(card_delivery.content_seq, excluded.content_seq)
+                `).run({ viewer_agent_id: agentId, agent_id: card.id, content_seq: card.content_changed_seq });
+            }
+        });
 
         const result: CheckInResult = {
             changed: cards.length + previews.length > 0,
@@ -1748,27 +1842,37 @@ export class RoomStore {
         return result;
     }
 
-    private toCompactCard(row: AgentRow, nowMs: number): CompactCard {
+    private toCompactCard({ row, nowMs, statusOnly }: { row: AgentRow; nowMs: number; statusOnly: boolean }): CompactCard {
         const card: CompactCard = { agent_id: row.id, name: row.display_name, status: row.status };
-        if(row.role != "") {
-            card.role = preview(row.role, CARD_FIELD_PREVIEW_LENGTH);
+        if(statusOnly == true) {
+            card.detail = "status";
+            card.current_directory = "";
+            card.replaced_by = "";
+            card.left = false;
+            card.offline = false;
+            card.stale = false;
         }
-        if(row.task != "") {
-            card.task = preview(row.task, CARD_FIELD_PREVIEW_LENGTH);
-        }
-        if(row.next_step != "") {
-            card.next_step = preview(row.next_step, CARD_FIELD_PREVIEW_LENGTH);
-        }
-        if(row.blocker != "") {
-            card.blocker = preview(row.blocker, CARD_FIELD_PREVIEW_LENGTH);
+        else {
+            if(row.role != "") {
+                card.role = preview(row.role, CARD_FIELD_PREVIEW_LENGTH);
+            }
+            if(row.task != "") {
+                card.task = preview(row.task, CARD_FIELD_PREVIEW_LENGTH);
+            }
+            if(row.next_step != "") {
+                card.next_step = preview(row.next_step, CARD_FIELD_PREVIEW_LENGTH);
+            }
+            if(row.blocker != "") {
+                card.blocker = preview(row.blocker, CARD_FIELD_PREVIEW_LENGTH);
+            }
+            const checkpoint = this.selectLatestCheckpoint(row.id);
+            if(checkpoint != null) {
+                card.checkpoint = preview(checkpoint, CARD_FIELD_PREVIEW_LENGTH);
+            }
         }
         const editing = parseList(row.editing_list);
-        if(editing.length > 0) {
+        if(statusOnly == true || editing.length > 0) {
             card.editing = editing.map((entry) => preview(entry, CARD_FIELD_PREVIEW_LENGTH));
-        }
-        const checkpoint = this.selectLatestCheckpoint(row.id);
-        if(checkpoint != null) {
-            card.checkpoint = preview(checkpoint, CARD_FIELD_PREVIEW_LENGTH);
         }
         if(row.workspace_id != null) {
             card.workspace_id = row.workspace_id;
@@ -1870,6 +1974,7 @@ export class RoomStore {
                 references: parseList(target.reference_list),
                 editing: parseList(target.editing_list),
                 editing_updated_at: target.editing_updated_at,
+                recent_folders: parseRecentFolders(target.recent_folder_list),
                 workspace: workspace,
                 working_directory: target.working_directory,
                 revision: target.revision,
@@ -2553,6 +2658,45 @@ export class RoomStore {
         });
     }
 
+    /** A board rename leaves activity times untouched; false means another live card owns the name. */
+    setNameFromBoard(agentId: string, displayName: string): boolean {
+        const name = displayName.trim();
+        if(name.length == 0 || name.length > MAX_DISPLAY_NAME_LENGTH) {
+            throw new RoomError(`display name must contain 1 to ${MAX_DISPLAY_NAME_LENGTH} characters`);
+        }
+        return runInTransaction(this.database, () => {
+            const current = this.requireAgent(agentId);
+            if(current.is_human == 1) {
+                throw new RoomError("a person's name cannot be changed from the agent board");
+            }
+            if(current.display_name == name) {
+                return true;
+            }
+            const now = new Date();
+            const duplicate = this.prepare(`
+                SELECT A.id FROM agent AS A
+                WHERE A.room = :room
+                    AND A.id <> :id
+                    AND A.display_name = :name
+                    AND ${ACTIVE_AGENT_CONDITION}
+                LIMIT 1
+            `).get({ room: current.room, id: agentId, name, active_since: activeSince(now.getTime()) });
+            if(duplicate != null) {
+                return false;
+            }
+            this.prepare(`
+                UPDATE agent
+                SET display_name = :name,
+                    revision = revision + 1,
+                    changed_seq = :changed_seq,
+                    content_changed_seq = :changed_seq,
+                    updated_at = :now
+                WHERE id = :id
+            `).run({ name, changed_seq: this.nextSeq(), now: now.toISOString(), id: agentId });
+            return true;
+        });
+    }
+
     /**
      * The person at the board sets an agent's role. The card's revision and change sequence move,
      * so the agent and others see it on their next check_in; the agent's own activity times stay,
@@ -2573,7 +2717,8 @@ export class RoomStore {
             }
             this.prepare(`
                 UPDATE agent
-                SET role = :role, revision = revision + 1, changed_seq = :changed_seq, updated_at = :now
+                SET role = :role, revision = revision + 1, changed_seq = :changed_seq,
+                    content_changed_seq = :changed_seq, updated_at = :now
                 WHERE id = :id
             `).run({ role: text, changed_seq: this.nextSeq(), now: new Date().toISOString(), id: agentId });
         });
@@ -2588,13 +2733,14 @@ export class RoomStore {
                 return;
             }
             // a participant that left works nowhere: its editing claim and current folder go
-            const { values } = applyCardUpdate(current, {
+            const { values, contentChanged } = applyCardUpdate(current, {
                 status: "finished",
                 summary: input.summary ?? undefined,
                 nextStep: input.nextStep ?? undefined,
                 editing: [],
                 currentDirectory: "",
             });
+            const checkpoint = input.checkpoint?.trim() ?? "";
             this.prepare(`
                 UPDATE agent
                 SET status = :status,
@@ -2608,14 +2754,14 @@ export class RoomStore {
                     current_directory = :current_directory,
                     revision = revision + 1,
                     changed_seq = :changed_seq,
+                    content_changed_seq = CASE WHEN :content_changed = 1 THEN :changed_seq ELSE content_changed_seq END,
                     updated_at = :now,
                     editing_updated_at = :now,
                     last_seen_at = :now,
                     last_call_at = :now,
                     left_at = :now
                 WHERE id = :id
-            `).run({ ...values, changed_seq: this.nextSeq(), now: nowText, id: agentId });
-            const checkpoint = input.checkpoint?.trim() ?? "";
+            `).run({ ...values, changed_seq: this.nextSeq(), content_changed: Number(contentChanged || checkpoint != ""), now: nowText, id: agentId });
             if(checkpoint != "") {
                 this.prepare(`
                     INSERT INTO checkpoint (agent_id, workspace_id, body, created_at)
@@ -2761,6 +2907,11 @@ export class RoomStore {
                 this.prepare(`DELETE FROM message_receipt WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
                 const removedCheckpoints = this.prepare(`DELETE FROM checkpoint WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
                 checkpoints += Number(removedCheckpoints.changes);
+                this.prepare(`
+                    DELETE FROM card_delivery
+                    WHERE viewer_agent_id IN (SELECT value FROM json_each(:ids))
+                        OR agent_id IN (SELECT value FROM json_each(:ids))
+                `).run({ ids: ids });
                 this.prepare(`DELETE FROM agent WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
             }
 
@@ -2924,11 +3075,11 @@ export class RoomStore {
             this.prepare(`
                 INSERT INTO agent (
                     id, room, handle_hash, display_name, client, is_human, status,
-                    changed_seq, joined_at, updated_at, last_seen_at
+                    changed_seq, content_changed_seq, joined_at, updated_at, last_seen_at
                 )
                 VALUES (
                     :id, :room, :handle_hash, :display_name, 'human', 1, 'idle',
-                    :changed_seq, :now, :now, :now
+                    :changed_seq, :changed_seq, :now, :now, :now
                 )
             `).run({
                 id: agentId,
@@ -2974,7 +3125,7 @@ export class RoomStore {
         throw new RoomError(`no agent ${idOrName} in room ${room}`);
     }
 
-    getRoomOverview(room: string, messageLimit: number): { agents: RoomOverviewAgent[]; messages: RoomOverviewMessage[] } {
+    getRoomOverview(room: string, messageLimit: number): { agents: RoomOverviewAgent[]; messages: RoomOverviewMessage[]; message_count: number; activity: { events_per_minute: number[]; active_agent_count: number } } {
         room = SHARED_ROOM;
         const nowMs = Date.now();
         const agentRows = this.prepare(`
@@ -2999,6 +3150,7 @@ export class RoomStore {
                 next_step: row.next_step,
                 blocker: row.blocker,
                 editing: parseList(row.editing_list),
+                recent_folders: parseRecentFolders(row.recent_folder_list),
                 workspace_path: workspacePath,
                 working_directory: row.working_directory,
                 current_directory: row.current_directory,
@@ -3039,6 +3191,27 @@ export class RoomStore {
             }
         }
 
+        const messageCount = this.prepare(`
+            SELECT COUNT(*) AS message_count FROM message WHERE room = :room
+        `).get({ room }) as { message_count: number };
+        const activityStart = nowMs - 30 * 60000;
+        const eventRows = this.prepare(`
+            SELECT created_at FROM message
+            WHERE room = :room AND created_at BETWEEN :since AND :now
+            UNION ALL
+            SELECT C.created_at FROM checkpoint AS C
+            JOIN agent AS A ON A.id = C.agent_id
+            WHERE A.room = :room AND C.created_at BETWEEN :since AND :now
+        `).all({ room, since: new Date(activityStart).toISOString(), now: new Date(nowMs).toISOString() }) as { created_at: string }[];
+        const eventsPerMinute = Array<number>(30).fill(0);
+        for(const event of eventRows) {
+            const minute = Math.min(29, Math.floor((Date.parse(event.created_at) - activityStart) / 60000));
+            eventsPerMinute[minute] += 1;
+        }
+        const activeAgentCount = live.filter(({ row }) => {
+            const calledAt = Date.parse(row.last_call_at ?? "");
+            return calledAt >= nowMs - 5 * 60000 && calledAt <= nowMs;
+        }).length;
         const messageRows = this.prepare(`
             SELECT
                 M.id,
@@ -3138,6 +3311,9 @@ export class RoomStore {
                 waiting_on_participants: waitingOn,
             };
         });
-        return { agents: agents, messages: messages };
+        return {
+            agents: agents, messages: messages, message_count: messageCount.message_count,
+            activity: { events_per_minute: eventsPerMinute, active_agent_count: activeAgentCount },
+        };
     }
 }

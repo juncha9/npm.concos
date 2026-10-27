@@ -16,6 +16,7 @@ export class RoomActivity {
     private agents = new Map<string, RoomOverviewAgent>();
     private messages = new Map<number, RoomOverviewMessage>();
     private readonly pulses = new Map<string, Pulse>();
+    private readonly folderPulses = new Map<string, number>();
     private readonly unseen: Record<ActivityTab, Set<string>> = { "tab:agents": new Set(), "tab:messages": new Set() };
     private readonly changedAt: Record<ActivityTab, number> = { "tab:agents": -Infinity, "tab:messages": -Infinity };
     private notice: { text: string; at: number } | null = null;
@@ -51,7 +52,20 @@ export class RoomActivity {
                 if(previous == null) {
                     if(visible) { this.mark(key, "JOINED", "tab:agents", tab); joined += 1; }
                 }
-                else if(JSON.stringify(agent) != JSON.stringify(previous)) {
+                else {
+                    const newest = agent.recent_folders[0]?.path;
+                    if(newest != null && newest != previous.recent_folders[0]?.path) {
+                        this.folderPulses.set(agent.agent_id, now);
+                    }
+                    // Folder/editing changes already show in the location; their timestamp is not a card update badge.
+                    const currentCard = { ...agent, recent_folders: [], editing: [] };
+                    const previousCard = { ...previous, recent_folders: [], editing: [] };
+                    if(JSON.stringify(agent.recent_folders) != JSON.stringify(previous.recent_folders) || JSON.stringify(agent.editing) != JSON.stringify(previous.editing)) {
+                        currentCard.updated_at = previousCard.updated_at;
+                    }
+                    if(JSON.stringify(currentCard) == JSON.stringify(previousCard)) {
+                        continue;
+                    }
                     let kind: Change = "UPDATED";
                     if(agent.status != previous.status || agent.online != previous.online || agent.ended != previous.ended || agent.left != previous.left || agent.blocker != previous.blocker) kind = "STATE";
                     else if(agent.pending_count > previous.pending_count) kind = "INBOX";
@@ -92,6 +106,11 @@ export class RoomActivity {
         for(const [key, pulse] of this.pulses) {
             if(now - pulse.at >= PULSE_MS && !this.unseen["tab:agents"].has(key) && !this.unseen["tab:messages"].has(key)) this.pulses.delete(key);
         }
+        for(const [id, at] of this.folderPulses) {
+            if(now - at >= PULSE_MS || !this.agents.has(id)) {
+                this.folderPulses.delete(id);
+            }
+        }
     }
 
     private recent(key: string): Pulse | undefined {
@@ -124,6 +143,24 @@ export class RoomActivity {
             paint = (text) => style.bold(color(text));
         }
         return [{ text: `  ${pulse.kind}`, paint }];
+    }
+
+    folderPaint(agentId: string, style: Style, baseline?: (text: string) => string): ((text: string) => string) | undefined {
+        const at = this.folderPulses.get(agentId);
+        if(at == null || this.now - at >= PULSE_MS) {
+            return baseline;
+        }
+        const elapsed = this.now - at;
+        if(!this.motion) {
+            return (text) => style.bold(style.accent(text));
+        }
+        if(elapsed > PULSE_MS * 0.7) {
+            return style.dim;
+        }
+        if(Math.floor(elapsed / FRAME_MS) % 4 < 2) {
+            return (text) => style.bold(style.accent(text));
+        }
+        return baseline;
     }
 
     heading(base: string): string {

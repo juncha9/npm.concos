@@ -1,6 +1,6 @@
 // concos local SQLite schema — mirror of the resulting shape.
 // The record is the migration code in src/modules/store/schema.ts; edit both in the same change.
-// Schema version 12 · first required by concos 0.1.11. Every table is a record, not a cache.
+// Schema version 14 · unreleased. Every table is a record, not a cache.
 
 Table meta {
   key varchar [pk, note: 'last_seq, last_message_id (schema 9; message numbers are never given twice), created_by_version, created_at, last_opened_by_version, last_migrated_by_version, last_migrated_at, hook_handle_secret (private HMAC key)']
@@ -36,8 +36,10 @@ Table agent {
   blocker varchar [not null, default: '']
   reference_list varchar [not null, default: '[]', note: 'JSON string array']
   editing_list varchar [not null, default: '[]', note: 'JSON string array of paths from workspace_id; recalculated from the new project root when an explicit join moves the project. Cleared on leave and bridge shutdown']
+  recent_folder_list varchar [not null, default: '[]', note: 'schema 14: JSON array of {path, at} from file-edited hooks; only folders inside the workspace, relative paths, root is ., ISO UTC times, newest first, distinct, at most 3. Kept across turns; an end/leave trigger clears it for older writers too. Delivered only to board and inspect_agent; changes alone do not raise revision or either change sequence']
   revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
+  content_changed_seq integer [not null, default: 0, note: 'schema 13: last content change; status, editing and activity alone leave it unchanged. Existing cards start from changed_seq. Agent content and checkpoint-insert triggers cover already-running older writers too']
   delivered_seq integer [not null, default: 0, note: 'position delivered by the last check_in']
   hook_nudged_seq integer [not null, default: 0, note: 'newest message seq a turn-end hook or an idle wake (watch or MCP-server fallback) has pointed out; each message is pointed out once']
   wake_generation integer [not null, default: 0, note: 'idle wake (Claude Code, Codex): the live watch; a newer watch, a prompt or an MCP-server fallback wake raises it and ends older ones']
@@ -55,6 +57,19 @@ Table agent {
     (room, changed_seq) [name: 'idx_agent_room_changed_seq']
     workspace_id [name: 'idx_agent_workspace_id']
   }
+}
+
+Table card_delivery {
+  viewer_agent_id varchar [not null, ref: > agent.id]
+  agent_id varchar [not null, ref: > agent.id]
+  content_seq integer [not null, note: 'content_changed_seq delivered in a full card to this viewer; cleared when the viewer rejoins to restore context']
+
+  indexes {
+    (viewer_agent_id, agent_id) [pk, name: 'pk_card_delivery']
+    agent_id [name: 'idx_card_delivery_agent_id']
+  }
+
+  Note: 'Schema 13. Card-delivery record, separate from the room cursor. Triggers reset the viewer baseline and cursor on join/merge identity writes, invalidate transferred checkpoint baselines, and remove references before an agent is deleted, including by an already-running older writer.'
 }
 
 Table checkpoint {

@@ -56,6 +56,8 @@ export interface SelectChoice<T extends string> {
 /** A non-selectable divider between groups of choices. */
 export interface SelectSeparator {
     separator: true;
+    /** Read-only text at this point in the list; ANSI styles and embedded newlines are preserved. */
+    lines?: (width: number) => string[];
     /** Group heading in place of the divider rule, with a blank line above it after the first group. */
     label?: string;
     /** Dimmed text after the heading. */
@@ -91,9 +93,9 @@ export interface SelectOptions<T extends string> {
      * TTY only: reloads the question, items and tabs every `intervalMs` while the list is open.
      * The cursor stays on the same value, and the list redraws only when its lines change.
      */
-    refresh?: { intervalMs: number; load: () => { question: string; banner?: LinePart[]; items: SelectItem<T>[]; tabs?: SelectTabs<T> } };
-    /** A styled line under the question, such as a status bar; its plain text off a TTY. */
-    banner?: LinePart[];
+    refresh?: { intervalMs: number; load: () => { question: string; banner?: LinePart[][]; items: SelectItem<T>[]; tabs?: SelectTabs<T>; preface?: string[] } };
+    /** Styled lines under the question, such as status bars; their plain text off a TTY. */
+    banner?: LinePart[][];
     /**
      * Detail text before the choices, with ANSI styles and embedded newlines allowed. On a TTY,
      * it wraps to the available columns; PgUp/PgDn and Home/End scroll only this text while the
@@ -107,7 +109,7 @@ export interface SelectOptions<T extends string> {
      */
     tabs?: SelectTabs<T>;
     /** Repaints cached visual state between refreshes; it must not reload data. TTY only. */
-    animation?: { intervalMs: number; frame: () => { question?: string; tabs?: SelectTabs<T> } };
+    animation?: { intervalMs: number; frame: () => { question?: string; tabs?: SelectTabs<T>; preface?: string[] } };
 }
 
 /** The subset of `tty.ReadStream` the key-driven prompts need; absent on pipes and in tests. */
@@ -521,23 +523,35 @@ export class Prompter {
         }
 
         const prompt = this.fitLine([{ text: "Press Enter to continue · Esc to go back", paint: this.style.dim }], this.columns() - 1);
-        await this.readAnswer(prompt, false);
+        await this.readAnswer(prompt);
     }
 
     /**
-     * Free-text prompt. Enter accepts `defaultValue` when one is shown.
+     * Free-text prompt. A string is an Enter default; `initialValue` is editable on a TTY
+     * with the cursor at its end, and an Enter default in line mode.
      *
      * @throws {PromptBackError} On Esc.
      * @throws {PromptClosedError} If the input closes before a line arrives.
      */
-    async ask(question: string, defaultValue?: string): Promise<string> {
+    async ask(question: string, value?: string | { initialValue: string }): Promise<string> {
+        let defaultValue: string | undefined;
+        let initialValue: string | undefined;
+        if(typeof value == "string") {
+            defaultValue = value;
+        }
+        else if(value != null) {
+            initialValue = value.initialValue;
+            if(this.interactive == false) {
+                defaultValue = initialValue;
+            }
+        }
         let suffix = "";
         if(defaultValue != null && defaultValue !== "") {
             suffix = ` ${this.style.dim(`(${defaultValue})`)}`;
         }
 
         const prompt = `${this.style.accent(this.symbols.question)} ${this.style.bold(question)}${suffix} `;
-        const line = await this.readAnswer(prompt, false);
+        const line = await this.readAnswer(prompt, { initialValue });
 
         let answer = line.trim();
         if(answer === "" && defaultValue != null) {
@@ -580,7 +594,7 @@ export class Prompter {
 
         for(;;) {
             const prompt = `${this.style.accent(this.symbols.question)} ${this.style.bold(question)} ${hint} `;
-            const line = await this.readAnswer(prompt, false);
+            const line = await this.readAnswer(prompt);
 
             const normalized = line.trim().toLowerCase();
             let answer: boolean | null = null;
@@ -644,7 +658,7 @@ export class Prompter {
      */
     async askSecret(question: string): Promise<string> {
         const prompt = `${this.style.accent(this.symbols.question)} ${this.style.bold(question)} `;
-        const answer = await this.readAnswer(prompt, true);
+        const answer = await this.readAnswer(prompt, { secret: true });
 
         let shown = this.style.dim("(empty)");
         if(answer !== "") {
@@ -663,10 +677,10 @@ export class Prompter {
      * @throws {PromptBackError} On Esc, or an Esc line off a TTY.
      * @throws {PromptClosedError} When the input closes.
      */
-    private async readAnswer(prompt: string, secret: boolean): Promise<string> {
+    private async readAnswer(prompt: string, options: { secret?: boolean; initialValue?: string } = {}): Promise<string> {
         if(this.interactive && this.inputEnded) throw new PromptClosedError();
         if(this.interactive == true) {
-            const typed = await this.editLine(prompt, secret);
+            const typed = await this.editLine(prompt, options);
             return typed;
         }
 
@@ -738,15 +752,15 @@ export class Prompter {
         startIndex: number,
         cancelValue: T | undefined,
         tabs: SelectTabs<T> | undefined,
-        banner: LinePart[] | undefined,
+        banner: LinePart[][] | undefined,
         preface: string[] | undefined,
     ): Promise<T> {
         const choices = items.filter((item): item is SelectChoice<T> => "value" in item);
         const labelWidths = groupLabelWidths(items);
 
         this.output.write(`${this.symbols.question} ${question}\n`);
-        if(banner != null) {
-            this.output.write(`  ${banner.map((part) => part.text).join("")}\n`);
+        for(const line of banner ?? []) {
+            this.output.write(`  ${line.map((part) => part.text).join("")}\n`);
         }
         if(tabs != null) {
             const bar = tabs.items.map((tab) => {
@@ -766,6 +780,12 @@ export class Prompter {
         for(let index = 0; index < items.length; index += 1) {
             const item = items[index];
             if("value" in item == false) {
+                if(item.lines != null) {
+                    for(const line of item.lines(this.columns() - 1)) {
+                        this.output.write(`${line.replace(ANSI_PATTERN, "")}\n`);
+                    }
+                    continue;
+                }
                 if(item.label != null) {
                     let heading = `  ${item.label}`;
                     if(item.hint != null && item.hint !== "") {
@@ -925,14 +945,15 @@ export class Prompter {
      * The field redraws from the prompt on every key; the cursor is placed by row and
      * column from the widths, since a long value wraps.
      */
-    private editLine(prompt: string, secret: boolean): Promise<string> {
+    private editLine(prompt: string, options: { secret?: boolean; initialValue?: string }): Promise<string> {
+        const { secret = false, initialValue = "" } = options;
         const ttyInput = this.input as TtyInput;
         const promptWidth = displayWidth(prompt.replace(ANSI_PATTERN, ""));
         const columns = this.columns();
 
         /** Code points, so a wide character is one unit for the cursor. */
-        let buffer: string[] = [];
-        let cursor = 0;
+        let buffer = Array.from(initialValue);
+        let cursor = buffer.length;
         /** Row the terminal cursor is on, relative to the prompt's first row. */
         let cursorRow = 0;
 
@@ -954,6 +975,10 @@ export class Prompter {
             const widthToEnd = promptWidth + displayWidth(shown);
             const endRow = Math.floor(widthToEnd / columns);
             const endColumn = widthToEnd % columns;
+            // A full final row still has pending wrap; this puts the cursor on the counted next row.
+            if(endColumn == 0) {
+                text += "\r\n";
+            }
             cursorRow = Math.floor(widthToCursor / columns);
             const cursorColumn = widthToCursor % columns;
 
@@ -1050,7 +1075,7 @@ export class Prompter {
         refresh: SelectOptions<T>["refresh"],
         initialTabs: SelectTabs<T> | undefined,
         animation: SelectOptions<T>["animation"],
-        initialBanner: LinePart[] | undefined,
+        initialBanner: LinePart[][] | undefined,
         preface: string[] | undefined,
     ): Promise<T> {
         const ttyInput = this.input as TtyInput;
@@ -1084,6 +1109,7 @@ export class Prompter {
         let viewportHeight = 0;
         let bodyLineCount = 0;
         let followSelection = true;
+        let readingText = false;
         let anchorValue: string | null = null;
         let anchorStart = 0;
         let anchorHeaderHeight = 0;
@@ -1168,8 +1194,8 @@ export class Prompter {
                 { text: " " },
                 { text: question, paint: this.style.bold },
             ], width)];
-            if(banner != null) {
-                header.push(this.fitLine([{ text: "  " }, ...banner], width));
+            for(const line of banner ?? []) {
+                header.push(this.fitLine([{ text: "  " }, ...line], width));
             }
             if(tabs != null) {
                 // inactive tabs are padded to the bracket width, so switching never shifts the bar
@@ -1193,6 +1219,11 @@ export class Prompter {
             for(let index = 0; index < items.length; index += 1) {
                 const item = items[index];
                 if("value" in item == false) {
+                    if(item.lines != null) {
+                        const text = wrapPreface(item.lines(width), width);
+                        lines.push(...text.map((line) => process.env.NO_COLOR == null ? line : line.replace(ANSI_PATTERN, "")));
+                        continue;
+                    }
                     if(item.label != null) {
                         // a heading right under another heading belongs to it: no blank line between
                         const previous = items[index - 1];
@@ -1314,8 +1345,9 @@ export class Prompter {
             }
             let body = lines;
             if(lines.length > height) {
+                if(followSelection == true) readingText = false;
                 const selectedOutside = activeEnd < scrollTop || activeStart >= scrollTop + height;
-                if(followSelection == true || selectedOutside == true) {
+                if(followSelection == true || (selectedOutside == true && readingText == false)) {
                     if(activeEnd - activeStart + 1 > height) {
                         // A long message starts at its title; its body is reached by scrolling.
                         scrollTop = activeStart;
@@ -1335,6 +1367,7 @@ export class Prompter {
             else {
                 scrollTop = 0;
             }
+            if(activeEnd >= scrollTop && activeStart < scrollTop + height) readingText = false;
             followSelection = false;
             anchorValue = valueAt(active);
             anchorStart = activeStart;
@@ -1362,6 +1395,9 @@ export class Prompter {
                     "←→ · Enter · Esc",
                     "Tab Enter Esc",
                 );
+            }
+            if(readingText == true) {
+                hints.splice(0, hints.length, "Enter returns to menu · Esc back", "Enter menu · Esc back", "Enter Esc");
             }
             let footer: string | undefined;
             if(scrollable == true) {
@@ -1403,6 +1439,7 @@ export class Prompter {
                     const frame = animation.frame();
                     if(frame.question != null) question = frame.question;
                     if(frame.tabs != null) tabs = frame.tabs;
+                    if(frame.preface != null) preface = frame.preface;
                 }
                 catch(error) { refreshError = error instanceof Error ? error.message : String(error); }
             }
@@ -1424,6 +1461,9 @@ export class Prompter {
                 items = next.items;
                 if(next.tabs != null) {
                     tabs = next.tabs;
+                }
+                if(next.preface != null) {
+                    preface = next.preface;
                 }
                 refreshError = null;
             }
@@ -1503,7 +1543,7 @@ export class Prompter {
 
                 // a row's text field takes typing before Esc, digits and j/k mean anything else
                 const field = (items[active] as SelectChoice<T>).input;
-                if(field != null) {
+                if(field != null && readingText == false) {
                     if(KEY_BACKSPACE.includes(key) == true) {
                         field.text = [...field.text].slice(0, -1).join("");
                         redraw();
@@ -1522,6 +1562,14 @@ export class Prompter {
                 }
 
                 if(KEY_ENTER.includes(key) == true) {
+                    if(readingText == true) {
+                        active = selectableIndexes[0];
+                        scrollTop = 0;
+                        followSelection = true;
+                        readingText = false;
+                        redraw();
+                        return;
+                    }
                     const picked = items[active] as SelectChoice<T>;
                     finish();
                     this.writeAnswered(question, picked.label);
@@ -1572,7 +1620,9 @@ export class Prompter {
                         scrollTop = Math.min(Math.max(0, bodyLineCount - viewportHeight), Math.max(0, scrollTop + step * Math.max(1, viewportHeight - 1)));
                         const row = bounds.get(active)!;
                         if(row.end < scrollTop || row.start >= scrollTop + viewportHeight) {
-                            active = selectableIndexes.find((index) => bounds.get(index)!.end >= scrollTop && bounds.get(index)!.start < scrollTop + viewportHeight) ?? active;
+                            const visible = selectableIndexes.find((index) => bounds.get(index)!.end >= scrollTop && bounds.get(index)!.start < scrollTop + viewportHeight);
+                            readingText = visible == null;
+                            if(visible != null) active = visible;
                         }
                     }
                 }

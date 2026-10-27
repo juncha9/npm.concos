@@ -29,6 +29,8 @@ export interface HookStatus {
 }
 
 const HOOK_COMMAND_PREFIX = "concos hook ";
+const SETTINGS_RENAME_RETRY_LIMIT_MS = 2000;
+const SETTINGS_RENAME_RETRY_DELAY_MS = 25;
 const CODEX_HOOK_TRUST_NOTE = "Codex runs new or changed hooks only after you trust them: open /hooks in Codex.";
 export const UPDATED_MESSAGE = "Registration updated. Sessions started from now on use it; restart running sessions to switch.";
 
@@ -845,7 +847,25 @@ function replaceSettings(file: string, before: string | null, after: string, rep
                 throw ex;
             }
         }
-        else fs.renameSync(temporary, file);
+        else {
+            const deadline = performance.now() + SETTINGS_RENAME_RETRY_LIMIT_MS;
+            const waitBuffer = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+            let delay = SETTINGS_RENAME_RETRY_DELAY_MS;
+            for(;;) {
+                try {
+                    fs.renameSync(temporary, file);
+                    break;
+                }
+                catch(error) {
+                    const remaining = deadline - performance.now();
+                    const code = (error as NodeJS.ErrnoException).code;
+                    if(["EPERM", "EACCES", "EBUSY"].includes(code ?? "") == false || remaining <= 0) throw error;
+                    Atomics.wait(waitBuffer, 0, 0, Math.min(delay, remaining));
+                    verifyUnchanged(file, before);
+                    delay *= 2;
+                }
+            }
+        }
         replaced?.();
     }
     finally { fs.rmSync(temporary, { force: true }); }

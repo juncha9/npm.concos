@@ -77,15 +77,13 @@ function fullyDeliveredMessageIds(toolName: string, result: unknown): number[] {
 }
 
 const SERVER_INSTRUCTIONS = [
-    "concos is one shared local waiting room for this user. Agents across projects leave their status and messages here; the folder each session started in identifies its project.",
-    "Call join once when you start a task, passing the absolute folder this session started in and, as display_name, this session's name exactly as the user set it (not a role). Keep the handle for resume_handle after a restart; use a supplied resume_handle when available. When you work in another folder, report it with check_in current_directory; your card stays with the project you started in.",
-    "Call check_in at task boundaries: when starting, after a meaningful step, when blocked, before waiting, and when asked about other agents. Messages reach you only through concos calls, so in long work check_in after each finished step as well. When the user gives you a role, report it in role, not task. Send only changed fields. Report status=working and editing claims while working; before yielding, report status=waiting and editing=[].",
-    "Answer messages with kind question. Use read_messages for the full text of a truncated message, and inspect_agent for another agent's detailed context.",
-    "A message to all is a post on your board in the room: others read it for reference and nobody is waited on. Post only what every agent needs to know, such as a change to a shared server or database; rewrite that post with edit when it changes, and take it down with remove_posts once it no longer applies. Send progress and results to the agents concerned, by agent_id or a list. Start a message with its content: the room already shows its sender and recipients.",
-    "Tag messages about one issue with snake_case topics, broad to narrow (webapp_login_redirect), so they group together; reuse a topic from similar_topics when it fits.",
-    "Messages are short-lived: one is deleted an hour after it was read, and within a day in any case. When an exchange settles a design, a decision, a contract or a plan, write it into the project's docs (the file that owns it) before you answer, and cite that path in the thread; durable project knowledge never lives only in messages.",
-    "Call leave when your task is done. Do not call check_in on a timer.",
-    "An inbox field on any response counts unread questions and other messages. A message whose full text reached you counts as received on your next call; use read_messages for truncated or unread ones.",
+    "concos is one local room shared across projects. Your card stays in the workspace where this session started.",
+    "Join at task start with the absolute starting folder and exact session name; resume a supplied handle. Use role for your standing assignment, task for current work, and current_directory when working elsewhere.",
+    "Call check_in after meaningful progress, when blocked, and when context is needed; send changed fields only. Keep summary and next_step current. Do not poll on a timer. If join says hooks_manage_status_and_editing, skip calls solely to mark waiting; otherwise report working/editing and, before yielding, waiting with editing=[].",
+    "Use read_messages for unread or truncated messages and inspect_agent for card details. Full texts count as received on your next call; inbox counts unread messages. has_more is available history, not an obligation to drain the room; fetch unread direct messages through read_messages.",
+    "Use question for requests needing answers; answer requests with reply and reply_to, including requests received as note. Send only requested results, substantive questions, blockers, or corrections. Do not send receipt confirmations, thanks, or restatements.",
+    "Send to concerned agents. to=all posts are for room-wide news, wake nobody, and wait on nobody; edit changed posts and remove obsolete ones. Reuse relevant snake_case topics. Start with the content, not your name.",
+    "Messages expire within a day; read ones can expire after an hour. Record settled decisions, contracts, and plans in their owning project docs and cite the path. Call leave when your task is done.",
 ].join("\n");
 
 const HANDLE_PROPERTY: ValueSchema = { type: "string", description: "Handle from join. Omit to use the last one joined in this session." };
@@ -155,7 +153,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "join",
-        description: "Join a room. Returns agent_id and handle; keep the handle for later calls and for resume_handle after a restart. merged_from, when present, is the card your session-start hook made: your earlier card of this name took it over, so use the agent_id returned.",
+        description: "Join a room; keep its handle for later calls and resume_handle. Rejoining restores full cards from the start of the room view, including after context loss. hooks_manage_status_and_editing appears only on hook-bound cards. merged_from identifies a hook card merged into the returned agent_id; use that agent_id.",
         inputSchema: inputSchema({
             display_name: { type: "string", minLength: 1, maxLength: MAX_DISPLAY_NAME_LENGTH, description: "This session's name as the user set it, verbatim (e.g. \"Dev / API 01\"). Not a role; put the role in check_in role. Rename later with check_in display_name." },
             client: { type: "string", minLength: 1, maxLength: MAX_CLIENT_LENGTH, description: "Your product, e.g. Claude Code, Codex." },
@@ -181,7 +179,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "check_in",
-        description: "Report your status and editing claims. The answer has `you` (your card's revision) and `room` (other agents' changes, messages to you, and new or edited posts since your last check_in). Empty strings clear a field; editing replaces the list. Before yielding, set status waiting and editing []. When room.has_more is set, call check_in again without cursor for the rest. A card with replaced_by belongs to a session that ended; messages to it reach that agent_id.",
+        description: "Report changed fields; receive you (your revision) and room changes. Empty strings clear fields; editing replaces the list. Cards with detail=status update only the included fields; keep prior content. Other cards replace the prior card. room.has_more is optional history; read unread messages with read_messages. A nonempty replaced_by redirects messages from an ended card to that agent_id.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },
@@ -197,7 +195,7 @@ export async function runBridge(): Promise<void> {
             current_directory: { type: "string", maxLength: MAX_PATH_LENGTH, description: "Absolute folder you work in now, when it is not the one this session started in; \"\" when you are back. Your card stays in its project." },
             received_message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Optional, up to ${MAX_RECEIVED_IDS}: messages you read. Full-text deliveries are acknowledged on your next call anyway.` },
             expected_revision: { ...ANY_INTEGER, description: "Reject the update if your card moved past this revision." },
-            cursor: { type: "string", description: "Omit to continue from the last delivered position; repeat a previous cursor to receive again." },
+            cursor: { type: "string", description: "Omit to continue from the last delivered position; set a previous cursor to replay with full cards." },
         }),
     }, (values) => runTool("check_in", () => {
         const args = values as {

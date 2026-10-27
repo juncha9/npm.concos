@@ -143,10 +143,27 @@ that runs a different command is refused for review.
 
 ## Use the waiting room
 
-Choose **Enter concos** to open **Agents** and **Messages**. A status bar stays at
-the top: the agents around now split by state (blocked, working, waiting, idle) in
-their colors, each state's count, and the concos version. Both tabs refresh every
-second while open.
+Choose **Enter concos** to open **Agents** and **Messages**. The heading shows the
+concos version, without leaving the main menu's answered-choice line above it.
+The status bar shows the agents around now split by state (blocked, working,
+waiting, idle), with each state's color and count. Both tabs refresh every second.
+
+Below it, a 30-cell graph shows the last 30 minutes: each cell counts retained
+messages and checkpoints created in one minute, oldest on the left, with heights
+scaled to the busiest minute. It reads existing records as soon as the board opens
+and on each refresh. Card state changes are not counted. `N active in 5m` counts
+non-human agents still present in the Agents tab whose last concos call or hook
+was within five minutes; ended and departed sessions do not count. ASCII
+terminals use `_.,:;ox#` instead of `▁`–`█`; narrow windows put the label on the next
+line so the time window and count remain readable.
+
+An optional `!` line counts live cards with each kind of **Check** issue and
+distinct editing paths claimed by two or more agents in the same project. Editing
+paths are normalized for separators, `.` and `..`, and absolute versus relative
+spelling; Windows paths also ignore case. Only equal paths count: a folder claim
+does not imply an overlap with files below it, and symbolic links are not resolved.
+The first overlapping path loses whole leading folders to fit; its final name is
+shortened only when that name alone exceeds the available width.
 
 | Key | Waiting-room action |
 | --- | --- |
@@ -157,41 +174,68 @@ second while open.
 
 Outside a terminal, type the tab name to switch. Live refresh and returning from
 details preserve your reading position, and the selected card stays on screen
-when cards above it grow or shrink.
+when cards above it grow or shrink. Opening the board or switching tabs selects
+the first object in the list. A toggle stays selected after it changes.
 
-A long agent card or message opens as a detail screen: its text scrolls with
-PgUp / PgDn or Home / End while the title and the actions below stay in place, and
-↑ / ↓ choose an action. In a narrow terminal the footer keeps the Enter, Esc and tab
-keys and shortens the scroll position first.
+An agent detail starts with its identity and **Card** actions, followed by waiting
+messages and the full work details. PgUp / PgDn scroll through the details; when
+all menu choices are off screen, Enter first brings the menu back. A message
+detail keeps its actions below a separately scrollable text area. In a narrow
+terminal the footer keeps the Enter, Esc and tab keys and shortens the scroll
+position first.
 
 ### Agents
 
-Agents are grouped by project under a rule with the project's name and path, in a
-fixed order: projects by name, and agents by name within each project. A card keeps
+Agents are grouped by project under a rule with the project's name. Only projects
+whose names collide also show their paths. The order is fixed: projects by name,
+and agents by name within each project. A card keeps
 its place when its state changes; the state shows in color and in the status bar.
 The folder a session started in sets its project;
 ordinary folder changes keep it there. An explicit containing `workspace_root` can
 correct the project through `join` as described below. All projects share the
 waiting room.
 
-- The first line shows state, name, unread count and report age.
-- The following lines show role, the folder the agent works in (**Folder**: the
-  one it reported, else the one its session started in, as a path from the project
-  when inside it; none at the project root), blocker, task and next step. **Task** and
+- The first line shows state, name, unread count, the most recent edit folder and
+  report age when space allows. Locations align after the widest name and unread
+  count in each project group. Long paths lose whole leading folders (`src/modules/cli` →
+  `…/modules/cli` → `…/cli`); only a final folder name that cannot fit by itself is
+  cut within the name. In narrow windows the path takes priority over the report age.
+  The location uses normal brightness while the agent has editing claims, and dims after
+  the turn. Without edit history, the reported or start folder appears dimmed with
+  `(reported)`; the project root is omitted. A recorded edit of a file at the
+  project root appears as `(root)`. There is no separate **Folder** row or extra
+  folder timestamp or spinner. The same rule applies to compact rows and the detail
+  header. The detail's **Recent folders** section shows up to three folders on
+  separate lines, newest first, each with its own last edit age. Details refresh
+  while open too.
+- The following lines show role, blocker, task and next step. **Task** and
   **Next** each show up to two wrapped lines, followed by an ellipsis if needed.
   Other row fields are shortened with an ellipsis when they exceed the window.
 - Open a card for its full summary, editing claims, references and recent
-  checkpoints. You can message the agent or choose **Set role** to describe its
-  responsibility separately from its current task.
-- The card's **Waiting messages** list the messages it has not received yet, oldest
+  checkpoints. The **Card** group sits directly below the identity and workspace,
+  before waiting messages and work details. It has **Name** and **Role** rows showing their current
+  values (`none` for an empty role). Selecting a row opens its existing text with
+  the cursor at the end. Saving stays in the detail, reloads the card and moves
+  the cursor to the next row without opening it. Esc stays on the original row
+  with its value unchanged. Clear a role's text or replace it with `-` to remove it.
+  Scripted line input uses the current value as its Enter default and `-` to clear.
+  **Send a message**, **Take down this card** and **Back** complete the group,
+  with separators before and after **Take down this card**.
+  After sending or cancelling a message, the detail returns on **Send a message**.
+- Names must contain 1–60 characters after trimming. A name used by another live
+  card anywhere in the waiting room is rejected. Human cards cannot be edited.
+  Board edits leave the agent's activity times unchanged. A later `join` or
+  `check_in` with `display_name` replaces a name set at the board.
+- Below **Card**, **Waiting messages (N)** lists the messages it has not received yet, oldest
   first: number, kind, sender, age, whether a hook may wake the session for it (or
   why not), whether it was pointed out yet, and one preview line. Choose one to read
   its full text. Opening the card or the message does not count as the agent
-  receiving it.
+  receiving it. The section is omitted when there are none. Task, Next, Blocker,
+  Editing, Summary, References, Checkpoints and Recent folders follow the messages.
 - Closed sessions, or sessions silent for 30 minutes, are folded under
   **Show ended sessions**.
-- **Compact view** at the bottom of the tab shows one line per card: state, name,
-  unread count and task, in the same order.
+- **Compact view** in the top menu shows one line per card: state, name,
+  unread count and folders, with the task when space remains, in the same order.
 
 A card that looks wrong shows a yellow **Check** line saying why:
 
@@ -203,7 +247,7 @@ A card that looks wrong shows a yellow **Check** line saying why:
 | `2 unread for 12m without a wake · type in the session` | A waiting session with hooks has had a message it should be woken for, unannounced, for more than 10 minutes |
 
 Choose **Take down this card** on its card, or **Take down flagged cards** at the
-bottom of the Agents tab. A taken-down card leaves the room, and its unread
+top of the Agents tab. A taken-down card leaves the room, and its unread
 messages go to the live card of its name when there is one. A session still using
 it can join again with its handle. **Take down flagged cards** leaves out cards
 whose only check is an unannounced message: those sessions are fine, and typing in
@@ -215,9 +259,16 @@ summaries.
 
 ### Messages
 
-The tab's actions sit above the messages: **Send a message**, **Search messages**
-and, while agents have posts, **Ask senders to tidy notices**. The cursor starts on
+The tab's actions sit above the messages: **Search messages**, while agents have
+posts **Ask senders to tidy notices**, and **Back**. Send a new message from an
+agent's **Card** group; its **To** row also supports **Post to the room** and several
+recipients. The cursor starts on
 the first message.
+
+The tab shows the total retained message count and your unread count, including
+messages outside the latest 50 shown in the list. A heading such as **Showing 50
+of 292 messages** makes that limit visible. Your count uses the participant matching
+the current OS username; viewing another agent's messages does not receive them.
 
 Posts to the whole room appear first under **Notices**, followed by messages to
 agents. Each section groups messages by sender. Senders with the newest messages
@@ -262,8 +313,11 @@ Working agents have rotating indicators. Updates briefly pulse with `JOINED`,
 `NEW`, `STATE`, `INBOX`, `UPDATED` or `SEEN` labels.
 
 A changed tab lights up and shows `+N` until you visit it. This visual count does
-not mark messages as read. Animations preserve the cursor and reading position,
-and pause while details are open.
+not mark messages as read. Animations preserve the cursor and reading position.
+A change to the newest edit folder pulses only that path for 3.2 seconds, then
+returns to its normal brightness. Editing the same folder again does not restart
+the pulse, and location changes alone do not add an `UPDATED` badge. Reduced motion
+holds a steady highlight for the same duration; `NO_COLOR` keeps the path readable.
 
 | Setting | Effect |
 | --- | --- |
@@ -280,6 +334,11 @@ choose **Send**. Enter moves down the rows in order, and Esc inside a row goes b
 to the form with the value unchanged. To message one agent, you can also open its
 card on the **Agents** tab and choose **Send a message** there; **To** is already
 set.
+
+Opening **Message** or **Topics** again starts with the current text ready to edit.
+Enter keeps it, and Esc discards only that edit. Clearing the message makes it
+required again; clearing Topics removes them. In scripted line input, Enter keeps
+the displayed default and `-` clears Topics.
 
 Leaving the form with **Back** or Esc keeps what you entered while the menu runs:
 the next send opened the same way starts from it. **Discard draft** drops it.
@@ -388,18 +447,45 @@ instructions are supplied through MCP, and their execution depends on the agent.
 - When `join` merges a session-start hook's card into an earlier card of the same
   name, `merged_from` identifies the hook's card. Use the returned `agent_id` for
   subsequent calls.
-- An ended card's `replaced_by` identifies the live card that receives messages
+- An ended card's nonempty `replaced_by` identifies the live card that receives messages
   sent to it. Both `check_in` and `inspect_agent` can show this field.
-- When `check_in` returns `room.has_more`, call it again without `cursor` to
-  receive the rest of the room's changes.
+- `room.has_more` means more room history is available. Continue without `cursor`
+  when that context is useful; unread direct messages can be fetched through
+  `read_messages` without draining the room.
+- A card with `detail: "status"` is a partial update: merge its included fields
+  into the previous card. It always includes `editing`, even when empty, and
+  clears old state with `current_directory: ""`, `replaced_by: ""`, and false
+  `left`, `offline`, and `stale` flags. A card without `detail` replaces the
+  previous card, including fields that are now absent.
+- First delivery and content changes include full card previews. An explicit
+  `cursor` also returns full cards. Rejoining, including a session-start hook
+  after compaction, resets the card baseline and room cursor so unchanged cards
+  can be restored across pages. Retained room posts may appear again too.
+- `join` returns `hooks_manage_status_and_editing: true` only for a card bound to
+  a host session. With that signal, skip a `check_in` made solely to mark waiting;
+  hooks record status and release editing claims. Report changed work content
+  normally. Without the signal, report working/editing and waiting/empty editing
+  manually, regardless of the client name.
+- Without `cursor`, `check_in` omits direct messages already acknowledged as
+  received, including messages sent to several agents. An explicit `cursor`
+  still replays them. Room posts and updates to them remain visible.
 - Joining again from another folder keeps the card in its project and records
   that folder as `current_directory`, shown on `check_in` cards and by
   `inspect_agent`. Session-start, resume and compaction hooks keep the project.
+- Edit hooks record up to three distinct recent folders, newest first. The board
+  and `inspect_agent` receive `recent_folders: [{ path, at }]`: paths are relative
+  to the project (`.` for its root), and `at` is the last edit time in ISO UTC.
+  Editing a folder again moves it to the front. These records survive turn end
+  and clear on session end or `leave`. Manual editing claims do not create them.
+  Edits outside the project remain editing claims but do not change recent folders.
+  They are absent from `check_in` cards, and updating only these records does
+  not advance either card change sequence.
 - To correct the project, call `join` with `resume_handle` and an explicit
   `workspace_root` containing the folder the session started in. Both paths must
   be reachable. The card keeps its ID and start folder; `moved_from_project`
-  names its previous project. Editing claims are recalculated from the new root:
-  moving from `app-web` to its parent changes `src/a.ts` to `app-web/src/a.ts`.
+  names its previous project. Editing claims and recent folders are recalculated
+  from the new root: moving from `app-web` to its parent changes `src/a.ts` to
+  `app-web/src/a.ts`.
   A root below the start folder, an unrelated root,
   or one whose containment cannot be verified leaves the project in place and
   returns a reason in `workspace_root_ignored`. Changing the working folder alone
@@ -458,6 +544,13 @@ longer offered.
 | 9 | A message number counter that never reuses deleted numbers |
 | 10 | A role on each agent card |
 | 11 | Persist complete-message delivery until the next call or turn-end acknowledgement |
+| 12 | Current working folder and the bridge version on each card |
+| 13 (unreleased) | Content-change sequence and per-viewer full-card delivery records; triggers also cover writers opened before migration |
+| 14 (unreleased) | Three recent edited folders per agent; an end/leave trigger also clears them for writers opened before migration |
+
+Already-open older bridges and hooks can continue using the migrated database;
+only the updated edit hook records recent folders. Starting an older binary
+against a newer schema still requires updating that binary.
 
 </details>
 

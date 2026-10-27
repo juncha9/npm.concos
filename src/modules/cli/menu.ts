@@ -247,7 +247,7 @@ interface SendReply {
 
 /** The send form's values. One unsent draft is kept while the menu runs, for the next send opened the same way. */
 interface SendDraft {
-    /** How the form was opened: "" from the Messages tab, an agent id from its card, `reply:<id>` as an answer. */
+    /** The source card's agent id, or `reply:<id>` when answering a message. */
     origin: string;
     /** "all", or the agent ids picked */
     to: string[];
@@ -262,7 +262,7 @@ async function showStatus(prompter: Prompter, options: MenuOptions, drafts: { sa
         language: "en", columns: output.columns,
         color: input.isTTY == true && output.isTTY == true && process.env.NO_COLOR == null,
         unicode: supportsUnicode(),
-        send: (agentId?: string, reply?: SendReply) => sendFromMenu(prompter, drafts, agentId, reply),
+        send: (agentId: string, reply?: SendReply) => sendFromMenu(prompter, drafts, agentId, reply),
     });
 }
 
@@ -317,30 +317,20 @@ async function pickRecipients(
  * sending keeps the draft for the next send opened the same way. `presetTo` fills To, for sends
  * started from an agent's card; `reply` makes the message an answer to the one read.
  */
-async function sendFromMenu(prompter: Prompter, drafts: { saved: SendDraft | null }, presetTo?: string, reply?: SendReply): Promise<void> {
+async function sendFromMenu(prompter: Prompter, drafts: { saved: SendDraft | null }, presetTo: string, reply?: SendReply): Promise<void> {
     const room = (await readRoomOverviews())[0];
     // ended sessions are not offered: nothing reads their messages unless the session comes back
     const activeAgents = (room?.agents ?? []).filter((agent) => !agent.human && !agent.left && !agent.ended);
-    if(presetTo == null && activeAgents.length == 0) {
-        if(room == null || !room.agents.some((agent) => !agent.human)) {
-            prompter.write("\nNo agents have joined yet. Register MCP, then start a task in your client.\n");
-        }
-        else {
-            prompter.write("\nNo agent is active right now. Ended sessions are on the Agents tab, under Show ended sessions.\n");
-        }
-        await prompter.pause();
-        return;
-    }
     const nameOf = (agentId: string) => {
         const agent = room?.agents.find((agent) => agent.agent_id == agentId);
         return agent == null ? agentId : participantName(agent.name, agent.client, agent.human);
     };
 
-    let origin = presetTo ?? "";
+    let origin = presetTo;
     if(reply != null) {
         origin = `reply:${reply.messageId}`;
     }
-    const fresh: SendDraft = { origin: origin, to: presetTo == null ? [] : [presetTo], text: "", topics: reply?.topics ?? [] };
+    const fresh: SendDraft = { origin: origin, to: [presetTo], text: "", topics: reply?.topics ?? [] };
     let draft: SendDraft = { ...fresh };
     if(drafts.saved != null && drafts.saved.origin == origin) {
         draft = { ...drafts.saved };
@@ -427,24 +417,22 @@ async function sendFromMenu(prompter: Prompter, drafts: { saved: SendDraft | nul
                     }
                 }
                 else if(row == "message") {
-                    const typed = await prompter.ask(draft.text === "" ? "Message" : "Message (Enter keeps the current text)");
+                    const typed = await prompter.ask("Message", { initialValue: draft.text });
                     if(typed.length > MAX_MESSAGE_LENGTH) {
                         problem = { row: "message", text: `At most ${MAX_MESSAGE_LENGTH} characters` };
                     }
                     else {
-                        if(typed !== "") {
-                            draft.text = typed;
-                        }
+                        draft.text = typed;
                         cursor = "topics";
                     }
                 }
                 else if(row == "topics") {
-                    let question = "Topics (snake_case, comma-separated; Enter for none)";
-                    if(draft.topics.length > 0) {
-                        question = "Topics (snake_case, comma-separated; Enter keeps them, - for none)";
+                    let question = "Topics (snake_case, comma-separated; clear for none)";
+                    if(prompter.isInteractive == false) {
+                        question = "Topics (snake_case, comma-separated; - for none)";
                     }
-                    const typed = await prompter.ask(question);
-                    if(typed == "-") {
+                    const typed = await prompter.ask(question, { initialValue: draft.topics.join(", ") });
+                    if(typed == "-" || typed == "") {
                         draft.topics = [];
                     }
                     else if(typed !== "") {
@@ -517,13 +505,23 @@ export async function runMenu(options: MenuOptions): Promise<void> {
                     update = options.selfUpdate === false ? null : await checkForSelfUpdate(options.selfUpdate);
                 }
                 // the board first, where the cursor starts: registering is done once (2026-10-26 user decision)
-                const action: "setup" | "status" | "update" | "quit" = startWithSetup ? "setup" : await prompter.select("concos · Shared waiting room", [
-                    { value: "status", label: "Enter concos", hint: "Agents · Messages" },
-                    { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
-                    ...(update != null ? [{ value: "update" as const, label: "Update concos", hint: `${update.currentVersion} → ${update.latestVersion}` }] : []),
-                    { separator: true },
-                    { value: "quit", label: "Quit" },
-                ], { defaultValue: selected, cancelValue: "quit" });
+                let action: "setup" | "status" | "update" | "quit" = "setup";
+                if(startWithSetup == false) {
+                    const previousTransient = prompter.transient;
+                    prompter.transient = true;
+                    try {
+                        action = await prompter.select("concos · Shared waiting room", [
+                            { value: "status", label: "Enter concos", hint: "Agents · Messages" },
+                            { value: "setup", label: "Register MCP", hint: "Set up once for this user" },
+                            ...(update != null ? [{ value: "update" as const, label: "Update concos", hint: `${update.currentVersion} → ${update.latestVersion}` }] : []),
+                            { separator: true },
+                            { value: "quit", label: "Quit" },
+                        ], { defaultValue: selected, cancelValue: "quit" });
+                    }
+                    finally {
+                        prompter.transient = previousTransient;
+                    }
+                }
                 startWithSetup = false;
                 if(action == "quit") return;
                 selected = action;

@@ -198,10 +198,10 @@ describe("room menu", () => {
         database.close();
 
         const output = await menu("status\nServer\nback\nback\nquit\n");
-        // the status bar under the question: the bar, the counts and this concos's version
-        expect(output).toMatch(/\? Waiting room\n {2}(▓|!){16} {2}1 blocked {2}· {2}concos \d+\.\d+\.\d+\n/);
-        expect(output).toContain("[Agents 1]  Messages 0");
-        expect(output).toMatch(/1\) blocked +Server \(Codex\) · just now/);
+        expect(output).toMatch(/\? Waiting room · concos \d+\.\d+\.\d+\n {2}(▓|!){16} {2}1 blocked\n/);
+        expect(output).toContain("[Agents 1]  Messages 0 · 0 for you");
+        expect(output).not.toMatch(/[✔√] concos · Shared waiting room/);
+        expect(output).toMatch(/3\) blocked +Server \(Codex\) · just now/);
         expect(output).toMatch(/ {10}Blocker  needs schema review/);
         expect(output).toMatch(/ {10}Task     message storage/);
         expect(output).toContain(agent.agent_id);
@@ -267,11 +267,12 @@ describe("room menu", () => {
         database.close();
 
         const output = await menu("status\nback\nquit\n");
-        expect(output).toContain(`${path.basename(directory)}  ${directory}`);
-        expect(output).toMatch(/ {10}Folder {3}docs-repo\n +Task {5}design notes/);
+        expect(output).toContain(`  ${path.basename(directory)}\n`);
+        expect(output).toMatch(/Server \(Codex\) +docs-repo \(reported\) · just now\n +Task {5}design notes/);
+        expect(output).not.toContain("Folder");
     });
 
-    it("shows where an agent works from its project's root: its start folder when inside, nothing at the root", async () => {
+    it("shows a reported subfolder next to the name and hides the project root", async () => {
         const docs = path.join(directory, "docs-repo");
         fs.mkdirSync(docs);
         const database = await openDatabase(path.join(directory, "data"));
@@ -279,7 +280,7 @@ describe("room menu", () => {
         // a session that started in a folder inside its project, as cards from before 0.1.11 can be
         const agent = store.join({ room: "main", displayName: "Server", client: "Codex", workingDirectory: docs, workspaceRoot: directory, resumeHandle: null });
         database.close();
-        expect(await menu("status\nback\nquit\n")).toMatch(/ {10}Folder {3}docs-repo\n/);
+        expect(await menu("status\nback\nquit\n")).toContain("docs-repo (reported)");
 
         // then it moves up to the project root, which the project heading already names
         const again = await openDatabase(path.join(directory, "data"));
@@ -289,6 +290,7 @@ describe("room menu", () => {
         again.close();
         const atRoot = await menu("status\nback\nquit\n");
         expect(atRoot).toContain("Server (Codex)");
+        expect(atRoot).not.toContain("(reported)");
         expect(atRoot).not.toContain("Folder");
     });
 
@@ -300,9 +302,9 @@ describe("room menu", () => {
         });
         database.close();
 
-        const output = await menu("status\nServer\nrole\nreview owner\nback\nquit\n");
+        const output = await menu("status\nServer\nrole\nreview owner\nback\nback\nquit\n");
         expect(output).toMatch(/ {10}Role {5}storage owner\n +Task {5}message storage/);
-        expect(output).toContain("Role (Enter keeps it, - clears it)");
+        expect(output).toContain("Role (- to remove)");
         expect(output).toMatch(/ {10}Role {5}review owner/);
         const check = await openDatabase(path.join(directory, "data"));
         try {
@@ -350,11 +352,12 @@ describe("room menu", () => {
         // the tab's actions take rows 1 and 2, above the messages; the detail's own Back returns to the tab
         const output = await menu("status\nmessages\n3\nback\nback\nquit\n");
         expect(output).toContain("Server (Codex) (1 unread)");
-        expect(output).toContain(" Agents 1  [Messages 1]");
-        expect(output).toMatch(/1\) Send a message +to all, several agents or one\n[^\n]*2\) Search messages/);
+        expect(output).toContain(" Agents 1  [Messages 1 · 0 for you]");
+        expect(output).toMatch(/1\) Search messages +by text, topic or sender\n[^\n]*2\) Back/);
+        expect(output).not.toContain("Send a message");
         expect(output).toMatch(/\n {2}Reviewer {2}1 message\n/);
         expect(output).toMatch(/3\) #1 QUESTION {2}(→|->) Server \(Codex\) +just now · Pending Server/);
-        const list = output.slice(output.indexOf("[Messages 1]"), output.indexOf("From  Reviewer"));
+        const list = output.slice(output.indexOf("[Messages 1 · 0 for you]"), output.indexOf("From  Reviewer"));
         // two preview lines, the second ending in an ellipsis
         expect(list).toMatch(/ {2}First line\n +Second line with details(…|\.\.\.)\n/);
         expect(list).not.toContain("Original message text");
@@ -392,12 +395,12 @@ describe("room menu", () => {
         }
         await running;
 
-        expect(frames[0]).toContain("[Messages 1]");
+        expect(frames[0]).toContain("[Messages 1 · 0 for you]");
         expect(frames[0]).toContain("Reviewer");
         expect(frames[0]).toContain("preview text visible in the list");
         expect(frames[0]).toContain("←→ tab");
         // Esc after reading the whole message returned to the Messages tab, not the main menu
-        expect(frames[1]).toContain("[Messages 1]");
+        expect(frames[1]).toContain("[Messages 1 · 0 for you]");
         expect(frames[2]).toContain("[Agents 1]");
         expect(frames[2]).toContain("Server");
         expect(frames[2]).not.toContain("preview text visible in the list");
@@ -411,41 +414,150 @@ describe("room menu", () => {
 
     it("sends a message from an agent's card with the recipient already filled in", async () => {
         const agent = await seedRoom();
-        const output = await menu(`status\nServer\nsay\nmessage\nPlease review this change\nsend\nback\nquit\n`);
+        const output = await menu(`status\nServer\nsay\nmessage\nPlease review this change\nsend\nback\nback\nquit\n`);
         expect(output).not.toContain("? Recipient");
         expect(output).toContain(`To       Server (Codex) (${agent.agent_id})`);
         expect(await storedMessages()).toMatchObject([{ recipient_agent_id: agent.agent_id, kind: "note" }]);
     });
 
-    it("fills the send form row by row from the Messages tab, Enter following the rows in order", async () => {
+    it("prefills message fields on a terminal and returns to the current card without answer lines", async () => {
         const agent = await seedRoom();
-        // Enter picks the row the cursor moved to: To, then Message, then Topics (none), then Send
-        const output = await menu(`status\nmessages\nsend\n\n${agent.agent_id}\n\n검증 메시지\n\n\n\nback\nquit\n`);
+        const rawModes: boolean[] = [];
+        const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: (mode: boolean) => rawModes.push(mode) });
+        const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 30 });
+        const screen = new TerminalScreen(80, 30);
+        screen.write("C:\\work>concos\n");
+        output.on("data", (chunk) => screen.write(chunk.toString()));
+        const running = runMenu({ input, output, home: path.join(directory, "user"), selfUpdate: false });
+        void running.catch(() => undefined);
+        const visible = () => screen.visible().join("\n");
+        const key = async (value: string) => {
+            input.write(value);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        };
+        try {
+            await vi.waitFor(() => expect(visible()).toContain("Enter concos"));
+            await key("\r");
+            await vi.waitFor(() => expect(visible()).toContain("[Agents 1]"));
+            expect(visible()).not.toMatch(/[✔√] concos/);
+            await key("\r");
+            await key("3");
+            await key("\r");
+            await vi.waitFor(() => expect(visible()).toContain("? New message"));
+            await key("\r");
+            await key("Original body");
+            await key("\r");
+            await key("\r");
+            await key("concos_ui");
+            await key("\r");
+
+            await key("2");
+            await key("\r");
+            expect(visible()).toContain("? Message Original body");
+            await key("!");
+            await key("\u001b");
+            expect(visible()).toMatch(/[>❯] Message\s+Original body/);
+            expect(visible()).not.toContain("Original body!");
+            await key("\r");
+            await key("!");
+            await key("\r");
+            expect(visible()).toContain("Original body!");
+            expect(visible()).toMatch(/[>❯] Topics/);
+
+            await key("\r");
+            expect(visible()).toContain("clear for none) concos_ui");
+            await key(", concos_board");
+            await key("\u001b");
+            expect(visible()).toMatch(/[>❯] Topics\s+concos_ui/);
+            expect(visible()).not.toContain("concos_board");
+            await key("\r");
+            await key("\u0015");
+            await key("\r");
+            expect(visible()).toMatch(/Topics\s+none/);
+
+            await key("2");
+            await key("\r");
+            await key("\u0015");
+            await key("\r");
+            expect(visible()).toMatch(/Message\s+\(required\)/);
+            await key("4");
+            await key("\r");
+            expect(visible()).toMatch(/[>❯] Message.*Write the message/);
+            expect(await storedMessages()).toHaveLength(0);
+            await key("\r");
+            await key("Final body");
+            await key("\r");
+            await key("\r");
+            await key("\r");
+            await key("\r");
+            await vi.waitFor(() => expect(visible()).toContain("1 recipient(s)"));
+            await key("\r");
+            await vi.waitFor(() => expect(visible()).toContain("? Server (Codex)"));
+            expect(visible()).toMatch(/[>❯] Send a message/);
+            expect(visible()).toContain("Final body");
+            expect(visible()).not.toContain("stored · Room");
+            expect(visible()).not.toMatch(/[✔√]/);
+            expect(await storedMessages()).toMatchObject([{ recipient_agent_id: agent.agent_id, body: "Final body" }]);
+            const check = await openDatabase(path.join(directory, "data"));
+            try {
+                expect(check.prepare("SELECT topic_key FROM message_topic").all()).toEqual([]);
+            }
+            finally {
+                check.close();
+            }
+        }
+        finally {
+            input.end();
+            await running;
+        }
+        expect(rawModes.at(-1)).toBe(false);
+        expect(input.listenerCount("data")).toBe(0);
+    });
+
+    it("keeps prefilled message and topic values on Enter in line mode and removes topics with a dash", async () => {
+        await seedRoom();
+        const output = await menu("status\nServer\nsay\nmessage\nBody\ntopics\nconcos_ui\nmessage\n\ntopics\n\ntopics\n-\nsend\nback\nback\nquit\n");
+        expect(output).toContain("? Message (Body)");
+        expect(output).toContain("? Topics (snake_case, comma-separated; - for none) (concos_ui)");
+        expect(await storedMessages()).toMatchObject([{ body: "Body" }]);
+        const check = await openDatabase(path.join(directory, "data"));
+        try {
+            expect(check.prepare("SELECT topic_key FROM message_topic").all()).toEqual([]);
+        }
+        finally {
+            check.close();
+        }
+    });
+
+    it("fills the send form from the agent card, Enter following the rows in order", async () => {
+        const agent = await seedRoom();
+        // The card supplies To; Enter follows Message, Topics and Send.
+        const output = await menu("status\nServer\nsay\n\n검증 메시지\n\n\n\nback\nback\nquit\n");
         expect(output).toContain("? New message");
         expect(output).toContain("1 recipient(s)");
         expect(await storedMessages()).toMatchObject([{ recipient_agent_id: agent.agent_id, kind: "note", body: "검증 메시지" }]);
     });
 
     it("keeps an unsent draft for the next send, and drops it only when asked", async () => {
-        const agent = await seedRoom();
-        const kept = await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\n초안 메시지\nback\nsend\nsend\nback\nquit\n`);
+        await seedRoom();
+        const kept = await menu("status\nServer\nsay\nmessage\n초안 메시지\nback\nsay\nsend\nback\nback\nquit\n");
         expect(kept).toContain("Keeps the draft for the next send");
         // the second form opened with the draft, its cursor on Send
         expect(kept.slice(kept.lastIndexOf("? New message"))).toContain("초안 메시지");
         expect(await storedMessages()).toMatchObject([{ body: "초안 메시지" }]);
 
-        await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\n버릴 메시지\nback\nsend\ndiscard\ny\nback\nquit\n`);
+        await menu("status\nServer\nsay\nmessage\n버릴 메시지\nback\nsay\ndiscard\ny\nback\nback\nquit\n");
         expect(await storedMessages()).toHaveLength(1);
     });
 
     it("goes back to the form, the value unchanged, when Esc is pressed inside an edit", async () => {
-        const agent = await seedRoom();
-        const output = await menu(`status\nmessages\nsend\nto\n${agent.agent_id}\nmessage\nESC\nback\nback\nquit\n`);
+        await seedRoom();
+        const output = await menu("status\nServer\nsay\nmessage\nESC\nback\nback\nback\nquit\n");
         // the form again after the Message prompt, still waiting for the text
         const afterEsc = output.slice(output.indexOf("? Message"));
         expect(afterEsc).toContain("? New message");
         expect(afterEsc).toMatch(/Message\s+\(required\)/);
-        expect(output.lastIndexOf("[Messages 0]")).toBeGreaterThan(output.indexOf("? Message"));
+        expect(output.lastIndexOf("? Server (Codex)")).toBeGreaterThan(output.indexOf("? Message"));
         expect(await storedMessages()).toHaveLength(0);
     });
 
@@ -469,7 +581,7 @@ describe("room menu", () => {
 
     it("names a message to all a post to the room, which notifies nobody", async () => {
         await seedRoom();
-        const output = await menu("status\nmessages\nsend\nto\nall\nmessage\nRelease freeze starts at 18:00\nsend\nback\nquit\n");
+        const output = await menu("status\nServer\nsay\nto\nall\nmessage\nRelease freeze starts at 18:00\nsend\nback\nback\nquit\n");
         expect(output).toContain("Post to the room");
         expect(output).toContain("Agents see it on check_in; nobody is notified");
         expect(output).not.toContain("All agents");
@@ -486,7 +598,7 @@ describe("room menu", () => {
         join("Third");
         database.close();
 
-        const output = await menu("status\nmessages\nsend\nto\nseveral\nFirst\nSecond\ndone\nmessage\nreview the board\ntopics\nboard\ntopics\nConcos board, concos-ui\nsend\nback\nquit\n");
+        const output = await menu("status\nFirst\nsay\nto\nseveral\nFirst\nSecond\ndone\nmessage\nreview the board\ntopics\nboard\ntopics\nConcos board, concos-ui\nsend\nback\nback\nquit\n");
         expect(output).toContain("Recipients · First (Codex), Second (Codex)");
         expect(output).toContain(`topic "board" must be`);
         expect(output).toContain(`First (Codex) (${first.agent_id}), Second (Codex) (${second.agent_id})`);
@@ -527,11 +639,11 @@ describe("ended sessions on the board", () => {
         const { database } = await seedWithEnded();
         database.close();
         const output = await menu("status\nended\nback\nquit\n");
-        const firstBoard = output.slice(output.indexOf("? Waiting room"), output.indexOf("Show ended sessions (1)"));
+        const firstBoard = output.slice(output.indexOf("? Waiting room"), output.indexOf("? Waiting room", output.indexOf("? Waiting room") + 1));
         expect(firstBoard).toContain("[Agents 1]");
         expect(firstBoard).toContain("Live");
         expect(firstBoard).not.toContain("Gone");
-        const expanded = output.slice(output.indexOf("Show ended sessions (1)"));
+        const expanded = output.slice(output.indexOf("Hide ended sessions (1)"));
         expect(expanded).toContain("Ended sessions");
         expect(expanded).toContain("Gone");
         expect(expanded).toContain("Hide ended sessions");
@@ -540,12 +652,12 @@ describe("ended sessions on the board", () => {
     it("offers only active agents as recipients and says when a picked card's session has ended", async () => {
         const { database, gone } = await seedWithEnded();
         database.close();
-        const listed = await menu("status\nmessages\nsend\nto\nback\nback\nback\nquit\n");
+        const listed = await menu("status\nLive\nsay\nto\nback\nback\nback\nback\nquit\n");
         const recipients = listed.slice(listed.indexOf("? Recipient"), listed.indexOf("? New message", listed.indexOf("? Recipient")));
         expect(recipients).toContain("Live");
         expect(recipients).not.toContain("Gone");
 
-        const fromCard = await menu("status\nended\nGone\nsay\nmessage\nhello later\nsend\nback\nquit\n");
+        const fromCard = await menu("status\nended\nGone\nsay\nmessage\nhello later\nsend\nback\nback\nquit\n");
         expect(fromCard).toContain(`Gone (Codex) (${gone.agent_id})`);
         expect(fromCard).toContain("A recipient's session has ended; it reads this only if that session comes back.");
     });
@@ -580,7 +692,7 @@ describe("ended sessions on the board", () => {
         database.close();
 
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 2]"));
+        const list = output.slice(output.indexOf("[Messages 2 · 0 for you]"));
         expect(list).toContain("still open");
         expect(list).toContain("  Live (Codex)  2 messages");
         expect(list).toMatch(/QUESTION {2}(→|->) Other \(Codex\)/);
@@ -597,7 +709,7 @@ describe("ended sessions on the board", () => {
         database.close();
 
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 1]"));
+        const list = output.slice(output.indexOf("[Messages 1 · 0 for you]"));
         expect(list).toContain("already handled");
         expect(list).not.toContain("Pending");
         expect(list).not.toContain("No messages.");
@@ -653,7 +765,7 @@ describe("message groups on the board", () => {
     it("groups messages by sender, the sender of the newest message first", async () => {
         await seedMessages([["Alpha", []], ["Beta", []], ["Alpha", []]]);
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 3]"));
+        const list = output.slice(output.indexOf("[Messages 3 · 0 for you]"));
         expect(headings(list)).toEqual(["  Alpha (Codex)  2 messages", "  Beta (Codex)  1 message"]);
         // newest first within a group
         expect(list.indexOf("message 2")).toBeLessThan(list.indexOf("message 0"));
@@ -662,7 +774,7 @@ describe("message groups on the board", () => {
     it("shows every topic a message carries on its row", async () => {
         await seedMessages([["Alpha", ["concos_release"]], ["Alpha", ["concos_board", "concos_ui"]], ["Alpha", []]]);
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 3]"));
+        const list = output.slice(output.indexOf("[Messages 3 · 0 for you]"));
         expect(list).toContain("Topics concos_release");
         expect(list).toContain("Topics concos_board, concos_ui");
         expect(list.match(/Topics /g)).toHaveLength(2);
@@ -680,7 +792,7 @@ describe("message groups on the board", () => {
         database.close();
 
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 2]"));
+        const list = output.slice(output.indexOf("[Messages 2 · 0 for you]"));
         expect(list).toContain("\n  Notices\n\n  Poster (Codex)  1 post\n");
         expect(list).toMatch(/#2 NOTICE +edited just now\n +server is back\n/);
         expect(list.indexOf("server is back")).toBeLessThan(list.indexOf("\n  Messages\n"));
@@ -743,7 +855,7 @@ describe("message groups on the board", () => {
             ["Alpha", [], "[Alpha]"],
         ]);
         const output = await menu("status\nmessages\nback\nquit\n");
-        const list = output.slice(output.indexOf("[Messages 4]"));
+        const list = output.slice(output.indexOf("[Messages 4 · 0 for you]"));
         expect(list).toMatch(/\n +build is green\n/);
         expect(list).toMatch(/\n +schema frozen\n/);
         expect(list).not.toContain("Reader]");
@@ -757,7 +869,7 @@ describe("message groups on the board", () => {
         const output = await menu("status\nmessages\nsearch\nback\nback\nquit\n");
         expect(output).toMatch(/\d+\) Search messages +by text, topic or sender/);
         expect(output).toContain("Search messages by");
-        expect(output.lastIndexOf("[Messages 1]")).toBeGreaterThan(output.indexOf("Search messages by"));
+        expect(output.lastIndexOf("[Messages 1 · 0 for you]")).toBeGreaterThan(output.indexOf("Search messages by"));
     });
 
     it("searches message text typed straight into the Search messages row on a terminal", async () => {
@@ -775,9 +887,9 @@ describe("message groups on the board", () => {
         output.on("data", (chunk) => { screen += chunk.toString(); });
         const running = runMenu({ input, output, home: path.join(directory, "user"), selfUpdate: false });
         const frames: string[] = [];
-        // menu: Enter concos; board: Tab to Messages, 2 to the search row, type, Enter; results: Esc;
+        // menu: Enter concos; board: Tab to Messages, 1 to the search row, type, Enter; results: Esc;
         // board: Esc clears the query kept in the row, Esc leaves; menu: Esc
-        for(const key of ["1", "\r", "\t", "2", "n", "e", "e", "d", "l", "e", "SNAP", "\r", "SNAP", "\u001b", "SNAP", "\u001b", "\u001b", "\u001b"]) {
+        for(const key of ["1", "\r", "\t", "1", "n", "e", "e", "d", "l", "e", "SNAP", "\r", "SNAP", "\u001b", "SNAP", "\u001b", "\u001b", "\u001b"]) {
             await new Promise((resolve) => setTimeout(resolve, 30));
             if(key == "SNAP") {
                 frames.push(screen.slice(screen.lastIndexOf("\u001b[J") + 3).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, ""));
