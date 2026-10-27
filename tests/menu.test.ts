@@ -201,8 +201,10 @@ describe("room menu", () => {
         expect(output).toMatch(/\? Waiting room · concos \d+\.\d+\.\d+\n {2}(▓|!){16} {2}1 blocked\n/);
         expect(output).toContain("[Agents 1]  Messages 0 · 0 for you");
         expect(output).not.toMatch(/[✔√] concos · Shared waiting room/);
-        expect(output).toMatch(/3\) blocked +Server \(Codex\) · just now/);
-        expect(output).toMatch(/ {10}Blocker  needs schema review/);
+        // the tab's actions above the cards now include Wake all sessions
+        expect(output).toMatch(/4\) blocked +Server \(Codex\) · just now/);
+        // the blocker shows how long it has been set
+        expect(output).toMatch(/ {10}Blocker  now · needs schema review/);
         expect(output).toMatch(/ {10}Task     message storage/);
         expect(output).toContain(agent.agent_id);
         expect(output).toContain("Stored messages; retry dedupe remains.");
@@ -268,7 +270,8 @@ describe("room menu", () => {
 
         const output = await menu("status\nback\nquit\n");
         expect(output).toContain(`  ${path.basename(directory)}\n`);
-        expect(output).toMatch(/Server \(Codex\) +docs-repo \(reported\) · just now\n +Task {5}design notes/);
+        // the folder and time follow the name with no padding between them
+        expect(output).toMatch(/Server \(Codex\) · docs-repo \(reported\) · just now\n +Task {5}design notes/);
         expect(output).not.toContain("Folder");
     });
 
@@ -441,7 +444,9 @@ describe("room menu", () => {
             await vi.waitFor(() => expect(visible()).toContain("[Agents 1]"));
             expect(visible()).not.toMatch(/[✔√] concos/);
             await key("\r");
-            await key("3");
+            // the card opens on Name, whose field now takes digits: two rows down is Send a message
+            await key("\u001b[B");
+            await key("\u001b[B");
             await key("\r");
             await vi.waitFor(() => expect(visible()).toContain("? New message"));
             await key("\r");

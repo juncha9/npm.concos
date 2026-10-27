@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { Prompter, PromptBackError, PromptClosedError, displayWidth } from "../src/modules/cli/prompter";
+import { Prompter, PromptBackError, PromptClosedError, displayWidth, supportsUnicode } from "../src/modules/cli/prompter";
 import { TerminalScreen } from "./terminal-screen";
 
 function terminal() {
@@ -21,6 +21,20 @@ async function press(input: PassThrough, keys: string[]) {
         await new Promise((resolve) => setImmediate(resolve));
     }
 }
+
+describe("terminal symbols", () => {
+    it("lets CONCOS_UNICODE override the guess either way", () => {
+        try {
+            vi.stubEnv("CONCOS_UNICODE", "1");
+            expect(supportsUnicode()).toBe(true);
+            // a terminal that says it draws them is still told not to
+            vi.stubEnv("WT_SESSION", "session");
+            vi.stubEnv("CONCOS_UNICODE", "0");
+            expect(supportsUnicode()).toBe(false);
+        }
+        finally { vi.unstubAllEnvs(); }
+    });
+});
 
 describe("terminal prompts", () => {
     it("animates cached rows without fetching data or clearing the screen, and stops both timers on exit", async () => {
@@ -101,6 +115,129 @@ describe("terminal prompts", () => {
             await press(tty.input, ["a", "b", "\r"]);
             expect(await picked).toBe("search");
             expect(field.text).toBe("ab");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("edits an opted-in field at its caret, restores its saved value, and repaints only that row", async () => {
+        const tty = terminal();
+        const screen = new TerminalScreen(60, 24);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        const field = { text: "한😀끝", edit: true, savedText: "한😀끝" };
+        try {
+            const pending = prompter.select("Card", [{ value: "name", label: "Name", input: field }, { value: "back", label: "Back" }], {
+                cancelValue: "back", tabs: { active: "name", items: [{ value: "name", label: "Card" }, { value: "back", label: "Other" }] },
+            });
+            const start = tty.screen().length;
+            await press(tty.input, ["\u001b[D", "\u001b[3~", "\u001b[H", "A", "\u001b[F", "\u007f"]);
+            expect(field.text).toBe("A한");
+            const emitted = tty.screen().slice(start);
+            expect(emitted).not.toContain("\u001b[J");
+            expect(emitted).not.toContain("? Card");
+            expect(emitted).not.toContain("Back");
+            expect(emitted).toContain("\u001b[2K");
+            await press(tty.input, ["\u0015", "수", "정", "\u001b[D", "X"]);
+            expect(field.text).toBe("수X정");
+            await press(tty.input, ["\u001b"]);
+            expect(field.text).toBe("한😀끝");
+            expect(screen.visible().join("\n")).toMatch(/[❯>] Name/);
+            await press(tty.input, ["\u001b"]);
+            expect(await pending).toBe("back");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("keeps the editable caret visible at both ends of a long wide field", async () => {
+        vi.stubEnv("CONCOS_UNICODE", "1");
+        const tty = terminal();
+        tty.output.columns = 32;
+        const screen = new TerminalScreen(32, 24);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        const field = { text: "가".repeat(40) + "끝", edit: true };
+        try {
+            const pending = prompter.select("Card", [{ value: "role", label: "Role", input: field }]);
+            expect(screen.visible()[1]).toMatch(/…가+끝$/);
+            expect(screen.cursor()).toEqual({ row: 1, column: displayWidth(screen.visible()[1]), visible: true });
+            await press(tty.input, ["\u001b[H"]);
+            expect(screen.visible()[1]).toMatch(/Role\s+가+…$/);
+            expect(screen.cursor()).toEqual({ row: 1, column: displayWidth(screen.visible()[1].split("가")[0]), visible: true });
+            await press(tty.input, ["\u001b[3~", "\u001b[F", "\u007f", "\r"]);
+            expect(field.text).toBe("가".repeat(39));
+            expect(await pending).toBe("role");
+        }
+        finally { prompter.close(); vi.unstubAllEnvs(); }
+    });
+
+    it.each([false, true])("keeps the real input cursor in its field across redraws, wrapped content and refresh (edit=%s)", async (edit) => {
+        vi.useFakeTimers();
+        vi.stubEnv("CONCOS_REDUCED_MOTION", "0");
+        vi.stubEnv("TERM", "xterm");
+        const tty = terminal();
+        Object.assign(tty.output, { columns: 54, rows: 20 });
+        const screen = new TerminalScreen(54, 20);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        const field = { text: "한😀끝", edit, cursor: 2 };
+        let detail = "가".repeat(60);
+        let frame = 0;
+        const items = () => [
+            { separator: true as const, lines: () => [detail] },
+            { value: "send", label: "Send" },
+            { value: "search", label: "Search messages", input: field },
+            { value: "back", label: "Back" },
+        ];
+        const assertCursor = () => {
+            const row = screen.visible().findIndex((line) => /[❯>] Search messages/.test(line));
+            const prefix = screen.visible()[row].split("한")[0];
+            const before = edit ? [...field.text].slice(0, field.cursor).join("") : field.text;
+            expect(screen.cursor()).toEqual({ row, column: displayWidth(prefix + before), visible: true });
+        };
+        try {
+            const pending = prompter.select("Card", items(), {
+                defaultValue: "search", banner: [[{ text: "Status" }]], preface: ["First\nSecond"],
+                refresh: { intervalMs: 200, load: () => ({ question: "Card", items: items() }) },
+                animation: { intervalMs: 40, frame: () => ({ question: `Card frame ${frame++}` }) },
+            });
+            assertCursor();
+            tty.input.write("X");
+            assertCursor();
+            if(edit == true) {
+                const start = tty.screen().length;
+                tty.input.write("\u001b[D");
+                assertCursor();
+                expect(tty.screen().slice(start)).not.toContain("\u001b[J");
+                expect(tty.screen().slice(start)).not.toContain("Search messages");
+            }
+            detail += "가".repeat(20);
+            await vi.advanceTimersByTimeAsync(400);
+            assertCursor();
+            tty.input.write("\u001b[A");
+            expect(screen.cursor().visible).toBe(false);
+            tty.input.write("\u001b[B");
+            assertCursor();
+            tty.input.write("\r");
+            expect(await pending).toBe("search");
+            expect(screen.cursor()).toEqual({ row: 0, column: 0, visible: true });
+            expect(screen.visible().join("\n").trim()).toBe("");
+        }
+        finally { prompter.close(); vi.useRealTimers(); vi.unstubAllEnvs(); }
+    });
+
+    it.each(["\u001bOQ", "\u001b[12~", "\u001b[1;1Q", "\u0012"])("runs a selected-row shortcut for %j without treating it as input", async (key) => {
+        const tty = terminal();
+        tty.output.columns = 54;
+        const prompter = new Prompter(tty.input, tty.output);
+        try {
+            const pending = prompter.select<string>("Room", [{ value: "a", label: "Alpha" }, { value: "b", label: "Beta" }], {
+                defaultValue: "b", shortcuts: [{ keys: [key], hint: "F2 name · Ctrl+R role", value: (selected) => `edit:${selected}` }],
+            });
+            expect(tty.screen()).toContain("F2 name · Ctrl+R role");
+            await press(tty.input, [key]);
+            expect(await pending).toBe("edit:b");
+            expect(tty.raw).toEqual([true, false]);
         }
         finally { prompter.close(); }
     });
@@ -228,6 +365,76 @@ describe("terminal prompts", () => {
         }
         finally { prompter.close(); }
         expect(tty.screen()).toContain("\u001b[?25h");
+    });
+
+    it("moves an editor cursor without repainting and appends only the new character", async () => {
+        const tty = terminal();
+        tty.output.columns = 24;
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        const original = "Alpha한국0123456789".repeat(3);
+        try {
+            const pending = prompter.ask("Name", { initialValue: original });
+            for(const key of ["\u001b[D", "\u001b[C", "\u001b[H", "\u001b[F"]) {
+                const start = tty.screen().length;
+                await press(tty.input, [key]);
+                const emitted = tty.screen().slice(start);
+                expect(emitted).not.toContain("\u001b[J");
+                expect(emitted).not.toContain("Alpha");
+                expect(Buffer.byteLength(emitted)).toBeLessThanOrEqual(16);
+            }
+            const start = tty.screen().length;
+            await press(tty.input, ["x"]);
+            expect(tty.screen().slice(start)).toBe("x");
+            await press(tty.input, ["\u001b[D"]);
+            const beforeEdit = tty.screen().length;
+            await press(tty.input, ["가"]);
+            expect(tty.screen().slice(beforeEdit)).not.toContain("Name");
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe(`${original}가x`);
+        }
+        finally { prompter.close(); }
+    });
+
+    it("edits around wide-character wrap gaps without touching the prompt or preceding line", async () => {
+        const tty = terminal();
+        tty.output.columns = 10;
+        const screen = new TerminalScreen(10, 12);
+        tty.output.on("data", (chunk) => screen.write(chunk.toString()));
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        try {
+            prompter.write("Keep\n");
+            const pending = prompter.ask("N", { initialValue: "abcde가끝" });
+            expect(screen.visible().slice(0, 3)).toEqual(["Keep", "? N abcde", "가끝"]);
+            expect(screen.cursor()).toEqual({ row: 2, column: 4, visible: true });
+            await press(tty.input, ["\u001b[D", "\u001b[D"]);
+            expect(screen.cursor()).toEqual({ row: 2, column: 0, visible: true });
+            await press(tty.input, ["x"]);
+            expect(screen.visible().slice(0, 3)).toEqual(["Keep", "? N abcdex", "가끝"]);
+            await press(tty.input, ["\u007f", "\u001b[3~"]);
+            expect(screen.visible().slice(0, 3)).toEqual(["Keep", "? N abcde", "끝"]);
+            await press(tty.input, ["\u001b[F", "\u001b[D", "나", "\r"]);
+            expect(await pending).toBe("abcde나끝");
+            expect(screen.visible().join("\n").trim()).toBe("Keep");
+        }
+        finally { prompter.close(); }
+    });
+
+    it("edits a secret buffer without writing cursor or text updates", async () => {
+        const tty = terminal();
+        const prompter = new Prompter(tty.input, tty.output);
+        prompter.transient = true;
+        try {
+            const pending = prompter.askSecret("Secret");
+            const start = tty.screen().length;
+            await press(tty.input, ["비", "밀", "\u001b[D", "\u001b[3~", "\u001b[H", "A", "\u001b[F", "\u007f", "\u0015", "정", "답"]);
+            expect(tty.screen().slice(start)).toBe("");
+            await press(tty.input, ["\r"]);
+            expect(await pending).toBe("정답");
+            expect(tty.raw).toEqual([true, false]);
+        }
+        finally { prompter.close(); }
     });
 
     it("preserves Enter defaults for existing callers and prefilled values in line mode", async () => {

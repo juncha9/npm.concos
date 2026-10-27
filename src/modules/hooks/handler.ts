@@ -6,7 +6,7 @@ import { resolveDataDirectory } from "../../_libs/paths";
 import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
-import { getHostAdapter } from "./adapters";
+import { clientPidFromEnvironment, getHostAdapter } from "./adapters";
 import { describeNotices } from "./notices";
 import { HOOK_EVENTS } from "./types";
 import type { HookEvent, HookEventKind, HookResult, HostAdapter } from "./types";
@@ -23,20 +23,24 @@ export function processHook(store: RoomStore, event: HookEvent, room = SHARED_RO
     }
     const notices = outcome.notices ?? [];
     const unread = outcome.unread ?? notices.length;
+    const lines: string[] = [];
     if(outcome.joined != null) {
         const { joined } = outcome;
         const overview = store.getRoomOverview(room, 0);
         const others = overview.agents.filter((agent) => !agent.left && !agent.ended && agent.agent_id != joined.agent_id).length;
-        let context = `concos shared waiting room; agent_id=${joined.agent_id}; handle=${joined.handle}\n`
-            + `Call join with resume_handle=${joined.handle}, your absolute working_directory and this session's name as display_name to keep this participant.\n`
-            + `Hooks record your working/waiting status and edited files; keep reporting summary and next step with check_in. ${others} other participant(s).`;
-        if(unread > 0) {
-            context += `\n${describeNotices(notices, unread)} Read them with read_messages.`;
-        }
-        return { context: context };
+        lines.push(`concos shared waiting room; agent_id=${joined.agent_id}; handle=${joined.handle}`);
+        lines.push(`Call join with resume_handle=${joined.handle}, your absolute working_directory and this session's name as display_name to keep this participant.`);
+        lines.push(`Hooks record your working/waiting status and edited files; keep reporting summary and next step with check_in. ${others} other participant(s).`);
     }
     if(unread > 0) {
-        return { context: `${describeNotices(notices, unread)} Read them with read_messages.` };
+        lines.push(`${describeNotices(notices, unread)} Read them with read_messages.`);
+    }
+    // a turn starts where a blocker may have cleared: agents left resolved ones on the card (2026-10-28 report)
+    if(outcome.blocker != null) {
+        lines.push(`concos: your card still reports blocker "${outcome.blocker}". If it is resolved, clear it with check_in blocker "".`);
+    }
+    if(lines.length > 0) {
+        return { context: lines.join("\n") };
     }
 }
 
@@ -74,6 +78,49 @@ async function readPayload(): Promise<unknown> {
 const WATCH_EVENT_VARIABLE = "CONCOS_WATCH_EVENT";
 
 /**
+ * Starts the watch for `event` in a node of its own and returns at once. Waking from outside
+ * needs nothing back from the hook, so the shell Codex runs hooks in (PowerShell, about 64 MB)
+ * does not stay for the watch's day. The watch still ends when the session does, through its end hook.
+ */
+function startDetachedWatch(adapter: HostAdapter, event: HookEvent): void {
+    const watch = spawn(process.execPath, [...NODE_FLAGS, process.argv[1], "hook", "watch", "--host", adapter.id], {
+        detached: true, stdio: "ignore", windowsHide: true,
+        // database logging stays off the watch's stderr unless the user set a level
+        env: { ...process.env, CONCOS_LOG_LEVEL: process.env.CONCOS_LOG_LEVEL ?? "none", [WATCH_EVENT_VARIABLE]: JSON.stringify(event) },
+    });
+    // a watch that cannot start is left for the next turn end; the hook still ends quietly
+    watch.on("error", (error) => $logger.error(error, "idle-wake watch did not start"));
+    watch.unref();
+}
+
+/** Whether the user's settings have this host's idle wake on; read when a session starts, never on later hooks. */
+async function wakeRegistered(adapter: HostAdapter): Promise<boolean> {
+    try {
+        const { inspectWake } = await import("../cli/setup");
+        return inspectWake({ host: adapter.id });
+    }
+    catch {
+        return false;
+    }
+}
+
+/**
+ * The client process this hook runs under, when it is cheap to know: the id the client names in
+ * its environment, or the parent of a hook started in exec form, with no shell between them.
+ * Codex runs hooks through a shell and names no id, so its sessions get none.
+ */
+export function hookClientPid(adapter: HostAdapter): number | undefined {
+    const named = clientPidFromEnvironment(adapter);
+    if(named != null) {
+        return named;
+    }
+    if(process.execArgv.includes(NODE_FLAGS[0])) {
+        return process.ppid;
+    }
+    return undefined;
+}
+
+/**
  * The idle-wake hook. A host that wakes a session from outside (Codex) gets the line from
  * `deliverWake`. Otherwise exit code 2 wakes the Claude Code session with stderr as its message,
  * so stderr carries that one line and nothing else. Every other ending is a quiet exit 0.
@@ -81,17 +128,8 @@ const WATCH_EVENT_VARIABLE = "CONCOS_WATCH_EVENT";
 async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<void> {
     // child loggers read the level when created, so database logging stays off stderr from here
     process.env.CONCOS_LOG_LEVEL ??= "none";
-    // Waking from outside needs nothing back from this hook, so the watch goes on in a node of its
-    // own and the hook ends: the shell Codex runs hooks in (PowerShell, about 64 MB) does not stay
-    // for the watch's hour. The watch still ends when the session does, through its end hook.
     if(event != null && adapter.wake != null && adapter.deliverWake != null && process.env[WATCH_EVENT_VARIABLE] == null) {
-        const watch = spawn(process.execPath, [...NODE_FLAGS, process.argv[1], "hook", "watch", "--host", adapter.id], {
-            detached: true, stdio: "ignore", windowsHide: true,
-            env: { ...process.env, [WATCH_EVENT_VARIABLE]: JSON.stringify(event) },
-        });
-        // a watch that cannot start is left for the next turn end; the hook still ends quietly
-        watch.on("error", (error) => $logger.error(error, "idle-wake watch did not start"));
-        watch.unref();
+        startDetachedWatch(adapter, event);
         process.stdout.write("{}\n");
         return;
     }
@@ -150,9 +188,14 @@ export async function runHook(args: string[]): Promise<void> {
             return;
         }
         if(event != null) {
+            const hookEvent: HookEvent = { ...event, client: adapter.label };
+            const clientPid = hookClientPid(adapter);
+            if(clientPid != null) {
+                hookEvent.clientPid = clientPid;
+            }
             const database = await openDatabase(resolveDataDirectory(), { busyTimeoutMs: 100 });
             try {
-                const result = processHook(new RoomStore(database), { ...event, client: adapter.label });
+                const result = processHook(new RoomStore(database), hookEvent);
                 if(result?.continueReason != null && adapter.continueTurn != null) {
                     output = adapter.continueTurn(result.continueReason);
                 }
@@ -161,6 +204,12 @@ export async function runHook(args: string[]): Promise<void> {
                 }
             }
             finally { database.close(); }
+            // A session given no work never calls concos and went offline at once (2026-10-28
+            // report). A host woken from outside watches from its start, as after each turn,
+            // when its idle wake is on: the card stays online and a message can start its first turn.
+            if(kind == "session-start" && adapter.wake != null && adapter.deliverWake != null && await wakeRegistered(adapter) == true) {
+                startDetachedWatch(adapter, event);
+            }
         }
         else output = adapter.output(kind);
     }

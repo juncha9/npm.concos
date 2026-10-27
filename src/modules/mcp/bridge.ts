@@ -27,8 +27,9 @@ import type { AgentStatus, MessageKind } from "../../_defs";
 import { $logger } from "../../_libs/logger";
 import { resolveDataDirectory } from "../../_libs/paths";
 import { CONCOS_VERSION } from "../../_libs/version";
-import { HOST_ADAPTERS } from "../hooks/adapters";
+import { clientPidFromEnvironment, HOST_ADAPTERS } from "../hooks/adapters";
 import { describeWake } from "../hooks/notices";
+import { isRunning } from "../hooks/watch";
 import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
@@ -47,8 +48,8 @@ const WAKE_HOSTS = HOST_ADAPTERS.filter((adapter) => adapter.deliverWake != null
  * news since its cursor. Agents found one flat object hard to read when they only meant to
  * update themselves. Unread counts travel in the `inbox` field every tool adds.
  */
-function shapeCheckIn(result: CheckInResult): { you: { revision: number }; room: Omit<CheckInResult, "revision" | "pending_count"> } {
-    const room: Omit<CheckInResult, "revision" | "pending_count"> = { changed: result.changed, cursor: result.cursor };
+function shapeCheckIn(result: CheckInResult): { you: { revision: number; blocker?: string }; room: Omit<CheckInResult, "revision" | "pending_count" | "blocker"> } {
+    const room: Omit<CheckInResult, "revision" | "pending_count" | "blocker"> = { changed: result.changed, cursor: result.cursor };
     if(result.agents != null) {
         room.agents = result.agents;
     }
@@ -61,7 +62,11 @@ function shapeCheckIn(result: CheckInResult): { you: { revision: number }; room:
     if(result.has_more != null) {
         room.has_more = result.has_more;
     }
-    return { you: { revision: result.revision }, room: room };
+    const you: { revision: number; blocker?: string } = { revision: result.revision };
+    if(result.blocker != null) {
+        you.blocker = result.blocker;
+    }
+    return { you: you, room: room };
 }
 
 /** Messages whose whole text is in a tool result: check_in previews that were not cut, and every read_messages message. */
@@ -179,7 +184,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "check_in",
-        description: "Report changed fields; receive you (your revision) and room changes. Empty strings clear fields; editing replaces the list. Cards with detail=status update only the included fields; keep prior content. Other cards replace the prior card. room.has_more is optional history; read unread messages with read_messages. A nonempty replaced_by redirects messages from an ended card to that agent_id.",
+        description: "Report changed fields; receive you (your revision; your blocker while set: send blocker \"\" once it is resolved) and room changes. Empty strings clear fields; editing replaces the list. status finished clears the blocker. Cards with detail=status update only the included fields; keep prior content. Other cards replace the prior card. room.has_more is optional history; read unread messages with read_messages. A nonempty replaced_by redirects messages from an ended card to that agent_id.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             display_name: { type: "string", maxLength: MAX_DISPLAY_NAME_LENGTH, description: "Rename your card, e.g. after the user renamed this session; no new join needed." },
@@ -331,7 +336,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "leave",
-        description: "Finish your participation, leaving a final summary. Clears your editing list.",
+        description: "Finish your task, leaving a final summary. Clears your editing list and blocker. A card your session's hooks hold stays in the room as finished until the session ends (left: false), so later messages still reach you; any other card leaves.",
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             summary: { type: "string", maxLength: MAX_SUMMARY_LENGTH },
@@ -348,10 +353,23 @@ export async function runBridge(): Promise<void> {
         });
     }));
 
+    // the client this server runs under: the id it names in the environment, else the parent
+    let clientPid = process.ppid;
+    for(const adapter of HOST_ADAPTERS) {
+        const named = clientPidFromEnvironment(adapter);
+        if(named != null) {
+            clientPid = named;
+            break;
+        }
+    }
     const heartbeatTimer = setInterval(() => {
         try {
             // the version shows on the board, so a session still on an older concos can be found
             store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
+            // its client's hook cards too, before their models join; a client gone keeps nothing online
+            if(isRunning(clientPid) == true) {
+                store.keepAliveForClient(clientPid, CONCOS_VERSION);
+            }
             // every running bridge sweeps on its heartbeat, so residue is cleared while anyone is connected
             const removed = store.cleanUp();
             if(removed.messages + removed.agents + removed.checkpoints + removed.workspaces > 0) {

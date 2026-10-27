@@ -300,4 +300,21 @@ export const SCHEMA_STEPS: readonly string[] = [
         UPDATE agent SET recent_folder_list = '[]' WHERE id = NEW.id;
     END;
     `,
+    `
+    -- The client process a hook ran under: an MCP server under the same process keeps the card
+    -- online before its model joins. Older writers never name it, and it stays null for them.
+    ALTER TABLE agent ADD COLUMN client_pid INTEGER;
+
+    -- When the card's blocker was set, for the board to show how old it is; null without one.
+    -- A trigger keeps it, so writers that never name the column keep it right too.
+    ALTER TABLE agent ADD COLUMN blocker_since TEXT;
+    UPDATE agent SET blocker_since = updated_at WHERE blocker <> '';
+    CREATE TRIGGER trg_agent_blocker_since AFTER UPDATE OF blocker ON agent
+    WHEN NEW.blocker IS NOT OLD.blocker
+    BEGIN
+        UPDATE agent
+        SET blocker_since = CASE WHEN NEW.blocker = '' THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END
+        WHERE id = NEW.id;
+    END;
+    `,
 ];

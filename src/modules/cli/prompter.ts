@@ -45,12 +45,23 @@ export interface SelectChoice<T extends string> {
     /** What a line-mode answer may type besides the number and the label; defaults to `value`. */
     key?: string;
     /**
-     * A text field on the row, on a terminal: while the row is active, typed characters (digits and
-     * `j`/`k` too) edit `text`; Backspace deletes one, Ctrl+U clears it, and Esc clears it before
-     * it goes back. The caller keeps the object, so the text outlives a refresh that rebuilds the
-     * items, and reads it when the row is picked. Line mode picks the row as any other.
+     * A text field on the row, on a terminal: typed characters (digits and `j`/`k` too) edit
+     * `text`. The default appends and clears on Esc; `edit` opts into caret movement and Esc
+     * restoring the saved value. The caller keeps the field object across refreshes and reads
+     * it when the row is picked. Line mode picks the row as any other.
      */
-    input?: { text: string; placeholder?: string };
+    input?: SelectInput;
+}
+
+export interface SelectInput {
+    text: string;
+    placeholder?: string;
+    /** Opt in to caret editing; otherwise Left/Right retain their tab-switching behavior. */
+    edit?: boolean;
+    /** Code-point offset, kept with the field across list refreshes. Defaults to the end. */
+    cursor?: number;
+    /** Esc restores this saved value before it leaves the list; defaults to the initial text. */
+    savedText?: string;
 }
 
 /** A non-selectable divider between groups of choices. */
@@ -110,6 +121,8 @@ export interface SelectOptions<T extends string> {
     tabs?: SelectTabs<T>;
     /** Repaints cached visual state between refreshes; it must not reload data. TTY only. */
     animation?: { intervalMs: number; frame: () => { question?: string; tabs?: SelectTabs<T>; preface?: string[] } };
+    /** TTY actions on the selected value; an undefined result leaves the list open. */
+    shortcuts?: { keys: string[]; hint: string; value: (selected: T) => T | undefined }[];
 }
 
 /** The subset of `tty.ReadStream` the key-driven prompts need; absent on pipes and in tests. */
@@ -304,8 +317,16 @@ function groupLabelWidths<T extends string>(items: SelectItem<T>[]): number[] {
 /**
  * Legacy Windows consoles render `❯` / `✔` as boxes; Windows Terminal, the VS Code
  * terminal and every non-Windows terminal draw them. Same rule inquirer's `figures` uses.
+ * `CONCOS_UNICODE=1` or `0` overrides the guess for a terminal it gets wrong, such as a
+ * Windows Terminal window that left `WT_SESSION` unset (2026-10-28 user request).
  */
 export function supportsUnicode(): boolean {
+    if(process.env.CONCOS_UNICODE === "1") {
+        return true;
+    }
+    if(process.env.CONCOS_UNICODE === "0") {
+        return false;
+    }
     if(process.platform !== "win32") {
         return true;
     }
@@ -407,8 +428,7 @@ export class Prompter {
     /** Columns already used on the row being written, when the output so far does not end in a newline. */
     private openRowWidth = 0;
     private readonly style: Style;
-    /** `caret`: where typing goes in a row's text field, since the terminal cursor stays hidden in a list. */
-    private readonly symbols: { question: string; pointer: string; tick: string; rule: string; ellipsis: string; caret: string };
+    private readonly symbols: { question: string; pointer: string; tick: string; rule: string; ellipsis: string };
 
     constructor(private readonly input: Readable, private readonly output: Writable) {
         const ttyInput = input as TtyInput;
@@ -417,10 +437,10 @@ export class Prompter {
         this.style = createStyle(this.interactive == true && process.env.NO_COLOR == null);
 
         if(supportsUnicode() == true) {
-            this.symbols = { question: "?", pointer: "❯", tick: "✔", rule: "─", ellipsis: "…", caret: "▏" };
+            this.symbols = { question: "?", pointer: "❯", tick: "✔", rule: "─", ellipsis: "…" };
         }
         else {
-            this.symbols = { question: "?", pointer: ">", tick: "√", rule: "-", ellipsis: "...", caret: "_" };
+            this.symbols = { question: "?", pointer: ">", tick: "√", rule: "-", ellipsis: "..." };
         }
 
         this.inputEnded = input.readableEnded;
@@ -641,7 +661,7 @@ export class Prompter {
         }
 
         if(this.interactive == true) {
-            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation, options?.banner, options?.preface);
+            const picked = await this.selectWithKeys(question, items, startIndex, options?.cancelValue, options?.refresh, options?.tabs, options?.animation, options?.banner, options?.preface, options?.shortcuts);
             return picked;
         }
 
@@ -942,68 +962,65 @@ export class Prompter {
      * the terminal either swallows Esc or stuffs the byte into the value. With `secret` the
      * characters are collected but never drawn.
      *
-     * The field redraws from the prompt on every key; the cursor is placed by row and
-     * column from the widths, since a long value wraps.
+     * Cursor-only keys emit movement, appending emits only new text, and edits inside the
+     * value replace its suffix. Positions include the empty cell before a wide character wraps.
      */
     private editLine(prompt: string, options: { secret?: boolean; initialValue?: string }): Promise<string> {
         const { secret = false, initialValue = "" } = options;
         const ttyInput = this.input as TtyInput;
-        const promptWidth = displayWidth(prompt.replace(ANSI_PATTERN, ""));
         const columns = this.columns();
-
-        /** Code points, so a wide character is one unit for the cursor. */
+        type Position = { row: number; column: number };
         let buffer = Array.from(initialValue);
         let cursor = buffer.length;
-        /** Row the terminal cursor is on, relative to the prompt's first row. */
-        let cursorRow = 0;
-
-        const draw = (): void => {
-            let text = "";
-            if(cursorRow > 0) {
-                text += `${ESC}[${cursorRow}A`;
+        let terminal: Position = { row: 0, column: 0 };
+        const advance = (position: Position, character: string): Position => {
+            let { row, column } = position;
+            if(character == "\n") return { row: row + 1, column: 0 };
+            if(character == "\r") return { row, column: 0 };
+            const width = charWidth(character.codePointAt(0) ?? 0);
+            if(column + width > columns) { row += 1; column = 0; }
+            column += width;
+            if(column >= columns) { row += 1; column = 0; }
+            return { row, column };
+        };
+        const plainPrompt = [...prompt.replace(ANSI_PATTERN, "")];
+        const promptEnd = plainPrompt.reduce(advance, { row: 0, column: 0 });
+        let offsets: Position[] = [];
+        const layout = (): void => {
+            offsets = [promptEnd];
+            for(const character of buffer) {
+                offsets.push(secret == true ? promptEnd : advance(offsets[offsets.length - 1], character));
             }
-            text += `\r${ESC}[J${prompt}`;
-
-            let shown = "";
-            let widthToCursor = promptWidth;
-            if(secret == false) {
-                shown = buffer.join("");
-                widthToCursor += displayWidth(buffer.slice(0, cursor).join(""));
+        };
+        const cursorPosition = (): Position => {
+            const position = offsets[cursor];
+            const next = buffer[cursor];
+            if(secret == false && next != null && position.column + charWidth(next.codePointAt(0) ?? 0) > columns) {
+                return { row: position.row + 1, column: 0 };
             }
-            text += shown;
-
-            const widthToEnd = promptWidth + displayWidth(shown);
-            const endRow = Math.floor(widthToEnd / columns);
-            const endColumn = widthToEnd % columns;
-            // A full final row still has pending wrap; this puts the cursor on the counted next row.
-            if(endColumn == 0) {
-                text += "\r\n";
-            }
-            cursorRow = Math.floor(widthToCursor / columns);
-            const cursorColumn = widthToCursor % columns;
-
-            if(endRow > cursorRow) {
-                text += `${ESC}[${endRow - cursorRow}A`;
-            }
-            if(endColumn > cursorColumn) {
-                text += `${ESC}[${endColumn - cursorColumn}D`;
-            }
-            else if(cursorColumn > endColumn) {
-                text += `${ESC}[${cursorColumn - endColumn}C`;
-            }
-
-            this.output.write(text);
+            return position;
+        };
+        const moveTo = (target: Position): string => {
+            if(terminal.row == target.row && terminal.column == target.column) return "";
+            let movement = "\r";
+            const rows = target.row - terminal.row;
+            if(rows != 0) movement += `${ESC}[${Math.abs(rows)}${rows < 0 ? "A" : "B"}`;
+            if(target.column > 0) movement += `${ESC}[${target.column}C`;
+            terminal = target;
+            return movement;
+        };
+        const writeText = (text: string, end: Position): string => {
+            terminal = end;
+            // Finish pending autowrap now, so subsequent movement has one unambiguous origin.
+            if(text != "" && text.endsWith("\n") == false && end.column == 0) return `${text}\r\n`;
+            return text;
         };
 
         return new Promise<string>((resolve, reject) => {
             const finish = (): void => {
                 this.keyHandler = null;
                 ttyInput.setRawMode?.(false);
-                let text = "";
-                if(cursorRow > 0) {
-                    text += `${ESC}[${cursorRow}A`;
-                }
-                this.output.write(`${text}\r${ESC}[J`);
+                this.output.write(`${moveTo({ row: 0, column: 0 })}${ESC}[J`);
             };
 
             this.keyHandler = (key: string) => {
@@ -1025,13 +1042,19 @@ export class Prompter {
                     return;
                 }
 
+                let changedAt = cursor;
+                const oldLength = buffer.length;
+                let append = false;
                 if(KEY_BACKSPACE.includes(key) == true) {
                     if(cursor > 0) {
                         buffer.splice(cursor - 1, 1);
                         cursor -= 1;
+                        changedAt = cursor;
                     }
+                    else return;
                 }
                 else if(KEY_DELETE.includes(key) == true) {
+                    if(cursor == buffer.length) return;
                     buffer.splice(cursor, 1);
                 }
                 else if(KEY_LEFT.includes(key) == true) {
@@ -1047,23 +1070,41 @@ export class Prompter {
                     cursor = buffer.length;
                 }
                 else if(key === KEY_CTRL_U) {
+                    if(buffer.length == 0) return;
                     buffer = [];
                     cursor = 0;
+                    changedAt = 0;
                 }
                 else if(key.startsWith(ESC) == true || (key.codePointAt(0) ?? 0) < 0x20) {
                     // Any other escape sequence or control character — nothing to insert.
                     return;
                 }
                 else {
+                    append = cursor == oldLength;
                     buffer.splice(cursor, 0, key);
                     cursor += 1;
                 }
 
-                draw();
+                if(KEY_LEFT.includes(key) || KEY_RIGHT.includes(key) || KEY_HOME.includes(key) || KEY_END.includes(key)) {
+                    const movement = moveTo(cursorPosition());
+                    if(movement != "") this.output.write(movement);
+                    return;
+                }
+                const start = offsets[changedAt];
+                layout();
+                if(secret == true) return;
+                let text = "";
+                if(append == false) text = `${moveTo(start)}${ESC}[J`;
+                text += writeText(buffer.slice(changedAt).join(""), offsets[buffer.length]);
+                text += moveTo(cursorPosition());
+                if(text != "") this.output.write(text);
             };
 
             ttyInput.setRawMode?.(true);
-            draw();
+            layout();
+            let shown = "";
+            if(secret == false) shown = buffer.join("");
+            this.output.write(`\r${ESC}[J${writeText(prompt + shown, offsets[buffer.length])}`);
         });
     }
 
@@ -1077,6 +1118,7 @@ export class Prompter {
         animation: SelectOptions<T>["animation"],
         initialBanner: LinePart[][] | undefined,
         preface: string[] | undefined,
+        shortcuts: SelectOptions<T>["shortcuts"],
     ): Promise<T> {
         const ttyInput = this.input as TtyInput;
         let question = initialQuestion;
@@ -1118,6 +1160,11 @@ export class Prompter {
         let prefaceLineCount = 0;
         const hasPreface = preface != null && preface.length > 0;
         const bounds = new Map<number, { start: number; end: number }>();
+        const inputDefaults = new WeakMap<SelectInput, string>();
+        let inputCursor: { row: number; column: number } | null = null;
+        let cursorRow = 0;
+        let cursorColumn = 0;
+        let cursorVisible = false;
         /** First body line of the active row in the last build, for the trace. */
         let tracedActiveStart = 0;
 
@@ -1144,6 +1191,26 @@ export class Prompter {
             }
         };
 
+        /** The terminal's own cursor also anchors its IME composition UI and candidate window. */
+        const placeCursor = (): void => {
+            const target = inputCursor ?? { row: Math.max(0, renderedLines - 1), column: 0 };
+            let text = "";
+            const visible = inputCursor != null;
+            if(visible != cursorVisible) {
+                text += `${ESC}[?25${visible ? "h" : "l"}`;
+                cursorVisible = visible;
+            }
+            if(target.row != cursorRow || target.column != cursorColumn) {
+                text += "\r";
+                const distance = target.row - cursorRow;
+                if(distance != 0) text += `${ESC}[${Math.abs(distance)}${distance < 0 ? "A" : "B"}`;
+                if(target.column > 0) text += `${ESC}[${target.column}C`;
+                cursorRow = target.row;
+                cursorColumn = target.column;
+            }
+            if(text != "") this.output.write(text);
+        };
+
         const draw = (lines: string[], incremental = false): void => {
             const partial = incremental && lines.length == renderedLines && renderedLines > 0;
             trace({
@@ -1154,7 +1221,7 @@ export class Prompter {
             });
             if(partial) {
                 const previous = drawnText.split("\n");
-                let cursor = renderedLines - 1;
+                let cursor = cursorRow;
                 let changes = "";
                 lines.forEach((line, index) => {
                     if(line == previous[index]) return;
@@ -1168,18 +1235,58 @@ export class Prompter {
                     changes += "\r";
                     if(cursor < renderedLines - 1) changes += `${ESC}[${renderedLines - 1 - cursor}B`;
                     this.output.write(changes);
+                    cursorRow = renderedLines - 1;
+                    cursorColumn = 0;
                 }
                 drawnText = lines.join("\n");
+                placeCursor();
                 return;
             }
             let text = "";
-            if(renderedLines > 1) {
-                text += `${ESC}[${renderedLines - 1}A`;
+            if(cursorRow > 0) {
+                text += `${ESC}[${cursorRow}A`;
             }
             text += `\r${ESC}[J${lines.join("\n")}`;
             this.output.write(text);
             renderedLines = lines.length;
             drawnText = lines.join("\n");
+            cursorRow = Math.max(0, lines.length - 1);
+            cursorColumn = displayWidth((lines.at(-1) ?? "").replace(ANSI_PATTERN, ""));
+            if(lines.length == 0) inputCursor = null;
+            placeCursor();
+        };
+
+        /** A horizontal field viewport keeps its caret visible even for a long role on a narrow TTY. */
+        const inputParts = (field: SelectInput, active: boolean, width: number): { parts: LinePart[]; column: number } => {
+            const characters = [...field.text];
+            let cursor = 0;
+            let cursorSpace = 0;
+            if(active == true) {
+                cursor = Math.min(characters.length, Math.max(0, field.edit ? field.cursor ?? characters.length : characters.length));
+                cursorSpace = 1;
+            }
+            const ellipsis = this.symbols.ellipsis;
+            const tailReserve = cursor < characters.length ? displayWidth(ellipsis) : 0;
+            let start = 0;
+            let lead = "";
+            while(start < cursor && displayWidth(lead + characters.slice(start, cursor).join("")) + cursorSpace + tailReserve > width) {
+                start += 1;
+                lead = ellipsis;
+            }
+            if(displayWidth(lead) + cursorSpace + tailReserve > width) lead = "";
+            let end = cursor;
+            while(end < characters.length) {
+                const next = end + 1;
+                const tail = next < characters.length ? ellipsis : "";
+                if(displayWidth(lead + characters.slice(start, next).join("") + tail) + cursorSpace > width) break;
+                end = next;
+            }
+            let tail = "";
+            if(end < characters.length && displayWidth(lead + characters.slice(start, end).join("") + ellipsis) + cursorSpace <= width) tail = ellipsis;
+            const before = lead + characters.slice(start, cursor).join("");
+            return { column: displayWidth(before), parts: [
+                { text: before + characters.slice(cursor, end).join("") + tail, paint: active ? undefined : this.style.dim },
+            ] };
         };
 
         /**
@@ -1214,6 +1321,7 @@ export class Prompter {
             const lines: string[] = [];
             let activeStart = 0;
             let activeEnd = 0;
+            let activeInputColumn: number | null = null;
             bounds.clear();
 
             for(let index = 0; index < items.length; index += 1) {
@@ -1276,19 +1384,23 @@ export class Prompter {
                 }
                 else {
                     const parts: LinePart[] = [gutter];
+                    const field = item.input;
+                    let labelWidth = labelWidths[index];
+                    if(field?.edit == true) labelWidth = Math.max(displayWidth(item.label), Math.min(labelWidth, 8));
                     if(isActive == true) {
-                        parts.push({ text: padToWidth(item.label, labelWidths[index]), paint: this.style.accent });
+                        parts.push({ text: padToWidth(item.label, labelWidth), paint: this.style.accent });
                     }
                     else {
-                        parts.push({ text: padToWidth(item.label, labelWidths[index]) });
+                        parts.push({ text: padToWidth(item.label, labelWidth) });
                     }
                     // a text field shows what was typed, and on the active row where typing goes
-                    const field = item.input;
-                    if(field != null && (isActive == true || field.text != "")) {
-                        parts.push({ text: `  ${field.text}`, paint: isActive == true ? undefined : this.style.dim });
-                        if(isActive == true) {
-                            parts.push({ text: this.symbols.caret, paint: this.style.accent });
-                        }
+                    if(field != null && (isActive == true || field.text != "" || field.edit == true)) {
+                        if(inputDefaults.has(field) == false) inputDefaults.set(field, field.text);
+                        parts.push({ text: "  " });
+                        const used = parts.reduce((sum, part) => sum + displayWidth(part.text), 0);
+                        const input = inputParts(field, isActive, Math.max(1, width - used));
+                        parts.push(...input.parts);
+                        if(isActive == true) activeInputColumn = Math.min(width - 1, used + input.column);
                         if(field.text == "" && field.placeholder != null) {
                             parts.push({ text: ` ${field.placeholder}`, paint: this.style.dim });
                         }
@@ -1399,6 +1511,14 @@ export class Prompter {
             if(readingText == true) {
                 hints.splice(0, hints.length, "Enter returns to menu · Esc back", "Enter menu · Esc back", "Enter Esc");
             }
+            else if((items[active] as SelectChoice<T>).input?.edit == true) {
+                hints.splice(0, hints.length, "↑↓ move · ←→ edit · Enter save · Esc undo/back", "←→ edit · Enter save · Esc undo/back", "←→ · Enter save · Esc undo/back", "Enter save · Esc back", "Enter Esc");
+            }
+            const shortcutHelp = shortcuts?.map((shortcut) => shortcut.hint).join(" · ") ?? "";
+            if(shortcutHelp != "") {
+                const withShortcuts = hints.map((hint) => `${hint} · ${shortcutHelp}`).filter((hint) => displayWidth(hint) <= width);
+                if(withShortcuts.length > 0) hints.splice(0, hints.length, ...withShortcuts);
+            }
             let footer: string | undefined;
             if(scrollable == true) {
                 footer = hints.map((hint) => `${hint} · PgUp/PgDn scroll`).find((hint) => displayWidth(hint) <= width);
@@ -1427,6 +1547,10 @@ export class Prompter {
             }
 
             const result = [...header, ...detail, ...body, this.fitLine([{ text: footer, paint: this.style.dim }], width)];
+            inputCursor = null;
+            if(activeInputColumn != null && readingText == false && activeStart >= scrollTop && activeStart < scrollTop + height) {
+                inputCursor = { row: header.length + detail.length + activeStart - scrollTop, column: activeInputColumn };
+            }
             if(refreshError != null) {
                 result.push(this.fitLine([{ text: `refresh failed: ${refreshError}`, paint: this.style.warning }], width));
             }
@@ -1445,6 +1569,7 @@ export class Prompter {
             }
             const lines = buildLines();
             if(lines.join("\n") != drawnText) draw(lines, incremental);
+            else placeCursor();
         };
 
         /** Keeps the cursor on the value it was on; a row that disappeared moves it to the nearest row. */
@@ -1544,19 +1669,49 @@ export class Prompter {
                 // a row's text field takes typing before Esc, digits and j/k mean anything else
                 const field = (items[active] as SelectChoice<T>).input;
                 if(field != null && readingText == false) {
-                    if(KEY_BACKSPACE.includes(key) == true) {
+                    if(field.edit == true) {
+                        let characters = [...field.text];
+                        let cursor = Math.min(characters.length, Math.max(0, field.cursor ?? characters.length));
+                        let handled = true;
+                        if(KEY_LEFT.includes(key)) cursor = Math.max(0, cursor - 1);
+                        else if(KEY_RIGHT.includes(key)) cursor = Math.min(characters.length, cursor + 1);
+                        else if(KEY_HOME.includes(key)) cursor = 0;
+                        else if(KEY_END.includes(key)) cursor = characters.length;
+                        else if(KEY_BACKSPACE.includes(key)) {
+                            if(cursor > 0) { characters.splice(cursor - 1, 1); cursor -= 1; }
+                        }
+                        else if(KEY_DELETE.includes(key)) characters.splice(cursor, 1);
+                        else if(key == KEY_CTRL_U) { characters = []; cursor = 0; }
+                        else if(key == ESC) {
+                            const saved = field.savedText ?? inputDefaults.get(field) ?? field.text;
+                            if(field.text != saved) { characters = [...saved]; cursor = characters.length; }
+                            else handled = false;
+                        }
+                        else if(key.startsWith(ESC) == false && /^[^\u0000-\u001f\u007f]+$/u.test(key)) {
+                            characters.splice(cursor, 0, key);
+                            cursor += 1;
+                        }
+                        else handled = false;
+                        if(handled == true) {
+                            field.text = characters.join("");
+                            field.cursor = cursor;
+                            redraw(true);
+                            return;
+                        }
+                    }
+                    else if(KEY_BACKSPACE.includes(key) == true) {
                         field.text = [...field.text].slice(0, -1).join("");
-                        redraw();
+                        redraw(true);
                         return;
                     }
-                    if(key === KEY_CTRL_U || (key === ESC && field.text != "")) {
+                    else if(key === KEY_CTRL_U || (key === ESC && field.text != "")) {
                         field.text = "";
-                        redraw();
+                        redraw(true);
                         return;
                     }
-                    if(key.startsWith(ESC) == false && /^[^\u0000-\u001f\u007f]+$/u.test(key) == true) {
+                    else if(key.startsWith(ESC) == false && /^[^\u0000-\u001f\u007f]+$/u.test(key) == true) {
                         field.text += key;
-                        redraw();
+                        redraw(true);
                         return;
                     }
                 }
@@ -1584,6 +1739,13 @@ export class Prompter {
                         return;
                     }
                     resolve(cancelValue);
+                    return;
+                }
+
+                const shortcut = shortcuts?.find((candidate) => candidate.keys.includes(key));
+                if(shortcut != null) {
+                    const value = shortcut.value((items[active] as SelectChoice<T>).value);
+                    if(value != null) { finish(); resolve(value); }
                     return;
                 }
 

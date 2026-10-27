@@ -4,6 +4,71 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.16] - 2026-10-28
+
+### Added
+
+- **`CONCOS_UNICODE=1` or `0` picks the board's symbols.** On Windows, concos draws
+  `❯ ✔ ─ █` only in terminals it recognizes (Windows Terminal, VS Code, JetBrains,
+  ConEmu) and otherwise uses `> √ - =`, since the legacy console shows the symbols
+  as boxes. A terminal it does not recognize, such as a Windows Terminal window
+  without `WT_SESSION`, showed `====` for the status bar; `1` forces the symbols
+  and `0` the plain stand-ins.
+- **Wake all sessions on the Agents tab.** After one question (Enter is no), it
+  reaches every agent heard from within a day, offline ones included. A Codex
+  session bound by hooks gets a line in its queue at once, naming its unread
+  messages or asking it to check in. Any other gets a note asking it to check in,
+  which wakes a Claude Code session whose watch is running. The result counts the
+  queues, failures and notes.
+- **An agent hears when you change its name or role on the board.** Saving a new
+  name or role on its card sends it a note from you with the old and new value,
+  asking it to keep the new one. Before, the agent did not know, and its next
+  `check_in` or `join` could put the old value back.
+- **Edit a name or role right on the card, or from the list.** On a terminal the
+  card's **Name** and **Role** rows are fields: type, move with ← / → and
+  Home / End, Enter saves, Esc puts back the saved value. **F2** and **Ctrl+R** on
+  the Agents tab open the selected card on Name or Role. Before, a row opened a
+  separate prompt in place of the card.
+- **Moving the cursor in a text field is instant.** ← / → / Home / End only move
+  the cursor, and typing at the end writes just the new letter, instead of
+  redrawing the whole line on every key (82 bytes per ← before, 6 now). The
+  terminal's cursor now stands in the active field, so an input method shows the
+  letters it is composing there instead of under the list.
+- **Blockers show their age**, in the list and the card, and the compact view
+  shows the selected card's blocker in red in place of its task.
+- **The card's first line reads name, activity label, folder, time**, joined by
+  ` · `, without the gap that aligned folders after the longest name.
+
+### Fixed
+
+- **A session given no work no longer goes offline.** A session that had not been
+  given work since it started, after an update for example, never called concos,
+  so its MCP server never kept its card online and it went offline within minutes.
+  Claude Code hooks now record the client process (`CLAUDE_PID`, or the hook's
+  parent in exec form), and the MCP server under that process keeps the card
+  online before the model joins. With idle wake on, a Codex session-start hook
+  starts the detached watch a turn end starts, so the card stays online and a
+  message can start the session's first turn.
+- **Finishing a task no longer cuts a session off.** Agents call `leave` when a
+  task is done, while the user often keeps the session open. The card then left
+  the room, its hooks stopped, and a question sent to it next was stored with no
+  receipt: it never reached the session, even after the session joined again, and
+  nothing woke it. Now a card held by an open session's hooks stays as `finished`
+  (`leave` answers `left: false`) and keeps receiving and waking; its session-end
+  hook ends it. A message to a card that did leave keeps its receipt and reaches it
+  when it joins again.
+- **Agents clear resolved blockers.** A blocker stayed until the agent sent
+  `blocker: ""`, which agents kept forgetting once the cause was gone. While one is
+  set, `check_in` answers repeat it as `you.blocker`, and a hook-bound session's
+  turn starts with a reminder line. Reporting `status: "finished"` and `leave`
+  clear it.
+
+### Notes
+
+- Schema 15 adds `agent.client_pid` and `agent.blocker_since` (when the blocker was
+  set, kept by a trigger for every writer). Sessions already open learn their
+  client from their next hook; Codex sessions watch from their next start.
+
 ## [0.1.15] - 2026-10-27
 
 ### Added

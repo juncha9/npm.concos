@@ -59,6 +59,7 @@ interface AgentRow {
     summary: string;
     next_step: string;
     blocker: string;
+    blocker_since: string | null;
     reference_list: string;
     editing_list: string;
     recent_folder_list: string;
@@ -127,7 +128,7 @@ const MAX_RECENT_FOLDERS = 3;
 
 const AGENT_COLUMNS = `
     id, room, host_session_id, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
-    status, role, task, summary, next_step, blocker, reference_list, editing_list, recent_folder_list,
+    status, role, task, summary, next_step, blocker, blocker_since, reference_list, editing_list, recent_folder_list,
     revision, changed_seq, content_changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, last_call_at, disconnected_at, left_at
 `;
@@ -147,6 +148,9 @@ export interface CardUpdate {
     /** Absolute folder the agent works in now; empty, or the folder its session started in, clears it. */
     currentDirectory?: string;
 }
+
+/** `left: false`: the session's hooks hold the card, so it stays, finished, until the session ends. */
+export type LeaveResult = { left: true } | { left: false; status: "finished"; stays_until: "session_end" };
 
 export interface JoinResult {
     agent_id: string;
@@ -188,6 +192,8 @@ export interface HookOutcome {
     continueFor?: HookNotice[];
     /** Every unread message for the agent, with those no hook points out; set with `notices` or `continueFor`. */
     unread?: number;
+    /** The card's blocker, still set when a turn starts (prompt or session start). */
+    blocker?: string;
 }
 
 /** An idle-wake watch: the session it watches, and the generation that keeps it live. */
@@ -200,6 +206,17 @@ export type WakeCheck =
     | { state: "stop" }
     | { state: "wait" }
     | { state: "wake"; notices: HookNotice[]; unread: number };
+
+/** A session the person at the board may wake; `session_id` is its host session, when hooks bound it. */
+export interface WakeTarget {
+    agent_id: string;
+    name: string;
+    client: string;
+    host: string | null;
+    session_id: string | null;
+    online: boolean;
+    status: AgentStatus;
+}
 
 /** A wake no watch made: the host session to wake and what to tell it. */
 export interface FallbackWake {
@@ -257,6 +274,8 @@ export interface CheckInResult {
     cursor: string;
     has_more?: true;
     revision: number;
+    /** The caller's own blocker, while one is set. */
+    blocker?: string;
 }
 
 /** A folder actually edited by a hook, newest first; paths are workspace-relative, with "." for its root. */
@@ -351,6 +370,8 @@ export interface RoomOverviewAgent {
     task: string;
     next_step: string;
     blocker: string;
+    /** When the blocker was set (ISO UTC), or null without one. */
+    blocker_since: string | null;
     editing: string[];
     recent_folders: RecentFolder[];
     workspace_path: string | null;
@@ -1107,12 +1128,13 @@ export class RoomStore {
      */
     private mergeIntoEarlierCard(hookCardId: string, displayName: string, workspaceId: string, nowText: string): string | null {
         const hook = this.prepare(`
-            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, current_directory, recent_folder_list, concos_version, status
+            SELECT handle_hash, host, host_session_id, hook_nudged_seq, wake_generation, woken_at_list, client, working_directory, current_directory, recent_folder_list, concos_version, status, client_pid
             FROM agent
             WHERE id = :id
         `).get({ id: hookCardId }) as {
             handle_hash: string; host: string | null; host_session_id: string | null; hook_nudged_seq: number; wake_generation: number;
             woken_at_list: string; client: string; working_directory: string | null; current_directory: string | null; recent_folder_list: string; concos_version: string | null; status: AgentStatus;
+            client_pid: number | null;
         };
         if(hook.host_session_id == null) {
             return null;
@@ -1160,6 +1182,7 @@ export class RoomStore {
                 recent_folder_list = :recent_folder_list,
                 concos_version = COALESCE(:concos_version, concos_version),
                 status = :status,
+                client_pid = :client_pid,
                 changed_seq = :changed_seq,
                 content_changed_seq = :changed_seq,
                 last_seen_at = :now,
@@ -1167,6 +1190,7 @@ export class RoomStore {
                 disconnected_at = NULL
             WHERE id = :to
         `).run({
+            client_pid: hook.client_pid,
             handle_hash: hook.handle_hash,
             host: hook.host,
             host_session_id: hook.host_session_id,
@@ -1317,7 +1341,13 @@ export class RoomStore {
                 workingDirectory: event.cwd, workspaceRoot: null, resumeHandle: null,
                 hookSession: { host: event.host, sessionId: event.sessionId },
             });
-            return { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id, 0, true), unread: this.countPending(joined.agent_id) };
+            this.recordClientPid(joined.agent_id, event.clientPid);
+            const started: HookOutcome = { agentId: joined.agent_id, joined: joined, notices: this.hookNotices(joined.agent_id, 0, true), unread: this.countPending(joined.agent_id) };
+            const blocker = this.requireAgent(joined.agent_id).blocker;
+            if(blocker != "") {
+                started.blocker = blocker;
+            }
+            return started;
         }
         return runInTransaction(this.database, () => {
             // (2) Participant
@@ -1384,10 +1414,15 @@ export class RoomStore {
                 disconnected: event.kind == "session-end" ? now : null,
                 wake_step: event.kind == "prompt" ? 1 : 0,
             });
+            // a session that started before 0.1.16 learns its client from its next hook
+            this.recordClientPid(row.id, event.clientPid);
             const outcome: HookOutcome = { agentId: row.id };
             if(event.kind == "prompt") {
                 outcome.notices = this.hookNotices(row.id, 0, true);
                 outcome.unread = this.countPending(row.id);
+                if(current.blocker != "") {
+                    outcome.blocker = current.blocker;
+                }
             }
             return outcome;
         });
@@ -1478,6 +1513,31 @@ export class RoomStore {
     }
 
     /**
+     * The sessions the person at the board can try to wake: agents that have not left and whose
+     * session has not ended through its end hook, heard from within a day (the longest a message
+     * lives). Offline and silent cards are included: an open session that was never given work
+     * goes offline, and the board's Wake all sessions is for exactly those (2026-10-28).
+     */
+    wakeTargets(nowMs: number = Date.now()): WakeTarget[] {
+        const rows = this.prepare(`
+            SELECT id, display_name, client, host, host_session_id, status, last_seen_at
+            FROM agent
+            WHERE room = :room
+                AND is_human = 0
+                AND left_at IS NULL
+                AND disconnected_at IS NULL
+                AND last_seen_at >= :since
+            ORDER BY display_name, id
+        `).all({ room: SHARED_ROOM, since: new Date(nowMs - MESSAGE_LIFETIME_MS).toISOString() }) as {
+            id: string; display_name: string; client: string; host: string | null; host_session_id: string | null; status: AgentStatus; last_seen_at: string;
+        }[];
+        return rows.map((row) => ({
+            agent_id: row.id, name: row.display_name, client: row.client, host: row.host, session_id: row.host_session_id,
+            online: nowMs - Date.parse(row.last_seen_at) <= OFFLINE_AFTER_MS, status: row.status,
+        }));
+    }
+
+    /**
      * The cards `fallbackWake` may wake: bound to a session of one of `hosts`, online, and quiet
      * for `WAKE_FALLBACK_MS`. Every MCP server looks at all of them, not only the cards joined
      * through it, so one server of this version on the machine covers every such session, even
@@ -1509,10 +1569,13 @@ export class RoomStore {
      * bound to a session of one of `hosts` and online, has not acted for as long, the wake is
      * recorded as a watch records it, any watch still running ends, and the session to wake comes
      * back. An offline card is left alone: its session may have closed without its end hook.
+     * `force`, for the person at the board waking every session, skips the online and waiting
+     * conditions; the wake still needs a message not pointed out yet.
      *
      * Reads take no lock; the wake is checked again under the write lock before it is recorded.
      */
-    fallbackWake(agentId: string, hosts: string[], nowMs: number = Date.now()): FallbackWake | null {
+    fallbackWake(agentId: string, hosts: string[], nowMs: number = Date.now(), options: { force?: boolean } = {}): FallbackWake | null {
+        const force = options.force == true;
         // the wake, and the wake times within the last hour
         const look = (): { wake: FallbackWake; woken: string[] } | null => {
             const row = this.prepare(`
@@ -1526,10 +1589,10 @@ export class RoomStore {
             if(row == null || row.host == null || row.host_session_id == null || hosts.includes(row.host) == false) {
                 return null;
             }
-            if(nowMs - Date.parse(row.last_seen_at) > OFFLINE_AFTER_MS) {
+            if(force == false && nowMs - Date.parse(row.last_seen_at) > OFFLINE_AFTER_MS) {
                 return null;
             }
-            if(row.last_call_at != null && nowMs - Date.parse(row.last_call_at) < WAKE_FALLBACK_MS) {
+            if(force == false && row.last_call_at != null && nowMs - Date.parse(row.last_call_at) < WAKE_FALLBACK_MS) {
                 return null;
             }
             const notices = this.hookNotices(agentId, row.hook_nudged_seq, true);
@@ -1537,7 +1600,7 @@ export class RoomStore {
                 return null;
             }
             const oldest = this.prepare(`SELECT created_at FROM message WHERE id = :id`).get({ id: notices[0].id }) as { created_at: string };
-            if(nowMs - Date.parse(oldest.created_at) < WAKE_FALLBACK_MS) {
+            if(force == false && nowMs - Date.parse(oldest.created_at) < WAKE_FALLBACK_MS) {
                 return null;
             }
             const woken = parseList(row.woken_at_list).filter((at) => nowMs - Date.parse(at) < 60 * 60 * 1000);
@@ -1607,7 +1670,12 @@ export class RoomStore {
             }
 
             const checkpoint = input.checkpoint?.trim() ?? "";
-            const { values, cardChanged: fieldsChanged, contentChanged, editingChanged } = applyCardUpdate(current, input.update);
+            // finished work is blocked by nothing: agents left a resolved blocker on the card (2026-10-28 report)
+            let update = input.update;
+            if(update.status == "finished" && update.blocker == null) {
+                update = { ...update, blocker: "" };
+            }
+            const { values, cardChanged: fieldsChanged, contentChanged, editingChanged } = applyCardUpdate(current, update);
             let displayName = current.display_name;
             if(input.update.displayName != null && input.update.displayName.trim() != "") {
                 displayName = input.update.displayName.trim();
@@ -1838,6 +1906,10 @@ export class RoomStore {
         }
         if(hasMore == true) {
             result.has_more = true;
+        }
+        // repeated on every check_in while set: agents left a resolved blocker on the card (2026-10-28 report)
+        if(agent.blocker != "") {
+            result.blocker = agent.blocker;
         }
         return result;
     }
@@ -2172,13 +2244,14 @@ export class RoomStore {
                 insertTopic.run({ message_id: inserted.id, topic_key: topic, position: position });
             });
 
-            // named recipients keep their receipt unless they left; a post has none
+            // every named recipient keeps a receipt, one that left too: it gets the message when it
+            // joins again. Without one, questions to a card that had left reached nobody, even after
+            // its session came back (2026-10-28 report). A post has none.
             const receipts = this.prepare(`
                 INSERT INTO message_receipt (message_id, agent_id)
                 SELECT :message_id, A.id
                 FROM agent AS A
                 WHERE A.room = :room
-                    AND A.left_at IS NULL
                     AND A.id IN (SELECT value FROM json_each(:recipients))
             `).run({
                 message_id: inserted.id,
@@ -2725,18 +2798,27 @@ export class RoomStore {
     }
 
     /** Leaves the final context on the card, clears the editing claim and marks the participant left. */
-    leave(agentId: string, input: { summary: string | null; nextStep: string | null; checkpoint: string | null }): { left: true } {
+    /**
+     * The agent's task is done. A card its session hooks hold, while that session is open, stays
+     * in the room as finished: agents called leave on finishing a task while the user kept the
+     * session open, and the messages sent to it next were stored without a receipt and never
+     * reached it, nor woke it (2026-10-28 report). The session's end hook ends the card. Any
+     * other card leaves. Either way it works nowhere and is blocked by nothing.
+     */
+    leave(agentId: string, input: { summary: string | null; nextStep: string | null; checkpoint: string | null }): LeaveResult {
         const nowText = new Date().toISOString();
-        runInTransaction(this.database, () => {
+        const stays = runInTransaction(this.database, () => {
             const current = this.requireAgent(agentId);
             if(current.left_at != null) {
-                return;
+                return false;
             }
+            const held = current.host_session_id != null && current.disconnected_at == null;
             // a participant that left works nowhere: its editing claim and current folder go
             const { values, contentChanged } = applyCardUpdate(current, {
                 status: "finished",
                 summary: input.summary ?? undefined,
                 nextStep: input.nextStep ?? undefined,
+                blocker: "",
                 editing: [],
                 currentDirectory: "",
             });
@@ -2759,16 +2841,20 @@ export class RoomStore {
                     editing_updated_at = :now,
                     last_seen_at = :now,
                     last_call_at = :now,
-                    left_at = :now
+                    left_at = CASE WHEN :stays = 1 THEN left_at ELSE :now END
                 WHERE id = :id
-            `).run({ ...values, changed_seq: this.nextSeq(), content_changed: Number(contentChanged || checkpoint != ""), now: nowText, id: agentId });
+            `).run({ ...values, changed_seq: this.nextSeq(), content_changed: Number(contentChanged || checkpoint != ""), now: nowText, stays: Number(held), id: agentId });
             if(checkpoint != "") {
                 this.prepare(`
                     INSERT INTO checkpoint (agent_id, workspace_id, body, created_at)
                     VALUES (:agent_id, :workspace_id, :body, :created_at)
                 `).run({ agent_id: agentId, workspace_id: current.workspace_id, body: checkpoint, created_at: nowText });
             }
+            return held;
         });
+        if(stays == true) {
+            return { left: false, status: "finished", stays_until: "session_end" };
+        }
         return { left: true };
     }
 
@@ -3019,6 +3105,31 @@ export class RoomStore {
         `).run({ now: new Date().toISOString(), concos_version: concosVersion ?? null, agent_ids: JSON.stringify(agentIds) });
     }
 
+    /**
+     * An MCP server keeps the cards of the client process it runs under online, joined through it
+     * or not: a session given no work never calls concos, and its card went offline within minutes
+     * (2026-10-28 report). Liveness only, as `heartbeat`.
+     */
+    keepAliveForClient(clientPid: number, concosVersion?: string): void {
+        this.prepare(`
+            UPDATE agent SET last_seen_at = :now, concos_version = COALESCE(:concos_version, concos_version)
+            WHERE client_pid = :client_pid AND left_at IS NULL AND disconnected_at IS NULL
+        `).run({ now: new Date().toISOString(), concos_version: concosVersion ?? null, client_pid: clientPid });
+    }
+
+    /**
+     * Binds the card to the client process its hook ran under. Any other card of that process was
+     * a session it ended or replaced (`/clear`, a resume), or one of an earlier process given the
+     * same id, so it lets go of the process.
+     */
+    private recordClientPid(agentId: string, clientPid: number | undefined): void {
+        if(clientPid == null) {
+            return;
+        }
+        this.prepare(`UPDATE agent SET client_pid = NULL WHERE client_pid = :client_pid AND id <> :id`).run({ client_pid: clientPid, id: agentId });
+        this.prepare(`UPDATE agent SET client_pid = :client_pid WHERE id = :id AND client_pid IS NOT :client_pid`).run({ client_pid: clientPid, id: agentId });
+    }
+
     /** An idle-wake watch still running: its session is open and waiting, so the card stays online. */
     keepAlive(agentId: string): void {
         this.prepare(`
@@ -3149,6 +3260,7 @@ export class RoomStore {
                 task: row.task,
                 next_step: row.next_step,
                 blocker: row.blocker,
+                blocker_since: row.blocker_since,
                 editing: parseList(row.editing_list),
                 recent_folders: parseRecentFolders(row.recent_folder_list),
                 workspace_path: workspacePath,

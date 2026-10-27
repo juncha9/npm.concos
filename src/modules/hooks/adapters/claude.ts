@@ -5,6 +5,8 @@ import { contextOutput, continueOutput, failed, fileArgument, normalizeEvent, ob
 export const claude: HostAdapter = {
     id: "claude",
     label: "Claude Code",
+    // claude.exe, the parent of the MCP servers it starts (checked 2026-10-28 on 2.1.x)
+    clientPidVariable: "CLAUDE_PID",
     registrations: [
         { event: "SessionStart", kind: "session-start", timeout: 10 },
         { event: "UserPromptSubmit", kind: "prompt", timeout: 10 },

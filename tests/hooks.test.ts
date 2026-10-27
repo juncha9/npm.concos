@@ -9,7 +9,7 @@ import { WAKE_FALLBACK_MS } from "../src/_defs";
 import { openDatabase } from "../src/modules/store/database";
 import { SCHEMA_STEPS } from "../src/modules/store/schema";
 import { RoomStore } from "../src/modules/store/room-store";
-import { processHook } from "../src/modules/hooks/handler";
+import { hookClientPid, processHook } from "../src/modules/hooks/handler";
 import { getHostAdapter, HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 import { watchForWake } from "../src/modules/hooks/watch";
 import type { HookEvent, HookEventKind } from "../src/modules/hooks/types";
@@ -38,18 +38,79 @@ function card(agentId: string) {
     return store.inspectAgent(agentId, { agentId, checkpointLimit: null, beforeCheckpointId: null }).card;
 }
 
+describe("client process liveness", () => {
+    const seenAt = (agentId: string) => (database.prepare("SELECT last_seen_at FROM agent WHERE id = ?").get(agentId) as { last_seen_at: string }).last_seen_at;
+    const age = (agentId: string, at: string) => database.prepare("UPDATE agent SET last_seen_at = ? WHERE id = ?").run(at, agentId);
+    const old = "2026-01-01T00:00:00.000Z";
+
+    it("keeps a session's card online from its client's MCP server before the model joins", () => {
+        const joined = start({ clientPid: 4242 });
+        const other = start({ sessionId: "session-2", clientPid: 5151 });
+        age(joined.agent_id, old);
+        age(other.agent_id, old);
+        store.keepAliveForClient(4242, "9.9.9");
+        expect(seenAt(joined.agent_id)).not.toBe(old);
+        expect(seenAt(other.agent_id)).toBe(old);
+        expect(database.prepare("SELECT concos_version FROM agent WHERE id = ?").get(joined.agent_id)).toEqual({ concos_version: "9.9.9" });
+        // its session's end lets go of it
+        store.applyHookEvent(event("session-end"), "dev");
+        age(joined.agent_id, old);
+        store.keepAliveForClient(4242);
+        expect(seenAt(joined.agent_id)).toBe(old);
+    });
+
+    it("moves a client process to the session that started in it last, and learns it from any later hook", () => {
+        const cleared = start({ clientPid: 4242 });
+        // `/clear` starts a new session in the same client
+        const next = start({ sessionId: "session-2", clientPid: 4242 });
+        age(cleared.agent_id, old);
+        store.keepAliveForClient(4242);
+        expect(seenAt(cleared.agent_id)).toBe(old);
+        expect(seenAt(next.agent_id)).not.toBe(old);
+        // a session from before this version names its client on its next prompt
+        const earlier = start({ sessionId: "session-3" });
+        store.applyHookEvent(event("prompt", { sessionId: "session-3", clientPid: 6161 }), "dev");
+        age(earlier.agent_id, old);
+        store.keepAliveForClient(6161);
+        expect(seenAt(earlier.agent_id)).not.toBe(old);
+    });
+
+    it("keeps the client process when the model's join merges the hook card into its earlier card", () => {
+        const earlier = store.join({ room: "main", displayName: "Server", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        const hook = start({ clientPid: 4242 });
+        const joined = store.join({ room: "main", displayName: "Server", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: hook.handle });
+        expect(joined.agent_id).toBe(earlier.agent_id);
+        age(earlier.agent_id, old);
+        store.keepAliveForClient(4242);
+        expect(seenAt(earlier.agent_id)).not.toBe(old);
+    });
+
+    it("reads the client process from the variable the client names, and from nothing else", () => {
+        try {
+            vi.stubEnv("CLAUDE_PID", "4242");
+            expect(hookClientPid(getHostAdapter("claude"))).toBe(4242);
+            // a Codex hook started from a Claude session's shell must not take that session's process
+            expect(hookClientPid(getHostAdapter("codex"))).toBeUndefined();
+            vi.stubEnv("CLAUDE_PID", "not-a-pid");
+            expect(hookClientPid(getHostAdapter("claude"))).toBeUndefined();
+        }
+        finally { vi.unstubAllEnvs(); }
+    });
+});
+
 describe("hook lifecycle", () => {
     it("restores a stable private handle across processes and keeps different hosts/sessions separate", async () => {
         const first = start();
         const second = start({ sessionId: "session-2" });
         const third = start({ host: "codex" });
         expect(new Set([first.agent_id, second.agent_id, third.agent_id]).size).toBe(3);
-        store.leave(first.agent_id, { summary: "kept", nextStep: null, checkpoint: "checkpoint" });
+        // an open session's card stays when its agent finishes; its handle comes back on a restart
+        expect(store.leave(first.agent_id, { summary: "kept", nextStep: null, checkpoint: "checkpoint" })).toEqual({ left: false, status: "finished", stays_until: "session_end" });
         const connection = await openDatabase(directory);
         try {
             const restarted = new RoomStore(connection).applyHookEvent(event("session-start"), "dev")!.joined!;
             expect(restarted).toMatchObject({ agent_id: first.agent_id, handle: first.handle, resumed: true });
-            expect(card(first.agent_id)).toMatchObject({ status: "working", left: false, summary: "kept" });
+            expect(card(first.agent_id)).toMatchObject({ left: false, summary: "kept" });
         }
         finally { connection.close(); }
         expect(store.applyHookEvent(event("session-start"), "other-room")!.joined!.agent_id).toBe(first.agent_id);
@@ -102,10 +163,63 @@ describe("hook lifecycle", () => {
         expect(store.applyHookEvent(event("turn-end"), "dev")).toBeNull();
         expect(store.applyHookEvent(event("file-edited", { files: ["x.ts"] }), "dev")).toBeNull();
         const joined = start();
-        store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        // once its session ended, leaving does leave
+        store.applyHookEvent(event("session-end"), "dev");
+        expect(store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null })).toEqual({ left: true });
         expect(store.applyHookEvent(event("file-edited", { files: ["x.ts"] }), "dev")).toBeNull();
         expect(store.applyHookEvent(event("prompt"), "dev")).toBeNull();
         expect(card(joined.agent_id).left).toBe(true);
+    });
+
+    it("keeps an open session's card in the room when its agent finishes, reachable and blocked by nothing", () => {
+        const joined = start();
+        store.checkIn(joined.agent_id, { update: { blocker: "waiting for review", editing: ["a.ts"] }, receivedMessageIds: [], checkpoint: null, cursor: null, expectedRevision: null });
+        store.leave(joined.agent_id, { summary: "done", nextStep: null, checkpoint: null });
+        expect(card(joined.agent_id)).toMatchObject({ left: false, status: "finished", blocker: "", editing: [], summary: "done" });
+        // a request sent next reaches it, and its hooks keep working
+        const from = store.join({ room: "main", displayName: "Asker", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const question = store.sendMessage(from, { to: joined.agent_id, kind: "question", text: "one more?", replyTo: null, requestId: null }).message_id;
+        expect(store.hookNotices(joined.agent_id, 0, true).map((notice) => notice.id)).toEqual([question]);
+        expect(store.applyHookEvent(event("prompt"), "dev")?.notices).toMatchObject([{ id: question }]);
+        expect(card(joined.agent_id).status).toBe("working");
+    });
+
+    it("keeps a message to a card that left for when it joins again", () => {
+        const gone = store.join({ room: "main", displayName: "Helper", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
+        store.leave(gone.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        const from = store.join({ room: "main", displayName: "Asker", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null }).agent_id;
+        const sent = store.sendMessage(from, { to: gone.agent_id, kind: "question", text: "still there?", replyTo: null, requestId: null });
+        expect(sent).toMatchObject({ recipient_count: 1, inactive_recipients: [gone.agent_id] });
+        store.join({ room: "main", displayName: "Helper", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: gone.handle });
+        expect(store.readMessages(gone.agent_id, { messageIds: null, limit: null }).messages.map((message) => message.id)).toEqual([sent.message_id]);
+    });
+
+    it("repeats a blocker in check_in and at a turn's start until it is cleared, and clears it when work finishes", () => {
+        const joined = start();
+        const report = (update: Record<string, unknown>) => store.checkIn(joined.agent_id, { update, receivedMessageIds: [], checkpoint: null, cursor: null, expectedRevision: null });
+        expect(report({ blocker: "needs schema review" }).blocker).toBe("needs schema review");
+        expect(report({ task: "next part" }).blocker).toBe("needs schema review");
+        expect(processHook(store, event("prompt"), "dev")?.context).toContain(`your card still reports blocker "needs schema review"`);
+        expect(report({ blocker: "" }).blocker).toBeUndefined();
+        expect(processHook(store, event("prompt"), "dev")?.context ?? "").not.toContain("blocker");
+        report({ blocker: "again" });
+        expect(report({ status: "finished" }).blocker).toBeUndefined();
+        expect(card(joined.agent_id).blocker).toBe("");
+    });
+
+    it("dates a blocker from when it was set, for every writer, and forgets the date when it clears", () => {
+        const joined = start();
+        const since = () => store.getRoomOverview("main", 0).agents.find((agent) => agent.agent_id == joined.agent_id)?.blocker_since;
+        expect(since()).toBeNull();
+        // a writer that never names the column, as an older bridge does
+        database.prepare("UPDATE agent SET blocker = 'needs review' WHERE id = ?").run(joined.agent_id);
+        const first = since();
+        expect(Date.now() - Date.parse(first!)).toBeLessThan(5000);
+        // the same blocker again keeps its date
+        database.prepare("UPDATE agent SET blocker = 'needs review', task = 'x' WHERE id = ?").run(joined.agent_id);
+        expect(since()).toBe(first);
+        database.prepare("UPDATE agent SET blocker = '' WHERE id = ?").run(joined.agent_id);
+        expect(since()).toBeNull();
     });
 
     it("gives a session whose hooks came on after it started a card at its first prompt, which its own card can take over", () => {
@@ -236,8 +350,12 @@ describe("recent edited folders", () => {
         expect(card(joined.agent_id).recent_folders).toEqual([]);
         start();
         store.applyHookEvent(event("file-edited", { files: ["docs/a.md"] }));
+        // finishing while the session is open keeps the card, and where it last worked
         store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        expect(card(joined.agent_id).recent_folders).toEqual([expect.objectContaining({ path: "docs" })]);
+        store.applyHookEvent(event("session-end"));
         expect(card(joined.agent_id).recent_folders).toEqual([]);
+        store.leave(joined.agent_id, { summary: null, nextStep: null, checkpoint: null });
         expect(store.applyHookEvent(event("file-edited", { files: ["late/a.ts"] }))).toBeNull();
     });
 
@@ -659,6 +777,33 @@ describe("Codex idle wake", () => {
         const woken = store.fallbackWakeCandidates(["codex"], later).map((agentId) => store.fallbackWake(agentId, ["codex"], later)?.sessionId);
         expect(woken.sort()).toEqual([THREAD_ID, "01a16d85-083e-7373-9dd6-6ae1676b6d7d"]);
     });
+
+    it("lets the person at the board wake an offline session at once, still once per message", () => {
+        const joined = start({ host: "codex", sessionId: THREAD_ID });
+        const question = ask(asker(), joined.agent_id);
+        // offline and just asked: the timed fallback leaves it, a forced wake does not
+        const later = Date.now() + 10 * 60 * 1000;
+        expect(store.fallbackWake(joined.agent_id, ["codex"], later)).toBeNull();
+        expect(store.fallbackWake(joined.agent_id, ["codex"], later, { force: true })).toMatchObject({ sessionId: THREAD_ID, notices: [{ id: question }] });
+        expect(store.fallbackWake(joined.agent_id, ["codex"], later, { force: true })).toBeNull();
+    });
+
+    it("lists the sessions the board can try to wake, offline ones included, but not ended, left or day-old ones", () => {
+        const live = start({ host: "codex", sessionId: THREAD_ID });
+        const idle = start({ sessionId: "claude-idle" });
+        const ended = start({ sessionId: "claude-ended" });
+        store.applyHookEvent(event("session-end", { sessionId: "claude-ended" }), "dev");
+        const mcpOnly = asker();
+        const nowMs = Date.now();
+        online(live.agent_id, nowMs + 20 * 60 * 1000);
+        const targets = store.wakeTargets(nowMs + 20 * 60 * 1000);
+        expect(targets.map((target) => target.agent_id).sort()).toEqual([live.agent_id, idle.agent_id, mcpOnly].sort());
+        expect(targets.find((target) => target.agent_id == live.agent_id)).toMatchObject({ host: "codex", session_id: THREAD_ID, online: true });
+        expect(targets.find((target) => target.agent_id == idle.agent_id)).toMatchObject({ host: "claude", online: false });
+        expect(targets.find((target) => target.agent_id == mcpOnly)).toMatchObject({ host: null, session_id: null });
+        expect(targets.some((target) => target.agent_id == ended.agent_id)).toBe(false);
+        expect(store.wakeTargets(nowMs + 25 * 60 * 60 * 1000).map((target) => target.agent_id)).toEqual([]);
+    });
 });
 
 describe("schema migration", () => {
@@ -683,8 +828,8 @@ describe("schema migration", () => {
         const leave = old.prepare("UPDATE agent SET editing_list = '[]', left_at = ? WHERE id = 'legacy'");
         const upgraded = await openDatabase(oldDirectory);
         try {
-            expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 14 });
-            expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({ ...before, recent_folder_list: "[]" });
+            expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: SCHEMA_STEPS.length });
+            expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({ ...before, recent_folder_list: "[]", client_pid: null, blocker_since: null });
             expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual(delivery);
             const folders = JSON.stringify([{ path: "src", at: now }]);
             const setFolders = upgraded.prepare("UPDATE agent SET recent_folder_list = ? WHERE id = 'legacy'");

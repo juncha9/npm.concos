@@ -142,6 +142,19 @@ export function age(isoText: string, nowMs: number, english: boolean): string {
     return english ? `${Math.floor(hours / 24)}d ago` : `${Math.floor(hours / 24)}일 전`;
 }
 
+/** How long the current blocker has been present, independent of later status updates. */
+export function blockerAge(agent: Pick<RoomOverviewAgent, "blocker" | "blocker_since">, nowMs: number, english: boolean): string {
+    if(agent.blocker.trim() == "" || agent.blocker_since == null) return "";
+    const elapsed = nowMs - Date.parse(agent.blocker_since);
+    if(Number.isFinite(elapsed) == false) return "";
+    const minutes = Math.max(0, Math.floor(elapsed / 60000));
+    if(minutes < 1) return english ? "now" : "방금";
+    if(minutes < 60) return english ? `${minutes}m` : `${minutes}분`;
+    const hours = Math.floor(minutes / 60);
+    if(hours < 24) return english ? `${hours}h` : `${hours}시간`;
+    return english ? `${Math.floor(hours / 24)}d` : `${Math.floor(hours / 24)}일`;
+}
+
 /** Where an agent works now, as a path from its project's root when inside it; empty at the root itself. */
 export function workFolder(agent: RoomOverviewAgent): string {
     // the folder it reported, else the one its session started in
@@ -317,7 +330,8 @@ export function renderRoomStatus(overview: {
         sortedAgents.forEach((agent, index) => {
             if(index > 0) lines.push("");
             const state = stateOf(agent);
-            const badge = `[${labels[state]}]`;
+            const blockedFor = blockerAge(agent, nowMs, english);
+            const badge = `[${labels[state]}${state == "blocked" && blockedFor != "" ? ` · ${blockedFor}` : ""}]`;
             const prefix = `  ${badge} `;
             let unread = "";
             if(agent.pending_count > 0) {
@@ -345,7 +359,7 @@ export function renderRoomStatus(overview: {
             field(english ? "Folder" : "폴더", workFolder(agent));
             field(english ? "Task" : "작업", agent.task);
             field(english ? "Next" : "다음", agent.next_step);
-            field(english ? "Blocker" : "막힘", agent.blocker, true);
+            field(english ? "Blocker" : "막힘", [blockedFor, agent.blocker].filter((text) => text != "").join(" · "), true);
             field(english ? "Editing" : "편집 중", agent.editing.join(", "));
         });
     }
@@ -421,7 +435,8 @@ function agentDetailSections(agent: RoomOverviewAgent, detail: InspectResult, op
     const state = stateOf(agent);
     const card = detail.card;
     // same shape as the board row the card was opened from: state word, then name
-    const stateText = `${stateLabel(state, english).toLowerCase()}  `;
+    const blockedFor = blockerAge(agent, nowMs, english);
+    const stateText = `${stateLabel(state, english).toLowerCase()}${state == "blocked" && blockedFor != "" ? ` · ${blockedFor}` : ""}  `;
     let unread = "";
     if(agent.pending_count > 0) {
         unread = english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`;
@@ -471,7 +486,7 @@ function agentDetailSections(agent: RoomOverviewAgent, detail: InspectResult, op
     }
     field(english ? "Task" : "작업", card.task);
     field(english ? "Next" : "다음", card.next_step);
-    field(english ? "Blocker" : "막힘", card.blocker, 31);
+    field(english ? "Blocker" : "막힘", [blockedFor, card.blocker].filter((text) => text != "").join(" · "), 31);
     field(english ? "Editing" : "편집 중", card.editing.join(", "));
     field(english ? "Summary" : "요약", card.summary);
     field(english ? "References" : "참고", card.references.join(", "));

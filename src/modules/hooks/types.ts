@@ -12,6 +12,8 @@ export interface HookEvent {
     client?: string;
     /** A turn end on a host that can continue the turn, outside a continuation it already asked for. */
     canContinue?: boolean;
+    /** The client process the hook ran under, when known; MCP servers under it keep the card online. */
+    clientPid?: number;
 }
 
 export interface HookRegistration {
@@ -44,6 +46,8 @@ export interface HostAdapter {
      * with code 2 and the line on stderr, which Claude Code's asyncRewake turns into a turn.
      */
     deliverWake?(sessionId: string, message: string): Promise<void>;
+    /** The environment variable in which the client names its own process id to the hooks and MCP servers it starts. */
+    clientPidVariable?: string;
     normalize(kind: HookEventKind, payload: unknown): HookEvent | null;
     output(kind: HookEventKind, context?: string): Record<string, unknown>;
     /** Output that continues the turn at its end; a host without one never continues a turn. */

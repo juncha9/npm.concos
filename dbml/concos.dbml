@@ -34,9 +34,11 @@ Table agent {
   summary varchar [not null, default: '']
   next_step varchar [not null, default: '']
   blocker varchar [not null, default: '']
+  blocker_since varchar [note: 'schema 15: when the blocker was set (ISO UTC), null without one; a trigger on blocker keeps it for every writer, the same blocker again keeps the time. The board shows the blocker age']
   reference_list varchar [not null, default: '[]', note: 'JSON string array']
   editing_list varchar [not null, default: '[]', note: 'JSON string array of paths from workspace_id; recalculated from the new project root when an explicit join moves the project. Cleared on leave and bridge shutdown']
   recent_folder_list varchar [not null, default: '[]', note: 'schema 14: JSON array of {path, at} from file-edited hooks; only folders inside the workspace, relative paths, root is ., ISO UTC times, newest first, distinct, at most 3. Kept across turns; an end/leave trigger clears it for older writers too. Delivered only to board and inspect_agent; changes alone do not raise revision or either change sequence']
+  client_pid integer [note: 'schema 15: the client process (claude.exe) a hook of this session ran under, from CLAUDE_PID or an exec-form hook parent; the MCP server under that process keeps the card online before the model joins (2026-10-28). A later session of the same process takes it over; null for Codex and older writers']
   revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
   content_changed_seq integer [not null, default: 0, note: 'schema 13: last content change; status, editing and activity alone leave it unchanged. Existing cards start from changed_seq. Agent content and checkpoint-insert triggers cover already-running older writers too']
@@ -50,7 +52,7 @@ Table agent {
   last_seen_at varchar [not null, note: 'bridge heartbeat or 60-second idle-watch keepAlive: Codex, or Claude exec form with a live parent at startup. Claude command-form watches, and exec watches whose parent was already absent, do not keep the card online']
   last_call_at varchar [note: 'last concos tool call or hook event of the agent itself, never the heartbeat; messages wait only on agents that acted within 30 minutes. Schema 7 filled existing cards from updated_at']
   disconnected_at varchar [note: 'set by bridge shutdown only without host_session_id; hook-bound cards stay connected across MCP server restarts and end through their session-end hook']
-  left_at varchar
+  left_at varchar [note: 'an explicit leave of a card no open session holds (2026-10-28): a card its hooks hold, while the session is open, stays finished instead. Messages to a card that left keep their receipt for when it joins again']
 
   indexes {
     (host, host_session_id) [unique, name: 'uk_agent_host_session']

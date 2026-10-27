@@ -12,8 +12,9 @@ import { openDatabase } from "../src/modules/store/database";
 import { RoomStore } from "../src/modules/store/room-store";
 import type { AgentIssue } from "../src/modules/store/room-store";
 import { TerminalScreen } from "./terminal-screen";
-import { agentLocation, recentFolderLines, renderAgentDetailHeader, renderAgentDetailBody, shortenPath } from "../src/modules/cli/status-renderer";
+import { agentLocation, blockerAge, recentFolderLines, renderAgentDetailHeader, renderAgentDetailBody, shortenPath } from "../src/modules/cli/status-renderer";
 import { displayWidth } from "../src/modules/cli/prompter";
+import { codex } from "../src/modules/hooks/adapters/codex";
 
 let directory: string;
 let database: DatabaseSync;
@@ -25,6 +26,7 @@ beforeEach(async () => {
     vi.stubEnv("CODEX_HOME", path.join(directory, "user", ".codex"));
     vi.stubEnv("CONCOS_REDUCED_MOTION", "1");
     vi.stubEnv("CONCOS_LOG_LEVEL", "none");
+    vi.spyOn(codex, "deliverWake").mockResolvedValue(undefined);
     database = await openDatabase(directory);
     store = new RoomStore(database);
 });
@@ -66,8 +68,9 @@ function terminal(columns = 80, rows = 24) {
     const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
     const output = Object.assign(new PassThrough(), { isTTY: true, columns, rows });
     const screen = new TerminalScreen(columns, rows);
+    let written = "";
     screen.write("D:\\work>concos\n");
-    output.on("data", (chunk) => screen.write(chunk.toString()));
+    output.on("data", (chunk) => { written += chunk.toString(); screen.write(chunk.toString()); });
     const prompter = new Prompter(input, output);
     const running = showRoomBoard(prompter, { language: "en", columns, send: async () => undefined });
     // Attach immediately, including when an assertion fails before the normal exit.
@@ -75,6 +78,7 @@ function terminal(columns = 80, rows = 24) {
     return {
         input, screen, running,
         visible: () => screen.visible().join("\n"),
+        written: () => written,
         key: async (key: string) => {
             input.write(key);
             await new Promise<void>((resolve) => setImmediate(resolve));
@@ -87,6 +91,154 @@ function terminal(columns = 80, rows = 24) {
         },
     };
 }
+
+describe("wake all sessions", () => {
+    function hooked(name: string, host: "codex" | "claude", sessionId = name): string {
+        const joined = store.applyHookEvent({ host, sessionId, cwd: directory, kind: "session-start", files: [], client: host == "codex" ? "Codex" : "Claude Code" })!.joined!;
+        update(joined.agent_id, { displayName: name });
+        return joined.agent_id;
+    }
+
+    it.each(["", "n", "ESC"])("does nothing when confirmation is declined with %j", async (answer) => {
+        hooked("Codex", "codex");
+        agent("MCP only");
+        const fallback = vi.spyOn(RoomStore.prototype, "fallbackWake");
+        const person = vi.spyOn(RoomStore.prototype, "ensureHumanParticipant");
+        const output = await board(`wake\n${answer}\nback\n`);
+        expect(output).toMatch(/Wake all sessions +2 sessions/);
+        expect(output).toContain("Wake all 2 sessions?");
+        expect(codex.deliverWake).not.toHaveBeenCalled();
+        expect(fallback).not.toHaveBeenCalled();
+        expect(person).not.toHaveBeenCalled();
+        expect(database.prepare("SELECT count(*) AS n FROM message").get()).toEqual({ n: 0 });
+    });
+
+    it("offers the action with no eligible targets, and reports zero without creating a person", async () => {
+        store.retireAgent(agent("Left"));
+        const person = vi.spyOn(RoomStore.prototype, "ensureHumanParticipant");
+        const output = await board("wake\ny\nback\n");
+        expect(output).toMatch(/Wake all sessions +0 sessions/);
+        expect(output).toContain("Codex queued: 0 (failed: 0).");
+        expect(output).toContain("Notes sent: 0.");
+        expect(person).not.toHaveBeenCalled();
+        expect(codex.deliverWake).not.toHaveBeenCalled();
+    });
+
+    it("includes silent sessions, queues Codex without unread messages, and sends notes to the other targets", async () => {
+        const codexOnline = hooked("Codex online", "codex");
+        const codexSilent = hooked("Codex silent", "codex");
+        const claude = hooked("Claude", "claude");
+        const hostless = agent("MCP only");
+        const unbound = agent("Missing session");
+        database.prepare("UPDATE agent SET host = 'codex' WHERE id = ?").run(unbound);
+        const silentAt = new Date(Date.now() - 35 * 60_000).toISOString();
+        database.prepare("UPDATE agent SET last_seen_at = ?, last_call_at = ?, updated_at = ? WHERE id = ?").run(silentAt, silentAt, silentAt, codexSilent);
+        const left = agent("Left");
+        store.retireAgent(left);
+        const ended = hooked("Closed", "claude");
+        store.applyHookEvent({ host: "claude", sessionId: "Closed", cwd: directory, kind: "session-end", files: [] });
+        const expired = agent("Expired");
+        database.prepare("UPDATE agent SET last_seen_at = ? WHERE id = ?").run(new Date(Date.now() - 25 * 60 * 60_000).toISOString(), expired);
+        store.ensureHumanParticipant("main", os.userInfo().username);
+        const overview = store.getRoomOverview("main", 0);
+        expect(overview.agents.find((card) => card.agent_id == codexSilent)).toMatchObject({ ended: true, online: false });
+        expect(store.wakeTargets().map((target) => target.agent_id).sort()).toEqual([codexOnline, codexSilent, claude, hostless, unbound].sort());
+        const person = vi.spyOn(RoomStore.prototype, "ensureHumanParticipant");
+        const output = await board("wake\ny\nback\n");
+        expect(output).toMatch(/Wake all sessions +5 sessions/);
+        expect(output).toContain("Codex queued: 2 (failed: 0).");
+        expect(output).toContain("Notes sent: 3.");
+        expect(output.replace(/\s+/g, " ")).toContain("Claude Code sessions wake only if a turn ended since they started; type in the others.");
+        const queue = vi.mocked(codex.deliverWake!);
+        expect(queue).toHaveBeenCalledTimes(2);
+        for(const session of ["Codex online", "Codex silent"]) {
+            expect(queue).toHaveBeenCalledWith(session, "concos: the person at the board asks you to check in. Read unread messages with read_messages if any.");
+        }
+        expect(person).toHaveBeenCalledOnce();
+        const notes = database.prepare("SELECT M.recipient_agent_id AS id, M.kind, M.body, S.is_human AS human FROM message M JOIN agent S ON S.id = M.sender_agent_id ORDER BY M.recipient_agent_id").all();
+        expect(notes).toEqual([claude, hostless, unbound].sort().map((id) => ({ id, kind: "note", body: "Please check in with concos: report your current status.", human: 1 })));
+        expect(notes.some((note) => [left, ended, expired].includes(String(note.id)))).toBe(false);
+    });
+
+    it("forces a recent working Codex session's unread wake and keeps its receipt unread", async () => {
+        const reader = hooked("Codex", "codex");
+        update(reader, { status: "working" });
+        const person = store.ensureHumanParticipant("main", os.userInfo().username);
+        const id = send(person, reader);
+        const fallback = vi.spyOn(RoomStore.prototype, "fallbackWake");
+        const output = await board("wake\ny\nback\n");
+        expect(output).toContain("Codex queued: 1 (failed: 0).");
+        expect(fallback).toHaveBeenCalledExactlyOnceWith(reader, ["codex"], expect.any(Number), { force: true });
+        expect(codex.deliverWake).toHaveBeenCalledExactlyOnceWith("Codex", expect.stringContaining(`question #${id}`));
+        const text = vi.mocked(codex.deliverWake!).mock.calls[0][1];
+        expect(text).toContain("[concos_dev]");
+        expect(text).toContain("Read them with read_messages, and answer questions with kind reply if they need one.");
+        expect(store.pendingFor(reader)).toMatchObject([{ id, notified: true }]);
+        expect(database.prepare("SELECT delivered_at, received_at FROM message_receipt WHERE message_id = ? AND agent_id = ?").get(id, reader)).toEqual({ delivered_at: null, received_at: null });
+        expect(database.prepare("SELECT count(*) AS n FROM message").get()).toEqual({ n: 1 });
+    });
+
+    it("starts queue deliveries concurrently and counts rejection without stopping the others", async () => {
+        for(const name of ["One", "Two", "Three"]) hooked(name, "codex");
+        const deliveries: { resolve: () => void; reject: (error: Error) => void }[] = [];
+        vi.mocked(codex.deliverWake!).mockImplementation(() => new Promise<void>((resolve, reject) => deliveries.push({ resolve, reject })));
+        const running = board("wake\ny\nback\n");
+        void running.catch(() => undefined);
+        try {
+            await vi.waitFor(() => expect(deliveries).toHaveLength(3));
+        }
+        finally {
+            deliveries.forEach((delivery, index) => index == 1 ? delivery.reject(new Error("Queue unavailable")) : delivery.resolve());
+        }
+        const output = await running;
+        expect(output).toContain("Codex queued: 2 (failed: 1).");
+        expect(output).toContain("Notes sent: 0.");
+    });
+
+    it("keeps sending when one note fails, reporting it separately from queue failures", async () => {
+        hooked("Codex", "codex");
+        const failed = agent("Cannot receive");
+        agent("Can receive");
+        const original = RoomStore.prototype.sendMessage;
+        vi.spyOn(RoomStore.prototype, "sendMessage").mockImplementation(function(this: RoomStore, sender, input) {
+            if(input.to == failed) throw new Error("Cannot send this note");
+            return original.call(this, sender, input);
+        });
+        const output = await board("wake\ny\nback\n");
+        expect(output).toContain("Codex queued: 1 (failed: 0).");
+        expect(output).toContain("Notes sent: 1 (failed: 1).");
+        expect(codex.deliverWake).toHaveBeenCalledOnce();
+    });
+
+    it("shows the wake action only on the Agents tab", async () => {
+        agent("Reader");
+        const output = await board("messages\nback\n");
+        const views = output.split("? Waiting room").slice(1);
+        expect(views[0]).toContain("Wake all sessions");
+        expect(views[1]).not.toContain("Wake all sessions");
+    });
+
+    it("confirms and reports on a narrow terminal, then restores the board and its selection", async () => {
+        hooked("Codex", "codex");
+        hooked("Claude", "claude");
+        const tty = terminal(54, 20);
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("Wake all sessions"));
+            const before = tty.screen.visible().findIndex((line) => line.includes("? Waiting room"));
+            await tty.key("2");
+            await tty.key("\r");
+            await vi.waitFor(() => expect(tty.visible()).toContain("Wake all 2 sessions?"));
+            await tty.key("y\r");
+            await vi.waitFor(() => expect(tty.visible()).toContain("Codex queued: 1 (failed: 0)."));
+            expect(tty.visible()).toContain("Notes sent: 1.");
+            await tty.key("\r");
+            await vi.waitFor(() => expect(tty.visible()).toContain("? Waiting room"));
+            expect(tty.screen.visible().findIndex((line) => line.includes("? Waiting room"))).toBe(before);
+            expect(tty.screen.visible().find((line) => /^[❯>]/.test(line))).toContain("Wake all sessions");
+        }
+        finally { await tty.close(); }
+    });
+});
 
 describe("board message actions", () => {
     it("opens an older waiting message in full without acknowledging or delivering it for the agent", async () => {
@@ -268,6 +420,21 @@ describe("board views and navigation", () => {
         expect(database.prepare("SELECT display_name, role FROM agent WHERE id = ?").get(target)).toEqual({ display_name: "Renamed", role: "" });
     });
 
+    it("tells the agent of each change the person makes to its name or role, and of nothing else", async () => {
+        const target = agent("Original");
+        update(target, { role: "API owner" });
+        // the second role edit is Enter, which keeps Deployments
+        await board("Original\nname\nRenamed\nrole\nDeployments\nrole\n\nrole\n-\nback\nback\n");
+        const notes = database.prepare(`
+            SELECT M.kind, M.body, S.is_human FROM message AS M JOIN agent AS S ON S.id = M.sender_agent_id
+            WHERE M.recipient_agent_id = ? ORDER BY M.id
+        `).all(target) as { kind: string; body: string; is_human: number }[];
+        expect(notes.map((note) => [note.kind, note.is_human])).toEqual([["note", 1], ["note", 1], ["note", 1]]);
+        expect(notes[0].body).toContain(`renamed your card from "Original" to "Renamed"`);
+        expect(notes[1].body).toContain(`changed your role from "API owner" to "Deployments"`);
+        expect(notes[2].body).toContain(`removed your role (it was "Deployments")`);
+    });
+
     it("reports a taken name and hides agent editing actions on human cards", async () => {
         const target = agent("Original");
         agent("Taken", "other-project");
@@ -280,53 +447,83 @@ describe("board views and navigation", () => {
         expect(human).not.toMatch(/\d+\) Role/);
     });
 
-    it("edits prefilled name and role in the board and cancels each with Esc", async () => {
+    it("edits Name and Role on their rows, restores drafts with Esc and saves without another prompt", async () => {
         const target = agent("Original");
         update(target, { role: "API owner" });
         const tty = terminal();
         try {
             await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 1]"));
             await tty.key("\r");
-            for(const field of ["name", "role"]) {
-                for(const cancel of [true, false]) {
-                    await tty.key(field == "name" ? "1" : "2");
-                    await tty.key("\r");
-                    if(field == "name") {
-                        expect(tty.visible()).toContain("Name Original");
-                    }
-                    else {
-                        expect(tty.visible()).toContain("Role (clear to remove) API owner");
-                    }
-                    await tty.key("2");
-                    if(cancel == true) {
-                        await tty.key("\u001b");
-                    }
-                    else {
-                        await tty.key("\r");
-                    }
-                    expect(tty.visible()).not.toContain("? Waiting room");
-                    expect(tty.visible()).toContain("its next join may set it back");
-                    const saved = database.prepare("SELECT display_name, role FROM agent WHERE id = ?").get(target)!;
-                    if(field == "name") {
-                        let expected = "Original2";
-                        if(cancel == true) {
-                            expected = "Original";
-                        }
-                        expect(saved.display_name).toBe(expected);
-                        expect(tty.visible()).toContain(`? ${expected} (Codex)`);
-                        expect(tty.visible()).toMatch(cancel ? /[>❯] Name/ : /[>❯] Role/);
-                    }
-                    else {
-                        let expected = "API owner2";
-                        if(cancel == true) {
-                            expected = "API owner";
-                        }
-                        expect(saved.role).toBe(expected);
-                        expect(tty.visible()).toMatch(cancel ? /[>❯] Role/ : /[>❯] Send a message/);
-                    }
-                    expect(tty.visible()).not.toMatch(/[✔√]/);
-                }
+            for(const [field, original] of [["Name", "Original"], ["Role", "API owner"]]) {
+                if(field == "Role") await tty.key("\u001b[B");
+                expect(tty.visible()).toMatch(new RegExp(`[>❯] ${field} +${original}`));
+                const start = tty.written().length;
+                await tty.key("2");
+                expect(tty.written().slice(start)).not.toContain("\u001b[J");
+                expect(tty.written().slice(start)).not.toContain("? Name");
+                await tty.key("\u001b");
+                expect(tty.visible()).toMatch(new RegExp(`[>❯] ${field} +${original}`));
+                expect(database.prepare("SELECT display_name, role FROM agent WHERE id = ?").get(target)).toMatchObject(field == "Name" ? { display_name: original } : { role: original });
+                await tty.key("\u001b[H");
+                await tty.key("새");
+                await tty.key("\u001b[F");
+                await tty.key("2");
+                await tty.key("\r");
+                expect(database.prepare("SELECT display_name, role FROM agent WHERE id = ?").get(target)).toMatchObject(field == "Name" ? { display_name: `새${original}2` } : { role: `새${original}2` });
+                expect(tty.visible()).toMatch(new RegExp(`[>❯] ${field}`));
+                expect(tty.visible()).not.toContain("? Waiting room");
+                expect(tty.visible()).not.toMatch(/[✔√]/);
             }
+            expect(database.prepare("SELECT count(*) AS n FROM message WHERE kind = 'note'").get()).toEqual({ n: 2 });
+            await tty.key("\u001b");
+            expect(tty.visible()).toContain("? Waiting room");
+            expect(tty.visible()).toMatch(/[>❯].*새Original2/);
+        }
+        finally { await tty.close(); }
+    });
+
+    it.each([["\u001bOQ", "Name"], ["\u001b[12~", "Name"], ["\u001b[1;1Q", "Name"], ["\u0012", "Role"]])("opens the selected card's %s shortcut straight into %s", async (key, field) => {
+        agent("Alpha");
+        const target = agent("Zed");
+        update(target, { role: "API owner" });
+        const tty = terminal(54, 24);
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 2]"));
+            expect(tty.visible()).toContain("F2 name · Ctrl+R role");
+            await tty.key("\u001b[B");
+            await tty.key(key);
+            expect(tty.visible()).toContain("? Zed (Codex)");
+            expect(tty.visible()).toMatch(new RegExp(`[>❯] ${field}`));
+            await tty.key("\u0015");
+            await tty.key("한글 편집");
+            await tty.key("\u001b[H");
+            await tty.key("A");
+            await tty.key("\u001b[F");
+            await tty.key("\u007f");
+            await tty.key("\r");
+            expect(database.prepare("SELECT display_name, role FROM agent WHERE id = ?").get(target)).toMatchObject(field == "Name" ? { display_name: "A한글 편" } : { role: "A한글 편" });
+            await tty.key("\u001b");
+            expect(tty.visible()).toMatch(field == "Name" ? /[>❯].*A한글 편/ : /[>❯].*Zed/);
+        }
+        finally { await tty.close(); }
+    });
+
+    it("keeps an inline draft through refresh and restores the latest saved role on Esc", async () => {
+        const target = agent("Original");
+        update(target, { role: "API owner" });
+        const tty = terminal();
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 1]"));
+            await tty.key("\u0012");
+            await tty.key("2");
+            update(target, { role: "New responsibility" });
+            await new Promise((resolve) => setTimeout(resolve, 1050));
+            expect(tty.visible()).toMatch(/[>❯] Role +API owner2/);
+            await tty.key("\u001b");
+            expect(tty.visible()).toMatch(/[>❯] Role +New responsibility/);
+            expect(database.prepare("SELECT role FROM agent WHERE id = ?").get(target)).toEqual({ role: "New responsibility" });
+            await tty.key("\u001b");
+            expect(tty.visible()).toContain("? Waiting room");
         }
         finally { await tty.close(); }
     });
@@ -338,7 +535,6 @@ describe("board views and navigation", () => {
         try {
             await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 1]"));
             await tty.key("\r");
-            await tty.key("\r");
             await tty.key("\u0015");
             await tty.key("\r");
             expect(tty.visible()).toContain("A name must contain 1 to");
@@ -346,13 +542,12 @@ describe("board views and navigation", () => {
             expect(tty.visible()).toContain("? Original (Codex)");
             expect(tty.visible()).toMatch(/[>❯] Name/);
             expect(database.prepare("SELECT display_name FROM agent WHERE id = ?").get(target)).toEqual({ display_name: "Original" });
-            await tty.key("2");
-            await tty.key("\r");
+            await tty.key("\u001b[B");
             await tty.key("\u0015");
             await tty.key("-");
             await tty.key("\r");
             expect(tty.visible()).toContain("? Original (Codex)");
-            expect(tty.visible()).toMatch(/Role\s+none/);
+            expect(tty.visible()).toMatch(/Role\s+[▏_]? *none/);
             expect(database.prepare("SELECT role FROM agent WHERE id = ?").get(target)).toEqual({ role: "" });
         }
         finally { await tty.close(); }
@@ -513,7 +708,7 @@ describe("board views and navigation", () => {
         expect(output).not.toContain("2 on old concos");
     });
 
-    it("aligns only the latest folder after names and unread counts in compact and detail headers, fitting CJK paths", async () => {
+    it("joins the latest folder directly after each name and unread count, fitting CJK paths", async () => {
         const short = agent("A");
         const long = agent("Longest name");
         const reported = agent("Reported");
@@ -532,12 +727,13 @@ describe("board views and navigation", () => {
             expect(shortLine).toContain("src/cli");
             expect(shortLine).not.toContain("src/db");
             expect(shortLine).not.toMatch(/\+\d/);
-            expect(shortLine.indexOf("src/cli")).toBe(longLine.indexOf("tests"));
+            expect(shortLine).toContain("A (Codex) (1 unread) · src/cli · just now");
+            expect(longLine).toContain("Longest name (Codex) · tests · just now");
             expect(view).not.toMatch(/\n +Folder/);
         }
         const detail = output.split("? A (Codex)")[1];
         expect(detail).toMatch(/A \(Codex\) \(1 unread\) +src\/cli/);
-        expect(output).toMatch(/Reported \(Codex\) +docs \(reported\)/);
+        expect(output).toMatch(/Reported \(Codex\) · docs \(reported\)/);
         const card = store.getRoomOverview("main", 0).agents.find((entry) => entry.agent_id == short)!;
         card.recent_folders = [{ path: "프로젝트/아주긴경로/화면", at: "unused" }, { path: "tests", at: "unused" }, { path: "docs", at: "unused" }];
         for(const unicode of [false, true]) {
@@ -561,7 +757,7 @@ describe("board views and navigation", () => {
         expect(output).not.toContain(". (reported)");
         if(edited) {
             const views = output.split("? Waiting room").slice(1);
-            for(const view of views.slice(0, 3)) expect(view).toMatch(/Root card \(Codex\) +\(root\)/);
+            for(const view of views.slice(0, 3)) expect(view).toMatch(/Root card \(Codex\) · \(root\)/);
             expect(output.split("? Root card (Codex)")[1]).toMatch(/Root card \(Codex\) +\(root\)/);
         }
         else {
@@ -678,12 +874,78 @@ describe("board views and navigation", () => {
         expect(views).toHaveLength(3);
         expect(views[0]).toContain("Role");
         expect(views[0]).toContain("Next");
-        expect(views[1]).toMatch(/working +Alpha \(Codex\) \(1 unread\) · Alpha task/);
-        expect(views[1]).toMatch(/blocked +Zed \(Codex\) · Zed task/);
+        expect(views[1]).toMatch(/working +Alpha \(Codex\) \(1 unread\) · just now · Alpha task/);
+        expect(views[1]).toMatch(/blocked +Zed \(Codex\) · just now · Zed task/);
         expect(views[1]).not.toContain("API owner");
         expect(views[1]).not.toContain("Alpha next step");
         expect(views[2]).toContain("API owner");
         for(const view of views) expect(view.indexOf("Alpha (Codex)")).toBeLessThan(view.indexOf("Zed (Codex)"));
+    });
+
+    it.each([[54, true], [54, false], [80, true]])("shows an active compact card's blocker in place of its task (%s columns, color=%s)", async (columns, color) => {
+        vi.stubEnv("NO_COLOR", color ? undefined : "1");
+        const target = agent("Alpha");
+        agent("Zed");
+        update(target, { task: "Ordinary task", blocker: "Need deployment access" });
+        database.prepare("UPDATE agent SET blocker_since = ? WHERE id = ?").run(new Date(Date.now() - 121 * 60000).toISOString(), target);
+        const tty = terminal(columns as number, 24);
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 2]"));
+            expect(tty.visible()).toMatch(/Blocker +2h · Need deployment/);
+            await tty.key("1");
+            await tty.key("\r");
+            await tty.key("4");
+            const focused = tty.screen.visible().find((line) => /[>❯].*Alpha/.test(line))!;
+            expect(focused).toContain("2h · Need");
+            expect(focused).not.toContain("Ordinary");
+            expect(displayWidth(focused)).toBeLessThan(columns as number);
+            if(color) expect(tty.written()).toMatch(/\u001b\[31m2h · Need[^\n]*\u001b\[39m/);
+            else expect(tty.written()).not.toMatch(/\u001b\[[0-9;]*m/);
+            await tty.key("\u001b[B");
+            expect(tty.screen.visible().find((line) => line.includes("Alpha"))).toContain("Ordinary");
+        }
+        finally { await tty.close(); }
+    });
+
+    it("uses the blocker's own age in the detail and keeps a finished open session on the main board", async () => {
+        const joined = store.applyHookEvent({ host: "codex", sessionId: "open", cwd: directory, kind: "session-start", files: [], client: "Codex" })!.joined!;
+        update(joined.agent_id, { displayName: "Finished open", blocker: "Need access", task: "Completed implementation" });
+        const blockedAt = new Date(Date.now() - 121 * 60000).toISOString();
+        database.prepare("UPDATE agent SET blocker_since = ? WHERE id = ?").run(blockedAt, joined.agent_id);
+        let card = store.getRoomOverview("main", 0).agents.find((entry) => entry.agent_id == joined.agent_id)!;
+        expect(blockerAge(card, Date.now(), true)).toBe("2h");
+        const detail = store.inspectAgent(card.agent_id, { agentId: card.agent_id, checkpointLimit: 0, beforeCheckpointId: null });
+        expect(renderAgentDetailHeader(card, detail, { language: "en" })).toContain("blocked · 2h");
+        expect(renderAgentDetailBody(card, detail, { language: "en" })).toMatch(/Blocker +2h · Need access/);
+        expect(blockerAge({ ...card, blocker_since: null }, Date.now(), true)).toBe("");
+        expect(blockerAge({ ...card, blocker_since: "invalid" }, Date.now(), true)).toBe("");
+        expect(blockerAge({ ...card, blocker: "" }, Date.now(), true)).toBe("");
+        store.leave(card.agent_id, { summary: "Done", nextStep: null, checkpoint: null });
+        card = store.getRoomOverview("main", 0).agents.find((entry) => entry.agent_id == joined.agent_id)!;
+        expect(card).toMatchObject({ status: "finished", left: false, ended: false });
+        const output = await board("back\n");
+        expect(output).toMatch(/finished +Finished open/);
+        expect(output).not.toContain("Show ended sessions");
+    });
+
+    it.each([false, true])("places a refreshed pulse directly between name and folder without moving the selected card (compact=%s)", async (compact) => {
+        const target = agent("Alpha");
+        agent("A much longer participant name");
+        update(target, { task: "Old task" });
+        database.prepare("UPDATE agent SET recent_folder_list = ? WHERE id = ?").run(JSON.stringify([{ path: "src/card", at: new Date().toISOString() }]), target);
+        const tty = terminal(100, 30);
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("[Agents 2]"));
+            if(compact) { await tty.key("1"); await tty.key("\r"); }
+            await tty.key("5");
+            const before = tty.screen.visible().findIndex((line) => /[>❯].*Alpha/.test(line));
+            expect(before).toBeGreaterThanOrEqual(0);
+            expect(tty.visible()).toContain("Alpha (Codex) · src/card · just now");
+            update(target, { task: "New task" });
+            await vi.waitFor(() => expect(tty.visible()).toContain("Alpha (Codex) · UPDATED · src/card · just now"), { timeout: 1800 });
+            expect(tty.screen.visible().findIndex((line) => /[>❯].*Alpha/.test(line))).toBe(before);
+        }
+        finally { await tty.close(); }
     });
 
     it("leaves unread-only warnings out of both the bulk count and the cards taken down", async () => {
@@ -737,7 +999,8 @@ describe("board views and navigation", () => {
             await tty.key("\r");
             await vi.waitFor(() => {
                 const row = tty.screen.visible().find((line) => line.includes("Search messages"));
-                expect(row).toMatch(/[❯>] Search messages +cart[▏_]/);
+                expect(row).toMatch(/[❯>] Search messages +cart$/);
+                expect(tty.screen.cursor()).toEqual({ row: tty.screen.visible().indexOf(row!), column: displayWidth(row!), visible: true });
             });
             await tty.key("\r");
             await vi.waitFor(() => expect(tty.visible()).toContain("Message search · cart · 1 result"));

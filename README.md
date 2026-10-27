@@ -195,9 +195,9 @@ ordinary folder changes keep it there. An explicit containing `workspace_root` c
 correct the project through `join` as described below. All projects share the
 waiting room.
 
-- The first line shows state, name, unread count, the most recent edit folder and
-  report age when space allows. Locations align after the widest name and unread
-  count in each project group. Long paths lose whole leading folders (`src/modules/cli` →
+- The first line shows state, then the name with its unread count, the activity
+  label while it pulses (`UPDATED`, `STATE`, …), the most recent edit folder and
+  the report age, joined by ` · ` with no padding after the name. Long paths lose whole leading folders (`src/modules/cli` →
   `…/modules/cli` → `…/cli`); only a final folder name that cannot fit by itself is
   cut within the name. In narrow windows the path takes priority over the report age.
   The location uses normal brightness while the agent has editing claims, and dims after
@@ -208,17 +208,26 @@ waiting room.
   header. The detail's **Recent folders** section shows up to three folders on
   separate lines, newest first, each with its own last edit age. Details refresh
   while open too.
-- The following lines show role, blocker, task and next step. **Task** and
+- The following lines show role, blocker (with how long it has been set), task and next step. **Task** and
   **Next** each show up to two wrapped lines, followed by an ellipsis if needed.
   Other row fields are shortened with an ellipsis when they exceed the window.
 - Open a card for its full summary, editing claims, references and recent
   checkpoints. The **Card** group sits directly below the identity and workspace,
   before waiting messages and work details. It has **Name** and **Role** rows showing their current
-  values (`none` for an empty role). Selecting a row opens its existing text with
-  the cursor at the end. Saving stays in the detail, reloads the card and moves
-  the cursor to the next row without opening it. Esc stays on the original row
-  with its value unchanged. Clear a role's text or replace it with `-` to remove it.
-  Scripted line input uses the current value as its Enter default and `-` to clear.
+  values (`none` for an empty role). On a terminal you edit them right on the
+  row: type while it is selected (digits are text there), move with ← / → and
+  Home / End, delete with Backspace / Delete, clear with Ctrl+U. Enter saves; Esc
+  first puts back the saved value, then leaves. ↑ / ↓ move between rows. The
+  terminal's cursor stands in the field, so a Korean or other input method shows
+  the letters it is composing there. Clear a role to remove it. Scripted line
+  input picks the row, then takes the new value, with the current one as its Enter
+  default and `-` to clear.
+  On the Agents tab, **F2** opens the selected agent's card on **Name** and
+  **Ctrl+R** on **Role**, ready for typing.
+  Each change that is saved sends the agent a note from you with the old and new
+  value, asking it to keep the new one; saving the same value sends nothing. A
+  waiting session with a running watch reads it at once, any other on its next
+  concos call.
   **Send a message**, **Take down this card** and **Back** complete the group,
   with separators before and after **Take down this card**.
   After sending or cancelling a message, the detail returns on **Send a message**.
@@ -236,6 +245,7 @@ waiting room.
   **Show ended sessions**.
 - **Compact view** in the top menu shows one line per card: state, name,
   unread count and folders, with the task when space remains, in the same order.
+  The selected card shows its blocker in red, with its age, in place of the task.
 
 A card that looks wrong shows a yellow **Check** line saying why:
 
@@ -252,6 +262,20 @@ messages go to the live card of its name when there is one. A session still usin
 it can join again with its handle. **Take down flagged cards** leaves out cards
 whose only check is an unannounced message: those sessions are fine, and typing in
 them is the fix.
+
+**Wake all sessions**, at the top of the Agents tab, asks first (Enter is no). It
+then reaches every agent heard from within 24 hours, offline and ended cards
+included; people, cards taken down and sessions closed through their end hook are
+left out.
+
+| Session | What it gets |
+| --- | --- |
+| Codex, bound by hooks | A line in its queue naming its unread messages, or asking it to check in; an open session starts a turn |
+| Others | A note asking it to check in |
+
+A Claude Code session wakes for the note within a minute only if a turn has ended
+since it started, since only then is its watch running; type in the others. The
+result counts the Codex queues, the failures and the notes sent.
 
 Names include the client, such as `Dev / API 01 (Claude Code)` and
 `Dev_DX / API 01 (Codex)`. The same names appear in message details and recipient
@@ -323,6 +347,7 @@ holds a steady highlight for the same duration; `NO_COLOR` keeps the path readab
 | --- | --- |
 | `CONCOS_REDUCED_MOTION=1` | Use static indicators |
 | `NO_COLOR` | Keep text indicators and status labels without color |
+| `CONCOS_UNICODE=1` or `0` | Draw `❯ ✔ ─ █` (`1`) or their plain `> √ - =` stand-ins (`0`). Without it, Windows uses them only in Windows Terminal, VS Code, JetBrains and ConEmu, since the legacy console shows them as boxes; set `1` if your terminal draws them but shows `====` |
 | `CONCOS_BOARD_TRACE=<file>` | Append one JSON line per redraw, refresh, key and resize to the file, for reporting a display problem. It holds sizes, positions and row ids, never row text |
 | Piped output | Disable color and animation |
 
@@ -432,6 +457,18 @@ bridge that ends releases its claims, but marks only cards without a host sessio
 as disconnected. A hook-bound card stays connected across MCP server restarts
 inside the same session; its session-end hook records the end.
 
+When an agent finishes its task, `leave` clears its editing claims and blocker. A
+card held by an open session's hooks stays in the room as `finished` and answers
+`left: false`, since the user often keeps the session open and gives it more
+work: messages still reach it and idle wake still wakes it. The session-end hook
+ends it. A card without hooks leaves; a message sent to it is kept and reaches it
+when it joins again with its handle.
+
+A blocker stays on the card until the agent clears it with `blocker: ""`. While
+it is set, `check_in` answers repeat it as `you.blocker`, and a hook-bound
+session's turn starts with a reminder line. Reporting `status: "finished"` clears
+it as well.
+
 Messages are short-lived: one is deleted an hour after it was read, and within a
 day in any case. Agents are told to write what an exchange settles (a design, a
 decision, a contract or a plan) into the project's docs and cite the path in the
@@ -476,7 +513,8 @@ instructions are supplied through MCP, and their execution depends on the agent.
   and `inspect_agent` receive `recent_folders: [{ path, at }]`: paths are relative
   to the project (`.` for its root), and `at` is the last edit time in ISO UTC.
   Editing a folder again moves it to the front. These records survive turn end
-  and clear on session end or `leave`. Manual editing claims do not create them.
+  and clear when the session ends or the card leaves; a card that stays as
+  finished keeps them. Manual editing claims do not create them.
   Edits outside the project remain editing claims but do not change recent folders.
   They are absent from `check_in` cards, and updating only these records does
   not advance either card change sequence.
@@ -644,6 +682,19 @@ Applying **Update available** from a global Windows installation selects Claude'
 exec form. Command-based registrations on macOS, Linux and npx runs keep the
 wake-only behavior above.
 A running MCP bridge still keeps its joined cards online through its own heartbeat.
+
+A session given no work since it started never calls concos, so its card used to
+go offline within minutes. Two things now keep it online:
+
+- **Claude Code:** its hooks record the client process (`CLAUDE_PID`, or the
+  hook's parent in exec form). The MCP server running under that process keeps the
+  card online before the model joins, for as long as the client runs.
+- **Codex:** with idle wake on, the session-start hook starts the same detached
+  watch a turn end starts. The card stays online, and a message can start the
+  session's first turn.
+
+A Claude Code session that has not finished a turn still cannot be woken from
+outside; type in it.
 
 Two agents that keep sending each other notes keep waking each other. An answer
 to an answer never wakes anyone.

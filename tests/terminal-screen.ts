@@ -19,6 +19,7 @@ const CONTROL_SEQUENCE = /\u001b\[([0-9;?]*)([A-Za-z])/y;
 export class TerminalScreen {
     private readonly main: ScreenBuffer;
     private alternate: ScreenBuffer | null = null;
+    private cursorVisible = true;
 
     constructor(private readonly columns: number, private readonly rows: number) {
         this.main = this.blank();
@@ -45,6 +46,12 @@ export class TerminalScreen {
     /** The window's rows as they show now, trailing spaces cut. */
     visible(): string[] {
         return this.active().cells.map((cells) => this.text(cells));
+    }
+
+    /** The actual VT cursor, independently of any glyph a prompt draws as a caret. */
+    cursor(): { row: number; column: number; visible: boolean } {
+        const { row, column } = this.active();
+        return { row, column, visible: this.cursorVisible };
     }
 
     /** The main screen's scrollback and window rows: what the shell shows once the program is gone. */
@@ -111,6 +118,8 @@ export class TerminalScreen {
         }
         else if(command == "h" && parameters == "?1049") this.alternate = this.blank();
         else if(command == "l" && parameters == "?1049") this.alternate = null;
-        // colours and cursor visibility change nothing a test reads
+        else if(command == "h" && parameters == "?25") this.cursorVisible = true;
+        else if(command == "l" && parameters == "?25") this.cursorVisible = false;
+        // colours change nothing a test reads
     }
 }

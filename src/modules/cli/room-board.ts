@@ -6,9 +6,11 @@ import { resolveDataDirectory } from "../../_libs/paths";
 import { openDatabase } from "../store/database";
 import { RoomStore } from "../store/room-store";
 import type { RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
+import { HOST_ADAPTERS } from "../hooks/adapters";
+import { describeWake } from "../hooks/notices";
 import { displayWidth, padToWidth, PromptBackError } from "./prompter";
-import type { LinePart, Prompter, SelectChoice, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
-import { age, issueText, plain, renderAgentDetailHeader, renderAgentDetailBody, recentFolderLines, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, agentLocation, shortenPath, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
+import type { LinePart, Prompter, SelectChoice, SelectInput, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
+import { age, blockerAge, issueText, plain, renderAgentDetailHeader, renderAgentDetailBody, recentFolderLines, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, agentLocation, shortenPath, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
 import type { State, StatusRenderOptions } from "./status-renderer";
 import { showMessageSearch } from "./message-search";
 import { RoomActivity } from "./room-activity";
@@ -29,6 +31,8 @@ const SENDER_LEAD_SPAN = 60;
 const TIDY_REQUEST = "Please tidy your posts to all: remove the ones that no longer apply with remove_posts, and rewrite the ones that changed with send_message edit. Reply briefly once done. Your posts:";
 /** Width of the first line each post shows in that question. */
 const TIDY_PREVIEW_WIDTH = 80;
+const MANUAL_WAKE = "concos: the person at the board asks you to check in. Read unread messages with read_messages if any.";
+const CHECK_IN_REQUEST = "Please check in with concos: report your current status.";
 const STATE_PRIORITY: State[] = ["blocked", "working", "waiting", "idle", "finished", "offline", "left", "human"];
 /** States whose rows recede: nothing is expected of them right now. */
 const RECEDING_STATES: State[] = ["idle", "finished", "offline", "left"];
@@ -42,7 +46,7 @@ export interface RoomBoardOptions extends StatusRenderOptions {
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "search:messages" | "retire:flagged" | "back";
+type BoardValue = `agent:${string}` | `edit:name:${string}` | `edit:role:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "search:messages" | "retire:flagged" | "wake:all" | "back";
 
 type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
@@ -171,16 +175,17 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
         }
         return english ? ` (${agent.pending_count} unread)` : ` (미확인 ${agent.pending_count})`;
     };
-    const nameWidthOf = (agent: RoomOverviewAgent): number => displayWidth(participantName(agent.name, agent.client, agent.human) + unreadText(agent));
-    const agentRow = (agent: RoomOverviewAgent, groupNameWidth: number): SelectItem<BoardValue> => {
+    const agentRow = (agent: RoomOverviewAgent): SelectItem<BoardValue> => {
         const state = stateOf(agent);
         const receding = RECEDING_STATES.includes(state);
+        const blockedFor = blockerAge(agent, nowMs, english);
+        const blocker = [blockedFor, oneLine(agent.blocker)].filter((text) => text != "").join(" · ");
         // label, text, tone, lines shown: the role stays put, so one line is enough
         const fields: [string, string, "plain" | "danger" | "warning", number][] = [
             // what looks wrong comes first, in yellow, so the person at the board can take the card down
             ...agent.issues.map((issue): [string, string, "warning", number] => [fieldLabels.check, issueText(issue, nowMs, english), "warning", 1]),
             [fieldLabels.role, oneLine(agent.role), "plain", 1],
-            [fieldLabels.blocker, oneLine(agent.blocker), "danger", 1],
+            [fieldLabels.blocker, blocker, "danger", 1],
             [fieldLabels.task, oneLine(agent.task), "plain", 2],
             [fieldLabels.next, oneLine(agent.next_step), "plain", 2],
         ];
@@ -201,26 +206,35 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                     { text: padToWidth(activity.indicator(`agent:${agent.agent_id}`, state == "working") + stateLabel(state, english).toLowerCase(), stateWidth), paint: statePaint(style, state) },
                 ];
                 const name = participantName(agent.name, agent.client, agent.human);
-                const nameWidth = Math.min(groupNameWidth, Math.max(4, width - stateWidth - 17));
-                const shownName = compactText(name, Math.max(4, nameWidth - displayWidth(unread)), unicode);
+                // Identity, pulse, folder, age: no name-column padding or empty badge slot.
+                const badges = activity.badge(`agent:${agent.agent_id}`, style).map((part) => ({ ...part, text: part.text.trim() }));
+                const badgeWidth = badges.reduce((total, part) => total + displayWidth(part.text), 0) + (badges.length > 0 ? 3 : 0);
+                const showBlocker = compact && active && agent.blocker.trim() != "";
+                const task = showBlocker ? blocker : oneLine(agent.task);
+                const taskReserve = showBlocker ? Math.min(displayWidth(task), Math.max(8, Math.floor((width - stateWidth) / 3))) + 3 : 0;
+                const fullLocation = agentLocation(agent, Math.max(0, width - stateWidth), unicode, english);
+                let locationReserve = 0;
+                if(fullLocation.paths.length > 0) {
+                    const minimum = fullLocation.reported ? displayWidth(english ? " (reported)" : " (보고됨)") + 4 : 4;
+                    locationReserve = Math.min(displayWidth(fullLocation.paths[0]), minimum) + 3;
+                }
+                const nameWidth = Math.max(4, width - stateWidth - displayWidth(unread) - badgeWidth - locationReserve - taskReserve);
+                const shownName = compactText(name, nameWidth, unicode);
                 first.push({ text: shownName, paint: paintName });
                 if(unread != "") first.push({ text: unread, paint: style.warning });
-                const badges = compact ? [] : activity.badge(`agent:${agent.agent_id}`, style);
-                let trailing = compact ? [] : [...badges, { text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim }];
-                const padding = " ".repeat(Math.max(2, nameWidth - displayWidth(shownName + unread) + 2));
-                const used = first.reduce((total, part) => total + displayWidth(part.text), 0) + padding.length;
-                const trailingWidth = trailing.reduce((total, part) => total + displayWidth(part.text), 0);
-                let location = agentLocation(agent, Math.max(0, width - used - trailingWidth), unicode, english);
-                if(!compact) {
-                    const badgeWidth = badges.reduce((total, part) => total + displayWidth(part.text), 0);
-                    const expanded = agentLocation(agent, Math.max(0, width - used - badgeWidth), unicode, english);
-                    if(displayWidth(expanded.paths[0] ?? "") > displayWidth(location.paths[0] ?? "")) {
-                        location = expanded;
-                        trailing = badges;
-                    }
+                if(badges.length > 0) first.push({ text: " · ", paint: style.dim }, ...badges);
+                const used = first.reduce((total, part) => total + displayWidth(part.text), 0);
+                const elapsed = { text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim };
+                const locationBudget = Math.max(0, width - used - taskReserve - 3);
+                let location = agentLocation(agent, Math.max(0, locationBudget - displayWidth(elapsed.text)), unicode, english);
+                const expanded = agentLocation(agent, locationBudget, unicode, english);
+                let showTime = true;
+                if(displayWidth(expanded.paths[0] ?? "") > displayWidth(location.paths[0] ?? "")) {
+                    location = expanded;
+                    showTime = false;
                 }
                 if(location.paths.length > 0) {
-                    first.push({ text: padding });
+                    first.push({ text: " · ", paint: style.dim });
                     const baseline = location.reported || agent.editing.length == 0 ? style.dim : undefined;
                     location.paths.forEach((folder, index) => {
                         if(index > 0) {
@@ -230,12 +244,12 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                         first.push({ text: folder, paint });
                     });
                 }
-                first.push(...trailing);
+                const remaining = width - first.reduce((total, part) => total + displayWidth(part.text), 0);
+                if(showTime && displayWidth(elapsed.text) + taskReserve <= remaining) first.push(elapsed);
                 if(compact) {
-                    const task = oneLine(agent.task);
                     const remaining = width - first.reduce((total, part) => total + displayWidth(part.text), 0) - 3;
                     if(task != "" && remaining >= 6) {
-                        first.push({ text: " · ", paint: style.dim }, { text: compactText(task, remaining, unicode), paint: receding ? style.dim : undefined });
+                        first.push({ text: " · ", paint: style.dim }, { text: compactText(task, remaining, unicode), paint: showBlocker ? style.danger : receding ? style.dim : undefined });
                     }
                     return [first];
                 }
@@ -307,9 +321,8 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
             items.push({ separator: true, rule: true, label: name, hint });
         }
         const sortedMembers = [...members].sort((left, right) => left.name.localeCompare(right.name));
-        const groupNameWidth = Math.max(...members.map(nameWidthOf));
         for(const agent of sortedMembers) {
-            items.push(agentRow(agent, groupNameWidth));
+            items.push(agentRow(agent));
         }
     }
 
@@ -321,9 +334,8 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
             hint: english ? "left, closed, or silent for 30 minutes" : "퇴장, 종료, 또는 30분 동안 신호 없음",
         });
         const newestFirst = [...inactive].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-        const groupNameWidth = Math.max(...inactive.map(nameWidthOf));
         for(const agent of newestFirst) {
-            items.push(agentRow(agent, groupNameWidth));
+            items.push(agentRow(agent));
         }
     }
     return { items: items, inactiveCount: inactive.length };
@@ -578,6 +590,12 @@ function buildView(
                 hint: flagged.map((agent) => agent.name).join(", "),
             });
         }
+        const wakeCount = store.wakeTargets(nowMs).length;
+        items.push({
+            value: "wake:all", key: "wake",
+            label: english ? "Wake all sessions" : "모든 세션 깨우기",
+            hint: english ? `${wakeCount} session${wakeCount == 1 ? "" : "s"}` : `세션 ${wakeCount}개`,
+        });
         items.push({ value: "back", label: english ? "Back" : "뒤로" }, { separator: true }, ...built.items);
     }
 
@@ -679,7 +697,7 @@ async function selectInPlace<T extends string>(
     }
 }
 
-async function setName(options: { prompter: Prompter; store: RoomStore; agent: RoomOverviewAgent; english: boolean }): Promise<boolean> {
+async function setName(options: { prompter: Prompter; store: RoomStore; agent: RoomOverviewAgent; english: boolean; value?: string }): Promise<boolean> {
     const { prompter, store, agent, english } = options;
     const previous = prompter.transient;
     prompter.transient = true;
@@ -689,7 +707,7 @@ async function setName(options: { prompter: Prompter; store: RoomStore; agent: R
         label = "Name";
     }
     try {
-        name = await prompter.ask(label, { initialValue: agent.name });
+        name = options.value?.trim() ?? await prompter.ask(label, { initialValue: agent.name });
     }
     catch(error) {
         if(error instanceof PromptBackError) {
@@ -716,11 +734,28 @@ async function setName(options: { prompter: Prompter; store: RoomStore; agent: R
         await reportInPlace(prompter, report);
         return false;
     }
+    const renamed = name.trim();
+    if(renamed != agent.name) {
+        tellAgentOfBoardEdit(store, agent, `The person at the board renamed your card from "${agent.name}" to "${renamed}". Use "${renamed}" as your display_name from now on; if the user renames this session later, follow that.`);
+    }
     return true;
 }
 
+/**
+ * Tells the agent what the person changed on its card. Its context still holds the old value,
+ * so it did not know, and its next check_in or join could put the old one back (2026-10-28 user
+ * report). A note: a waiting session with a running watch reads it now, any other on its next call.
+ */
+function tellAgentOfBoardEdit(store: RoomStore, agent: RoomOverviewAgent, text: string): void {
+    if(agent.human == true || agent.left == true) {
+        return;
+    }
+    const person = store.ensureHumanParticipant(SHARED_ROOM, os.userInfo().username);
+    store.sendMessage(person, { to: agent.agent_id, kind: "note", text: text, replyTo: null, requestId: null });
+}
+
 /** The role entered in the card form; an empty value or `-` clears it, Esc keeps the saved value. */
-async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, english: boolean): Promise<boolean> {
+async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, english: boolean, value?: string): Promise<boolean> {
     const previous = prompter.transient;
     prompter.transient = true;
     let typed: string;
@@ -729,7 +764,7 @@ async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverview
         label = english ? "Role (- to remove)" : "역할 (-로 삭제)";
     }
     try {
-        typed = await prompter.ask(label, { initialValue: agent.role });
+        typed = value?.trim() ?? await prompter.ask(label, { initialValue: agent.role });
     }
     catch(error) {
         if(error instanceof PromptBackError) {
@@ -749,19 +784,42 @@ async function setRole(prompter: Prompter, store: RoomStore, agent: RoomOverview
         return false;
     }
     store.setRoleFromBoard(agent.agent_id, role);
+    const saved = role.trim();
+    if(saved != agent.role) {
+        let text = `The person at the board set your role to "${saved}". Report it as your role; change it only when the user asks.`;
+        if(agent.role != "") {
+            text = `The person at the board changed your role from "${agent.role}" to "${saved}". Report it as your role; change it only when the user asks.`;
+        }
+        if(saved == "") {
+            text = `The person at the board removed your role (it was "${agent.role}"). Do not set one again unless the user gives you one.`;
+        }
+        tellAgentOfBoardEdit(store, agent, text);
+    }
     return true;
 }
 
-async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions, activity: RoomActivity): Promise<void> {
+async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOverviewAgent, options: RoomBoardOptions, activity: RoomActivity, initialAction: "name" | "role" = "name"): Promise<void> {
     const english = options.language == "en";
     type AgentAction = `message:${number}` | "say" | "name" | "role" | "retire" | "back";
-    let selected: AgentAction = "name";
+    let selected: AgentAction = initialAction;
+    const nameInput: SelectInput = { text: oneLine(agent.name), savedText: oneLine(agent.name), edit: true };
+    const roleInput: SelectInput = { text: oneLine(agent.role), savedText: oneLine(agent.role), edit: true, placeholder: english ? "none" : "없음" };
+    const syncInputs = (current: RoomOverviewAgent): void => {
+        for(const [input, value] of [[nameInput, oneLine(current.name)], [roleInput, oneLine(current.role)]] as const) {
+            if(input.text == input.savedText && value != input.savedText) {
+                input.text = value;
+                input.cursor = [...value].length;
+            }
+            input.savedText = value;
+        }
+    };
     for(;;) {
         const found = store.getRoomOverview(SHARED_ROOM, 0).agents.find((candidate) => candidate.agent_id == agent.agent_id);
         if(found == null) {
             return;
         }
         let current = found;
+        syncInputs(current);
         // the agent itself is the viewer: inspectAgent only requires both to be in the same room
         let detail = store.inspectAgent(current.agent_id, {
             agentId: current.agent_id,
@@ -801,8 +859,9 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
                 items.push({
                     value: "name", label: english ? "Name" : "이름",
                     hint: `${oneLine(current.name)} · ${english ? "its next join may set it back" : "다음 참가 때 세션 이름으로 돌아갈 수 있음"}`,
+                    input: prompter.isInteractive ? nameInput : undefined,
                 });
-                items.push({ value: "role", label: english ? "Role" : "역할", hint: oneLine(current.role) || (english ? "none" : "없음") });
+                items.push({ value: "role", label: english ? "Role" : "역할", hint: oneLine(current.role) || (english ? "none" : "없음"), input: prompter.isInteractive ? roleInput : undefined });
             }
             if(current.human == false && current.left == false) {
                 items.push({ value: "say", label: english ? "Send a message" : "메시지 보내기", hint: english ? "to this agent" : "이 에이전트에게" });
@@ -844,6 +903,7 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
                     const refreshed = overview.agents.find((candidate) => candidate.agent_id == current.agent_id);
                     if(refreshed != null) {
                         current = refreshed;
+                        syncInputs(current);
                         detail = store.inspectAgent(current.agent_id, { agentId: current.agent_id, checkpointLimit: DETAIL_CHECKPOINT_LIMIT, beforeCheckpointId: null });
                         pending = store.pendingFor(current.agent_id);
                     }
@@ -862,15 +922,26 @@ async function showAgent(prompter: Prompter, store: RoomStore, agent: RoomOvervi
         }
         if(action == "name") {
             selected = "name";
-            if(await setName({ prompter, store, agent: current, english }) == true) {
-                selected = "role";
+            if(await setName({ prompter, store, agent: current, english, value: prompter.isInteractive ? nameInput.text : undefined }) == true) {
+                if(prompter.isInteractive == true) {
+                    nameInput.text = nameInput.text.trim();
+                    nameInput.savedText = nameInput.text;
+                    nameInput.cursor = [...nameInput.text].length;
+                }
+                else selected = "role";
             }
             continue;
         }
         if(action == "role") {
             selected = "role";
-            if(await setRole(prompter, store, current, english) == true) {
-                selected = current.left == false ? "say" : "back";
+            if(await setRole(prompter, store, current, english, prompter.isInteractive ? roleInput.text : undefined) == true) {
+                if(prompter.isInteractive == true) {
+                    roleInput.text = roleInput.text.trim();
+                    if(roleInput.text == "-") roleInput.text = "";
+                    roleInput.savedText = roleInput.text;
+                    roleInput.cursor = [...roleInput.text].length;
+                }
+                else selected = current.left == false ? "say" : "back";
             }
             continue;
         }
@@ -950,6 +1021,52 @@ async function reportInPlace(prompter: Prompter, report: string): Promise<void> 
         }
     }
     prompter.eraseLines(writtenLineCount(report));
+}
+
+/** The person explicitly wakes even silent sessions; one failed host must not stop the rest. */
+async function wakeAllSessions(prompter: Prompter, store: RoomStore, options: RoomBoardOptions): Promise<void> {
+    const english = options.language == "en";
+    const targets = store.wakeTargets();
+    const question = english
+        ? `Wake all ${targets.length} session${targets.length == 1 ? "" : "s"}?`
+        : `세션 ${targets.length}개를 모두 깨울까요?`;
+    if(await confirmInPlace(prompter, question) == false) return;
+
+    const hosts = HOST_ADAPTERS.filter((adapter) => adapter.deliverWake != null).map((adapter) => adapter.id);
+    const queueTargets = new Set<string>();
+    let person: string | undefined;
+    const results = await Promise.allSettled(targets.map(async (target) => {
+        const adapter = HOST_ADAPTERS.find((item) => item.id == target.host);
+        if(adapter?.deliverWake != null && target.session_id != null) {
+            queueTargets.add(target.agent_id);
+            const wake = store.fallbackWake(target.agent_id, hosts, Date.now(), { force: true });
+            await adapter.deliverWake(target.session_id, wake == null ? MANUAL_WAKE : describeWake(wake.notices, wake.unread));
+            return "queue";
+        }
+        person ??= store.ensureHumanParticipant(SHARED_ROOM, os.userInfo().username);
+        store.sendMessage(person, { to: target.agent_id, kind: "note", text: CHECK_IN_REQUEST, replyTo: null, requestId: null });
+        return "note";
+    }));
+    let queued = 0, queueFailed = 0, notes = 0, notesFailed = 0;
+    results.forEach((result, index) => {
+        if(result.status == "fulfilled") {
+            if(result.value == "queue") queued += 1;
+            else notes += 1;
+        }
+        else if(queueTargets.has(targets[index].agent_id)) queueFailed += 1;
+        else notesFailed += 1;
+    });
+    const report = english ? [
+        `Codex queued: ${queued} (failed: ${queueFailed}).`,
+        `Notes sent: ${notes}${notesFailed > 0 ? ` (failed: ${notesFailed})` : ""}.`,
+        "Claude Code sessions wake only if a turn ended since they started; type in the others.",
+    ] : [
+        `Codex 큐 전송: ${queued}건 (실패: ${queueFailed}건).`,
+        `메모 전송: ${notes}건${notesFailed > 0 ? ` (실패: ${notesFailed}건)` : ""}.`,
+        "Claude Code는 시작 후 턴이 끝난 세션만 깨어납니다. 나머지 세션에는 직접 입력하세요.",
+    ];
+    const width = Math.max(19, (options.columns ?? 80) - 1);
+    await reportInPlace(prompter, report.flatMap((line) => wrap(line, width)).join("\n"));
 }
 
 /**
@@ -1053,6 +1170,11 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
 
         // The current tab keeps its row after actions; entering another tab starts at its list.
         const selected: Partial<Record<BoardTab, BoardValue>> = {};
+        const editShortcut = (action: "name" | "role", value: BoardValue): BoardValue | undefined => {
+            const agent = view.agents.find((candidate) => `agent:${candidate.agent_id}` == value);
+            if(agent == null || agent.human == true) return undefined;
+            return `edit:${action}:${agent.agent_id}`;
+        };
         for(;;) {
             const display = frame();
             const picked: BoardValue = await selectInPlace<BoardValue>(prompter, display.question, view.items, {
@@ -1060,6 +1182,10 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
                 banner: view.banner,
                 defaultValue: selected[tab] ?? view.defaultValue,
                 cancelValue: "back",
+                shortcuts: tab == "tab:agents" ? [
+                    { keys: ["\u001bOQ", "\u001b[12~", "\u001b[1;1Q"], hint: english ? "F2 name" : "F2 이름", value: (value) => editShortcut("name", value) },
+                    { keys: ["\u0012"], hint: english ? "Ctrl+R role" : "Ctrl+R 역할", value: (value) => editShortcut("role", value) },
+                ] : undefined,
                 animation: { intervalMs: ANIMATION_FRAME_MS, frame },
                 refresh: {
                     intervalMs: BOARD_REFRESH_MS,
@@ -1110,8 +1236,21 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
                 view = loadView();
                 continue;
             }
+            if(picked == "wake:all") {
+                selected[tab] = picked;
+                await wakeAllSessions(prompter, store, options);
+                view = loadView();
+                continue;
+            }
 
-            selected[tab] = picked;
+            let cardValue = picked;
+            let initialAction: "name" | "role" = "name";
+            if(picked.startsWith("edit:name:")) cardValue = `agent:${picked.slice("edit:name:".length)}`;
+            else if(picked.startsWith("edit:role:")) {
+                cardValue = `agent:${picked.slice("edit:role:".length)}`;
+                initialAction = "role";
+            }
+            selected[tab] = cardValue;
             if(picked.startsWith("message:") == true) {
                 const message = view.messages.find((candidate) => `message:${candidate.id}` == picked);
                 if(message != null) {
@@ -1119,9 +1258,9 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
                 }
             }
             else {
-                const agent = view.agents.find((candidate) => `agent:${candidate.agent_id}` == picked);
+                const agent = view.agents.find((candidate) => `agent:${candidate.agent_id}` == cardValue);
                 if(agent != null) {
-                    await showAgent(prompter, store, agent, options, activity);
+                    await showAgent(prompter, store, agent, options, activity, initialAction);
                 }
             }
             view = loadView();

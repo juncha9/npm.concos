@@ -16,7 +16,7 @@ export interface WakeTimings {
 export const WAKE_TIMINGS: WakeTimings = { idleMs: WAKE_IDLE_MS, pollMs: WAKE_POLL_MS, watchMs: WAKE_WATCH_MS, keepAliveMs: HEARTBEAT_INTERVAL_MS };
 
 /** Whether process `pid` still runs; one that exists but may not be signalled counts as running. */
-function isRunning(pid: number): boolean {
+export function isRunning(pid: number): boolean {
     try {
         process.kill(pid, 0);
         return true;

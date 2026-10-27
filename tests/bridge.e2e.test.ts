@@ -23,6 +23,9 @@ function childEnvironment(): Record<string, string> {
         }
     }
     environment.CONCOS_HOME = dataDirectory;
+    // a Codex session start reads the user's hooks for idle wake: the real ones would start
+    // detached watches that outlive the test and hold its folder open
+    environment.CODEX_HOME = path.join(dataDirectory, "codex-home");
     return environment;
 }
 
