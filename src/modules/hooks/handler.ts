@@ -76,21 +76,50 @@ async function readPayload(): Promise<unknown> {
 
 /** Set on a watch that goes on in a node of its own: the hook event it watches, as JSON. */
 const WATCH_EVENT_VARIABLE = "CONCOS_WATCH_EVENT";
+/** How long a hook waits for the PowerShell that starts its watch on Windows; it takes about half a second. */
+const WATCH_LAUNCH_TIMEOUT_MS = 5000;
 
 /**
- * Starts the watch for `event` in a node of its own and returns at once. Waking from outside
- * needs nothing back from the hook, so the shell Codex runs hooks in (PowerShell, about 64 MB)
- * does not stay for the watch's day. The watch still ends when the session does, through its end hook.
+ * Starts the watch for `event` in a node of its own. Waking from outside needs nothing back from
+ * the hook, so the shell Codex runs hooks in (PowerShell, about 64 MB) does not stay for the
+ * watch's day. The watch still ends when the session does, through its end hook. Resolves once
+ * the watch is on its way: at once, or on Windows when the PowerShell starting it has ended.
  */
-function startDetachedWatch(adapter: HostAdapter, event: HookEvent): void {
-    const watch = spawn(process.execPath, [...NODE_FLAGS, process.argv[1], "hook", "watch", "--host", adapter.id], {
-        detached: true, stdio: "ignore", windowsHide: true,
-        // database logging stays off the watch's stderr unless the user set a level
-        env: { ...process.env, CONCOS_LOG_LEVEL: process.env.CONCOS_LOG_LEVEL ?? "none", [WATCH_EVENT_VARIABLE]: JSON.stringify(event) },
+function startDetachedWatch(adapter: HostAdapter, event: HookEvent): Promise<void> {
+    const args = [...NODE_FLAGS, process.argv[1], "hook", "watch", "--host", adapter.id];
+    // database logging stays off the watch's stderr unless the user set a level
+    const env = { ...process.env, CONCOS_LOG_LEVEL: process.env.CONCOS_LOG_LEVEL ?? "none", [WATCH_EVENT_VARIABLE]: JSON.stringify(event) };
+    if(process.platform != "win32") {
+        const watch = spawn(process.execPath, args, { detached: true, stdio: "ignore", env: env });
+        // a watch that cannot start is left for the next turn end; the hook still ends quietly
+        watch.on("error", (error) => $logger.error(error, "idle-wake watch did not start"));
+        watch.unref();
+        return Promise.resolve();
+    }
+    // On Windows a child started from a hook that a shell ran holds the hook's output pipe open, and
+    // a host that waits for that pipe (Codex, for its session-start hook) waited out the whole watch:
+    // "hook timed out after 10s", and the session lost its join context (2026-10-28 report; node
+    // spawn and cmd start both held it). Start-Process starts the watch without handing it any
+    // handle. PowerShell needs a console for that and ends with the hook's, so the hook waits for
+    // it, about half a second.
+    const quote = (text: string) => `'${text.replaceAll("'", "''")}'`;
+    const argumentList = args.map((arg) => quote(/\s/.test(arg) ? `"${arg}"` : arg)).join(",");
+    const script = `Start-Process -FilePath ${quote(process.execPath)} -ArgumentList ${argumentList} -WindowStyle Hidden`;
+    const launcher = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
+        stdio: "ignore", windowsHide: true, env: env,
     });
-    // a watch that cannot start is left for the next turn end; the hook still ends quietly
-    watch.on("error", (error) => $logger.error(error, "idle-wake watch did not start"));
-    watch.unref();
+    return new Promise((resolve) => {
+        const timer = setTimeout(resolve, WATCH_LAUNCH_TIMEOUT_MS);
+        launcher.on("exit", () => {
+            clearTimeout(timer);
+            resolve();
+        });
+        launcher.on("error", (error) => {
+            $logger.error(error, "idle-wake watch did not start");
+            clearTimeout(timer);
+            resolve();
+        });
+    });
 }
 
 /** Whether the user's settings have this host's idle wake on; read when a session starts, never on later hooks. */
@@ -129,7 +158,7 @@ async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<
     // child loggers read the level when created, so database logging stays off stderr from here
     process.env.CONCOS_LOG_LEVEL ??= "none";
     if(event != null && adapter.wake != null && adapter.deliverWake != null && process.env[WATCH_EVENT_VARIABLE] == null) {
-        startDetachedWatch(adapter, event);
+        await startDetachedWatch(adapter, event);
         process.stdout.write("{}\n");
         return;
     }
@@ -208,7 +237,7 @@ export async function runHook(args: string[]): Promise<void> {
             // report). A host woken from outside watches from its start, as after each turn,
             // when its idle wake is on: the card stays online and a message can start its first turn.
             if(kind == "session-start" && adapter.wake != null && adapter.deliverWake != null && await wakeRegistered(adapter) == true) {
-                startDetachedWatch(adapter, event);
+                await startDetachedWatch(adapter, event);
             }
         }
         else output = adapter.output(kind);

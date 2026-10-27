@@ -88,3 +88,5 @@ export const CHECKPOINT_KEEP_PER_AGENT = 50;
  */
 export const SETTINGS_BACKUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 60 * 1000;
+/** How long a newer bridge has to answer its introduction before the older one keeps its client. */
+export const HANDOFF_TIMEOUT_MS = 10 * 1000;

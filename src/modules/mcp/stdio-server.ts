@@ -19,11 +19,26 @@ export interface ToolResult {
     isError?: boolean;
 }
 
+/** Lets a bridge pass its client to a newer bridge it starts, and take it back if that one fails. */
+export interface StdioServer {
+    /** The params of the client's initialize request, kept to introduce a successor; null before it. */
+    initializeParams(): Record<string, unknown> | null;
+    /** From now on every line from the client goes to `forward`, unanswered here. */
+    handOver(forward: (line: string) => void): void;
+    /** Lines from the client are answered here again. */
+    takeBack(): void;
+    /** Answers `line` here as if it had just arrived, for lines held during a hand-over that failed. */
+    receive(line: string): void;
+    /** Writes one JSON-RPC line to the client as it is. */
+    writeLine(line: string): void;
+}
+
 /**
  * MCP over stdio for a server that offers tools only: one JSON-RPC message per line on stdin and on
  * stdout. Answers initialize, ping, tools/list and tools/call, each like the MCP SDK the bridge was
  * first built on. Notifications, responses from the client and lines that are not JSON-RPC get no
- * answer; any other request gets "Method not found".
+ * answer; any other request gets "Method not found". `beforeLine` runs before a line is answered
+ * here, and may hand the client over, the line included.
  */
 export function serveStdio(options: {
     name: string;
@@ -32,23 +47,30 @@ export function serveStdio(options: {
     tools: ToolDefinition[];
     callTool: (name: string, values: Record<string, unknown>) => ToolResult;
     logger: Logger;
-}): void {
+    beforeLine?: () => void;
+}): StdioServer {
     const { logger } = options;
     let stdoutBroken = false;
+    let initializeParams: Record<string, unknown> | null = null;
+    let forward: ((line: string) => void) | null = null;
     // the client is gone; stdin's end shuts the bridge down, so later answers are dropped
     process.stdout.on("error", () => {
         stdoutBroken = true;
     });
-    const send = (id: string | number, outcome: { result: unknown } | { error: { code: number; message: string } }): void => {
+    const writeLine = (line: string): void => {
         if(stdoutBroken == true) {
             return;
         }
-        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: id, ...outcome })}\n`);
+        process.stdout.write(`${line}\n`);
+    };
+    const send = (id: string | number, outcome: { result: unknown } | { error: { code: number; message: string } }): void => {
+        writeLine(JSON.stringify({ jsonrpc: "2.0", id: id, ...outcome }));
     };
     const toolError = (text: string): ToolResult => ({ content: [{ type: "text", text: text }], isError: true });
 
     const answer = (id: string | number, method: string, params: Record<string, unknown>): void => {
         if(method == "initialize") {
+            initializeParams = params;
             let protocolVersion = SUPPORTED_PROTOCOL_VERSIONS[0];
             if(typeof params.protocolVersion == "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(params.protocolVersion) == true) {
                 protocolVersion = params.protocolVersion;
@@ -142,9 +164,29 @@ export function serveStdio(options: {
         for(let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
             const line = buffer.slice(0, end).replace(/\r$/, "");
             buffer = buffer.slice(end + 1);
-            if(line.trim() != "") {
-                receive(line);
+            if(line.trim() == "") {
+                continue;
             }
+            if(forward == null) {
+                options.beforeLine?.();
+            }
+            if(forward != null) {
+                forward(line);
+                continue;
+            }
+            receive(line);
         }
     });
+
+    return {
+        initializeParams: () => initializeParams,
+        handOver: (next) => {
+            forward = next;
+        },
+        takeBack: () => {
+            forward = null;
+        },
+        receive: receive,
+        writeLine: writeLine,
+    };
 }

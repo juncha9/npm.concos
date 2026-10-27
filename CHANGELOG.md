@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.17] - 2026-10-28
+
+### Added
+
+- **Agents move to a newer concos without restarting.** A session's MCP server ran
+  the concos it started with until the client restarted it, which the client
+  programs make hard, so agents kept running old code after every update. Now a
+  running MCP server notices a newer installed version at its next tool call, or
+  within a minute while idle, starts it, introduces it with the client's own
+  handshake, carries over who joined, and relays between the two. The agent keeps
+  its card and handle, and the client is told its tools may have changed. If the
+  newer server does not answer within 10 seconds or stops, the older one keeps
+  answering and does not try that version again.
+
+### Fixed
+
+- **Codex sessions no longer time out at start on Windows (0.1.16 regression).**
+  With idle wake on, 0.1.16's session-start hook started the watch, and on Windows
+  the watch inherited the hook's output pipe through the PowerShell that ran the
+  hook. Codex waits for that pipe, so the hook failed with "hook timed out after
+  10s", the session never got its join context, and its agent's concos calls
+  failed with "call join first". The watch now starts through PowerShell's
+  `Start-Process`, which hands it no handle; the hook ends in about 0.7 seconds.
+- **"call join first" says how to recover**: the server has no join yet, as after
+  a restart, so join with the session's `resume_handle` or pass `handle`.
+
+### Notes
+
+- Sessions running 0.1.16 or older need one restart to get this; later updates
+  reach them on their own. Each update a session lives through adds one relaying
+  process. The instructions the client received when it first connected stay as
+  they were.
+
 ## [0.1.16] - 2026-10-28
 
 ### Added

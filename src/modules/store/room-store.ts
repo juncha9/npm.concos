@@ -34,7 +34,7 @@ import {
     WAKE_FALLBACK_MS,
 } from "../../_defs";
 import type { AgentStatus, MessageKind } from "../../_defs";
-import { CONCOS_VERSION } from "../../_libs/version";
+import { compareVersions, CONCOS_VERSION } from "../../_libs/version";
 import { runInTransaction } from "./database";
 import { RoomError } from "./room-error";
 import type { HookEvent } from "../hooks/types";
@@ -523,20 +523,6 @@ const ACTIVE_AGENT_CONDITION = `(
     A.left_at IS NULL
     AND (A.is_human = 1 OR (A.disconnected_at IS NULL AND A.last_seen_at >= :active_since))
 )`;
-
-/** Orders two `x.y.z` versions by their numbers; a missing or unreadable part counts as 0. */
-function compareVersions(left: string, right: string): number {
-    const parts = (version: string) => version.split(/[.+-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
-    const leftParts = parts(left);
-    const rightParts = parts(right);
-    for(let index = 0; index < 3; index += 1) {
-        const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
-        if(difference != 0) {
-            return difference;
-        }
-    }
-    return 0;
-}
 
 /** The `:active_since` value for `ACTIVE_AGENT_CONDITION`; stored times are ISO UTC, so text order is time order. */
 function activeSince(nowMs: number): string {

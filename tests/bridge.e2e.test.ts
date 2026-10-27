@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 // runs the built bundle the way an MCP host does; `npm test` builds it first
@@ -588,7 +589,7 @@ describe("concos mcp over stdio", () => {
         const wrongTypes = await callTool(6, "check_in", { status: "sleeping", received_message_ids: [1.5], to: 3 });
         expect(wrongTypes.content[0].text).toMatch(/^Invalid arguments for tool check_in: status must be one of working, waiting, idle, finished; received_message_ids\[0\] must be an integer; to is not a check_in argument; send_message takes it\. check_in takes handle, display_name, status, role, /);
         const withoutArguments = await callTool(7, "read_messages");
-        expect(withoutArguments).toEqual({ content: [{ type: "text", text: "call join first" }], isError: true });
+        expect(withoutArguments).toEqual({ content: [{ type: "text", text: "call join first: this concos server has no join yet, as after a restart. Join with the resume_handle your session was given to keep your card, or pass handle" }], isError: true });
 
         // neither a broken line nor a notification is answered, and the bridge keeps serving
         const answeredBefore = answers.length;
@@ -600,5 +601,92 @@ describe("concos mcp over stdio", () => {
 
         child.stdin.end();
         await new Promise((resolve) => child.on("exit", resolve));
+    }, E2E_TIMEOUT_MS);
+});
+
+describe("taking over from an older bridge", () => {
+    /**
+     * A copy of the built bundle with its own package.json, as `npm install -g` lays it out, so the
+     * test can install a "newer" version under a running bridge by rewriting that file.
+     */
+    function installCopy(): { cli: string; packageFile: string } {
+        const root = path.join(dataDirectory, "install");
+        fs.cpSync(path.resolve("dist"), path.join(root, "dist"), { recursive: true });
+        fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+        const packageFile = path.join(root, "package.json");
+        fs.copyFileSync(path.resolve("package.json"), packageFile);
+        return { cli: path.join(root, "dist", "cli.js"), packageFile: packageFile };
+    }
+
+    function installVersion(packageFile: string, version: string): void {
+        const json = JSON.parse(fs.readFileSync(packageFile, "utf8")) as Record<string, unknown>;
+        fs.writeFileSync(packageFile, JSON.stringify({ ...json, version: version }, null, 2));
+        // the bridge re-reads the file only when its modification time moves
+        const later = new Date(Date.now() + 5000);
+        fs.utimesSync(packageFile, later, later);
+    }
+
+    async function connect(cli: string): Promise<{ client: Client; log: () => string; listChanged: () => number }> {
+        const transport = new StdioClientTransport({
+            command: process.execPath, args: [cli, "mcp"], env: { ...childEnvironment(), CONCOS_LOG_LEVEL: "info" }, cwd: workDirectory, stderr: "pipe",
+        });
+        let log = "";
+        transport.stderr?.on("data", (chunk: Buffer) => {
+            log += chunk.toString();
+        });
+        const client = new Client({ name: "concos-e2e", version: "0.0.0" });
+        let listChanged = 0;
+        client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+            listChanged += 1;
+        });
+        await client.connect(transport);
+        openClients.push(client);
+        return { client, log: () => log, listChanged: () => listChanged };
+    }
+
+    it("moves the client to a newer installed concos at its next call, keeping its join", async () => {
+        const { cli, packageFile } = installCopy();
+        const { client, log, listChanged } = await connect(cli);
+        const joined = await callTool(client, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
+        installVersion(packageFile, "99.0.0");
+        // no handle: the newer bridge carries the one joined through the older bridge
+        const answered = await callTool(client, "check_in", { status: "working", task: "after the update" });
+        expect(answered.you.revision).toBeGreaterThan(1);
+        await expect.poll(() => listChanged()).toBe(1);
+        expect(log()).toContain("handed the client to concos 99.0.0");
+        expect(log()).toContain("took over from an older bridge");
+        const tools = await client.listTools();
+        expect(tools.tools.map((tool) => tool.name)).toContain("check_in");
+        // the same card, still working, and the version is not handed to again
+        const card = await callTool(client, "inspect_agent", { agent_id: joined.agent_id });
+        expect(card.card).toMatchObject({ agent_id: joined.agent_id, task: "after the update" });
+        expect(log().match(/handed the client to concos/g)).toHaveLength(1);
+        // closing the client ends both bridges
+        const successorPid = Number(/handed the client to concos 99\.0\.0 \(pid (\d+)\)/.exec(log())?.[1]);
+        await client.close();
+        openClients.splice(openClients.indexOf(client), 1);
+        await expect.poll(() => {
+            try {
+                process.kill(successorPid, 0);
+                return true;
+            }
+            catch {
+                return false;
+            }
+        }, { timeout: 10000 }).toBe(false);
+    }, E2E_TIMEOUT_MS);
+
+    it("keeps the client when the newer install does not start, and does not try that version again", async () => {
+        const { cli, packageFile } = installCopy();
+        const { client, log } = await connect(cli);
+        await callTool(client, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
+        // a broken install: the running bridge has its code loaded already, a new one would not start
+        fs.writeFileSync(cli, "process.exit(3);\n");
+        installVersion(packageFile, "99.0.0");
+        const answered = await callTool(client, "check_in", { task: "still here" });
+        expect(answered.you.revision).toBeGreaterThan(1);
+        expect(log()).toContain("kept the client: the newer bridge stopped (exit 3)");
+        await callTool(client, "check_in", { task: "again" });
+        expect(log().match(/kept the client/g)).toHaveLength(1);
     }, E2E_TIMEOUT_MS);
 });

@@ -56,8 +56,18 @@ Select it to review the version and command, then press Enter to confirm. It run
 Installation output and the result appear in the terminal. If npm's CLI cannot
 be found, concos shows the manual command instead.
 
-After success, concos closes the menu. Restart concos and open agent sessions so
-they use the new code. A failed installation keeps the menu available to retry.
+After success, concos closes the menu; open it again for the new board. A failed
+installation keeps the menu available to retry.
+
+Agent sessions need no restart. From 0.1.17 on, a running MCP server notices the
+newer installation at its next tool call, or within a minute while idle. It
+starts the installed version, introduces it to the client with the client's own
+handshake, carries over who joined, and from then on only relays between the
+two. The agent keeps its card and handle, and the client is told its tools may
+have changed. If the newer server does not answer within 10 seconds or stops, the
+older one keeps answering and does not try that version again. A session running
+0.1.16 or older needs one restart to get this; hooks always run the installed
+version. The server's first instructions stay as the client received them.
 
 ## Register MCP
 

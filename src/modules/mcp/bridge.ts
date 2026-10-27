@@ -26,7 +26,7 @@ import {
 import type { AgentStatus, MessageKind } from "../../_defs";
 import { $logger } from "../../_libs/logger";
 import { resolveDataDirectory } from "../../_libs/paths";
-import { CONCOS_VERSION } from "../../_libs/version";
+import { compareVersions, CONCOS_VERSION } from "../../_libs/version";
 import { clientPidFromEnvironment, HOST_ADAPTERS } from "../hooks/adapters";
 import { describeWake } from "../hooks/notices";
 import { isRunning } from "../hooks/watch";
@@ -34,8 +34,10 @@ import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
 import type { CheckInResult, FullMessage } from "../store/room-store";
+import { InstalledVersion, readHandoff, startSuccessor } from "./handoff";
+import type { Successor } from "./handoff";
 import { serveStdio } from "./stdio-server";
-import type { ToolDefinition, ToolResult } from "./stdio-server";
+import type { StdioServer, ToolDefinition, ToolResult } from "./stdio-server";
 import { inputSchema } from "./tool-schema";
 import type { ValueSchema } from "./tool-schema";
 
@@ -109,16 +111,19 @@ export async function runBridge(): Promise<void> {
     const database = await openDatabase(dataDirectory);
     const store = new RoomStore(database);
 
-    let lastHandle: string | null = null;
+    // an older bridge that started this one to take its client over carries its state here
+    const handoff = readHandoff();
+    let lastHandle: string | null = handoff?.lastHandle ?? null;
     let toolAgentId: string | null = null;
-    const joinedAgentIds = new Set<string>();
+    const joinedAgentIds = new Set<string>(handoff?.joinedAgentIds ?? []);
     /** Agents whose first answer through this bridge already carried `record_in_docs`. */
-    const agentsToldToRecord = new Set<string>();
+    const agentsToldToRecord = new Set<string>(handoff?.toldToRecord ?? []);
 
     const resolveAgentId = (handle: string | undefined): string => {
         const effectiveHandle = handle ?? lastHandle;
         if(effectiveHandle == null) {
-            throw new RoomError("call join first");
+            // a server the client restarted, or one whose session lost its start context, knows no one yet
+            throw new RoomError("call join first: this concos server has no join yet, as after a restart. Join with the resume_handle your session was given to keep your card, or pass handle");
         }
         const agentId = store.requireAgentIdByHandle(effectiveHandle);
         toolAgentId = agentId;
@@ -354,7 +359,7 @@ export async function runBridge(): Promise<void> {
     }));
 
     // the client this server runs under: the id it names in the environment, else the parent
-    let clientPid = process.ppid;
+    let clientPid = handoff?.clientPid ?? process.ppid;
     for(const adapter of HOST_ADAPTERS) {
         const named = clientPidFromEnvironment(adapter);
         if(named != null) {
@@ -362,7 +367,59 @@ export async function runBridge(): Promise<void> {
             break;
         }
     }
-    const heartbeatTimer = setInterval(() => {
+
+    // A newer concos installed under this running bridge takes its client over, so agents run the
+    // installed version without their sessions restarting (2026-10-28 user request).
+    const installed = new InstalledVersion(process.argv[1]);
+    let server: StdioServer | null = null;
+    let successor: Successor | null = null;
+    let handingOver = false;
+    // the version this bridge was handed, and one whose bridge failed: neither is tried again
+    const skippedVersions = new Set<string>(handoff == null ? [] : [handoff.version]);
+    let shuttingDown = false;
+    const maybeHandOver = (): void => {
+        if(server == null || successor != null || handingOver == true || shuttingDown == true) {
+            return;
+        }
+        const version = installed.read();
+        const initializeParams = server.initializeParams();
+        if(version == null || initializeParams == null || skippedVersions.has(version) == true || compareVersions(version, CONCOS_VERSION) <= 0) {
+            return;
+        }
+        handingOver = true;
+        startSuccessor({
+            server: server,
+            initializeParams: initializeParams,
+            state: { lastHandle, joinedAgentIds: [...joinedAgentIds], toldToRecord: [...agentsToldToRecord], clientPid, version },
+            logger: _logger,
+            onHandedOver: (child) => {
+                successor = child;
+                handingOver = false;
+                // the successor heartbeats with its version now; this one would put the old one back
+                clearInterval(heartbeatTimer);
+            },
+            onReturned: (reason) => {
+                const wasHandedOver = successor != null;
+                successor = null;
+                handingOver = false;
+                skippedVersions.add(version);
+                if(shuttingDown == true) {
+                    process.exit(0);
+                }
+                if(wasHandedOver == true) {
+                    _logger.warn(`answering the client again: ${reason}`);
+                    heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+                    heartbeatTimer.unref();
+                }
+            },
+        });
+    };
+
+    const beat = (): void => {
+        maybeHandOver();
+        if(successor != null) {
+            return;
+        }
         try {
             // the version shows on the board, so a session still on an older concos can be found
             store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
@@ -405,10 +462,14 @@ export async function runBridge(): Promise<void> {
                 _logger.error(ex, "fallback wake check failed");
             }
         }
-    }, HEARTBEAT_INTERVAL_MS);
+    };
+    let heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
     heartbeatTimer.unref();
+    // the board shows the version this bridge runs at once, not a minute after it took a client over
+    if(handoff != null) {
+        store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
+    }
 
-    let shuttingDown = false;
     const shutdown = (reason: string): void => {
         if(shuttingDown == true) {
             return;
@@ -418,6 +479,12 @@ export async function runBridge(): Promise<void> {
         setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS).unref();
         _logger.info(`shutting down: ${reason}`);
         clearInterval(heartbeatTimer);
+        // the successor holds the client: its own shutdown releases the cards, then this one exits
+        if(successor != null) {
+            successor.once("exit", () => process.exit(0));
+            successor.stdin.end();
+            return;
+        }
         try {
             store.disconnect([...joinedAgentIds]);
             database.close();
@@ -433,7 +500,7 @@ export async function runBridge(): Promise<void> {
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-    serveStdio({
+    server = serveStdio({
         name: "concos",
         version: CONCOS_VERSION,
         instructions: SERVER_INSTRUCTIONS,
@@ -446,6 +513,8 @@ export async function runBridge(): Promise<void> {
             return run(values);
         },
         logger: _logger,
+        // a request is the moment a newer install matters; idle bridges check on their heartbeat
+        beforeLine: maybeHandOver,
     });
-    _logger.info(`concos ${CONCOS_VERSION} bridge ready`);
+    _logger.info(`concos ${CONCOS_VERSION} bridge ready${handoff == null ? "" : " (took over from an older bridge)"}`);
 }
