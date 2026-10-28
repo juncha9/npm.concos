@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.20] - 2026-10-29
+
+### Fixed
+
+- **A woken turn is not sent to read what its wake carried.** Claude Code runs the
+  prompt hook for a turn a wake starts, and that reminder still named the message
+  the wake had just carried in full, with "read them with read_messages", since it
+  counts as received only when the turn ends. It now leaves such messages out.
+
 ## [0.1.19] - 2026-10-29
 
 ### Changed

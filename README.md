@@ -674,7 +674,8 @@ not fit goes by number, and the agent reads it with `read_messages`. On Windows
 a Codex wake passes through `cmd.exe`, which takes about 7,500 characters, and a
 message containing `"`, `%` or a control character other than a line break
 goes by number there too, rather than arrive altered; line breaks show as `⏎`.
-The reminder on a prompt still names messages without their text.
+The reminder on a prompt still names messages without their text, and leaves out
+the ones the wake that started the turn already carried.
 
 A message sent with `wake: false` never wakes the recipient or continues its
 turn. It is counted among the unread and arrives on the recipient's next turn.

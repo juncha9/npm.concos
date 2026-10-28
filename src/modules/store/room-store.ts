@@ -870,12 +870,14 @@ export class RoomStore {
         return row.body;
     }
 
-    private countPending(agentId: string): number {
+    /** `undeliveredOnly`: as in `hookNotices`. */
+    private countPending(agentId: string, undeliveredOnly = false): number {
         const row = this.prepare(`
             SELECT COUNT(*) AS pending_count
             FROM message_receipt
             WHERE agent_id = :agent_id AND received_at IS NULL
-        `).get({ agent_id: agentId }) as { pending_count: number };
+                AND (:undelivered_only = 0 OR delivered_at IS NULL)
+        `).get({ agent_id: agentId, undelivered_only: Number(undeliveredOnly) }) as { pending_count: number };
         return row.pending_count;
     }
 
@@ -1213,9 +1215,10 @@ export class RoomStore {
      * counts. `includeNotes` adds notes and notices named to it and answers to its own notes and
      * notices, for the line a prompt or session start shows and for idle wake; they never continue
      * a turn. A message sent with wake false is never pointed out: it waits for the next turn,
-     * counted among the unread. Reading this list acknowledges nothing.
+     * counted among the unread. `undeliveredOnly` leaves out what already reached the agent in full
+     * and waits only for its turn end to count as received. Reading this list acknowledges nothing.
      */
-    hookNotices(agentId: string, afterSeq = 0, includeNotes = false): HookNotice[] {
+    hookNotices(agentId: string, afterSeq = 0, includeNotes = false, undeliveredOnly = false): HookNotice[] {
         return this.prepare(`
             SELECT
                 M.id,
@@ -1237,6 +1240,7 @@ export class RoomStore {
                 ON S.id = M.sender_agent_id
             WHERE R.agent_id = :agent_id
                 AND R.received_at IS NULL
+                AND (:undelivered_only = 0 OR R.delivered_at IS NULL)
                 AND M.seq > :after_seq
                 AND M.wake = 1
                 -- a direct row without a recipient is a room-wide message from an older bridge
@@ -1258,7 +1262,7 @@ export class RoomStore {
                     )
                 )
             ORDER BY M.seq
-        `).all({ agent_id: agentId, after_seq: afterSeq, include_notes: Number(includeNotes) }) as unknown as HookNotice[];
+        `).all({ agent_id: agentId, after_seq: afterSeq, include_notes: Number(includeNotes), undelivered_only: Number(undeliveredOnly) }) as unknown as HookNotice[];
     }
 
     /** Card diagnostics, oldest first: previews only, with the same wake targets as the hooks. */
@@ -1424,8 +1428,10 @@ export class RoomStore {
             this.recordClientPid(row.id, event.clientPid);
             const outcome: HookOutcome = { agentId: row.id };
             if(event.kind == "prompt") {
-                outcome.notices = this.hookNotices(row.id, 0, true);
-                outcome.unread = this.countPending(row.id);
+                // a wake or a continued turn that carried a message in full started this turn: pointing
+                // at it again sent the agent to read_messages for nothing (2026-10-29)
+                outcome.notices = this.hookNotices(row.id, 0, true, true);
+                outcome.unread = this.countPending(row.id, true);
                 if(current.blocker != "") {
                     outcome.blocker = current.blocker;
                 }

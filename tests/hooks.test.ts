@@ -487,6 +487,19 @@ describe("turn end", () => {
         expect(codexWake.delivered).toEqual(process.platform == "win32" ? [first] : [first, second, small]);
     });
 
+    it("does not point a prompt at what a wake already carried in full", () => {
+        const joined = start();
+        const asker = joinOther("Asker");
+        const carried = store.sendMessage(asker.agent_id, { to: joined.agent_id, kind: "note", text: "role changed", replyTo: null, requestId: null }).message_id;
+        // the wake that started this turn carried it; it counts as received when the turn ends
+        store.markDelivered(joined.agent_id, [carried]);
+        expect(processHook(store, event("prompt"), "dev")?.context).toBeUndefined();
+        const waiting = store.sendMessage(asker.agent_id, { to: joined.agent_id, kind: "question", text: "which?", replyTo: null, requestId: null }).message_id;
+        expect(processHook(store, event("prompt"), "dev")?.context).toBe(`concos: unread for you — question #${waiting} from Asker. Read them with read_messages.`);
+        // still unread until the turn ends, so the board and a new session still see it
+        expect(store.pendingFor(joined.agent_id).map((message) => message.id)).toEqual([carried, waiting]);
+    });
+
     it("never points out a message sent with wake false, and tells the board why", () => {
         const joined = start();
         const asker = joinOther("Asker");
@@ -666,7 +679,8 @@ describe("idle wake", () => {
         const waking = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000 });
         setTimeout(() => ask(from, joined.agent_id), 30);
         expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker; plus 1 other unread\.\n\n#\d+ question from Asker:\nbody\n\nThe texts above count as read\. Read the rest with read_messages\./);
-        expect(processHook(store, event("prompt"), "dev")?.context).toMatch(/question #\d+ from Asker; plus 1 other unread\./);
+        // the woken turn's prompt names only what the wake did not carry
+        expect(processHook(store, event("prompt"), "dev")?.context).toBe("concos: unread for you — 1 message. Read them with read_messages.");
     });
 
     it("keeps the waiting card online while it watches, and ends once the client that ran it is gone", async () => {
