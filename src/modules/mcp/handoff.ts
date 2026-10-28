@@ -1,29 +1,29 @@
-import { spawn } from "node:child_process";
-import type { ChildProcessByStdio } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { Readable, Writable } from "node:stream";
-import { HANDOFF_TIMEOUT_MS, NODE_FLAGS } from "../../_defs";
-import type { Logger } from "../../_libs/logger";
-import type { StdioServer } from "./stdio-server";
+import { pathToFileURL } from "node:url";
 
-/** A newer bridge relaying the client: its stdin and stdout are piped, its stderr shared. */
-export type Successor = ChildProcessByStdio<Writable, Readable, null>;
-
-/** Set on a bridge that another bridge started to take its client over: what it carries over, as JSON. */
+/**
+ * Set on a bridge that an older bridge (0.1.17, 0.1.18) started as its own child to take its
+ * client over: what it carries over, as JSON. Bridges from 0.1.19 on load the newer code into
+ * their own process instead (`TakeoverInput`).
+ */
 export const HANDOFF_VARIABLE = "CONCOS_HANDOFF";
 
-/** The id of the initialize request that introduces the newer bridge; its answer never reaches the client. */
-const HANDOFF_REQUEST_ID = "concos-handoff";
-
-/** What a bridge carries over to the newer bridge it starts, so its agents need not join again. */
+/** What a bridge carries over to the newer one, so its agents need not join again. */
 export interface HandoffState {
     lastHandle: string | null;
     joinedAgentIds: string[];
     toldToRecord: string[];
     clientPid: number;
-    /** The installed version handed to; the successor never hands over to it again. */
+    /** The installed version handed to; the newer bridge never hands over to it again. */
     version: string;
+    /** The version that handed over; absent from bridges before 0.1.19. */
+    fromVersion?: string;
+    /**
+     * The MCP instructions the client holds, from its initialize: a client reads them once, so a
+     * newer bridge tells it of changed ones. Absent from bridges before 0.1.19, which did not know.
+     */
+    clientInstructions?: string;
 }
 
 /** The state an older bridge carried over to this one, read once; null for a bridge its client started. */
@@ -73,114 +73,36 @@ export class InstalledVersion {
 }
 
 /**
- * Hands the client to a newer bridge (2026-10-28 user request: agents kept running an older concos,
- * and restarting their sessions was hard, the client programs owning them).
- *
- * Flow:
- *  1) Hold the client's lines, start the installed cli.js as a bridge with this one's state
- *  2) Introduce it with the client's own initialize; its answer stays here
- *  3) Send it initialized and the held lines, then relay both ways; tell the client its tools may
- *     have changed
- *  4) A successor that does not answer in time, or stops, gives the client back: the held lines
- *     are answered here, and this bridge goes on as before
+ * What a bridge hands the newer concos code it loads into its own process (protocol 1, from
+ * 0.1.19). Starting a second process for each update had doubled the bridges: 22 sessions went
+ * from 22 to 44 node processes, about 1 GB more, when 0.1.18 was installed (2026-10-29).
  */
-export function startSuccessor(options: {
-    server: StdioServer;
-    initializeParams: Record<string, unknown>;
+export interface TakeoverInput {
+    protocol: 1;
     state: HandoffState;
-    logger: Logger;
-    /** The successor answers the client now; this bridge stops its own work. */
-    onHandedOver: (successor: Successor) => void;
-    /** The successor failed or stopped; this bridge answers the client again. */
-    onReturned: (reason: string) => void;
-}): void {
-    const { server, logger } = options;
-    // (1) Hold and start
-    const held: string[] = [];
-    server.handOver((line) => held.push(line));
-    const successor = spawn(process.execPath, [...NODE_FLAGS, process.argv[1], "mcp"], {
-        stdio: ["pipe", "pipe", "inherit"],
-        windowsHide: true,
-        env: { ...process.env, [HANDOFF_VARIABLE]: JSON.stringify(options.state) },
-    });
-    const toSuccessor = (line: string): void => {
-        successor.stdin.write(`${line}\n`);
-    };
-    // a successor that died mid-write is handled by its exit
-    successor.stdin.on("error", () => undefined);
+    /** The client's initialize request: the newer bridge starts out initialized with it. */
+    initializeParams: Record<string, unknown>;
+    /**
+     * Called once by the newer bridge when it is ready and right before it reads stdin: the older
+     * bridge lets go of stdin, its timers and its process listeners, and gives over the client lines
+     * it held meanwhile and the start of a line not yet ended. Before this call the older bridge
+     * still holds everything, so a newer bridge that fails leaves it as it was.
+     */
+    release(): { held: string[]; partial: string };
+}
 
-    let handedOver = false;
-    let returned = false;
-    const giveBack = (reason: string): void => {
-        if(returned == true) {
-            return;
-        }
-        returned = true;
-        handedOver = false;
-        clearTimeout(timer);
-        server.takeBack();
-        logger.warn(`kept the client: ${reason}`);
-        for(const line of held.splice(0)) {
-            server.receive(line);
-        }
-        options.onReturned(reason);
-    };
-    const timer = setTimeout(() => {
-        successor.kill();
-        giveBack("the newer bridge did not answer");
-    }, HANDOFF_TIMEOUT_MS);
+/** The entry of a concos install that a bridge of an older version loads to hand its client over. */
+export type TakeOver = (input: TakeoverInput) => Promise<void>;
 
-    // (3) Relay
-    const complete = (): void => {
-        handedOver = true;
-        clearTimeout(timer);
-        toSuccessor(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
-        server.handOver(toSuccessor);
-        for(const line of held.splice(0)) {
-            toSuccessor(line);
-        }
-        // the newer bridge may describe its tools differently
-        server.writeLine(JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }));
-        logger.info(`handed the client to concos ${options.state.version} (pid ${successor.pid})`);
-        options.onHandedOver(successor);
-    };
-
-    let buffer = "";
-    successor.stdout.setEncoding("utf8");
-    successor.stdout.on("data", (chunk: string) => {
-        buffer += chunk;
-        for(let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
-            const line = buffer.slice(0, end).replace(/\r$/, "");
-            buffer = buffer.slice(end + 1);
-            if(handedOver == true) {
-                server.writeLine(line);
-                continue;
-            }
-            if(returned == true) {
-                continue;
-            }
-            // (2) before the hand-over only the answer to the introduction comes back
-            let answer: { id?: unknown; result?: unknown } = {};
-            try {
-                answer = JSON.parse(line) as { id?: unknown; result?: unknown };
-            }
-            catch {
-                continue;
-            }
-            if(answer.id != HANDOFF_REQUEST_ID) {
-                continue;
-            }
-            if(answer.result == null) {
-                successor.kill();
-                giveBack("the newer bridge refused the introduction");
-                continue;
-            }
-            complete();
-        }
-    });
-    successor.on("error", (error) => giveBack(`the newer bridge did not start: ${error.message}`));
-    successor.on("exit", (code) => giveBack(`the newer bridge stopped (exit ${code})`));
-
-    // (2) Introduce
-    toSuccessor(JSON.stringify({ jsonrpc: "2.0", id: HANDOFF_REQUEST_ID, method: "initialize", params: options.initializeParams }));
+/**
+ * Loads `takeover.js` of the concos installed beside `cliPath`. The version in the URL keeps it
+ * apart from any code this process loaded before, including an earlier takeover's.
+ */
+export async function loadTakeover(cliPath: string, version: string): Promise<TakeOver> {
+    const file = path.resolve(path.dirname(cliPath), "takeover.js");
+    const entry = await import(`${pathToFileURL(file).href}?v=${encodeURIComponent(version)}`) as { takeOver?: unknown };
+    if(typeof entry.takeOver != "function") {
+        throw new Error(`concos ${version} has no takeover entry`);
+    }
+    return entry.takeOver as TakeOver;
 }

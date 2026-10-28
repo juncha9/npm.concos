@@ -34,8 +34,9 @@ import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
 import type { CheckInResult, FullMessage } from "../store/room-store";
-import { InstalledVersion, readHandoff, startSuccessor } from "./handoff";
-import type { Successor } from "./handoff";
+import { InstalledVersion, loadTakeover, readHandoff } from "./handoff";
+import { InstructionsUpdate } from "./instructions-update";
+import type { HandoffState, TakeoverInput } from "./handoff";
 import { serveStdio } from "./stdio-server";
 import type { StdioServer, ToolDefinition, ToolResult } from "./stdio-server";
 import { inputSchema } from "./tool-schema";
@@ -103,16 +104,28 @@ const POSITIVE_INTEGER = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE
 /**
  * Serves the MCP tools over stdio until the client goes away.
  * The bridge opens the shared SQLite file directly; there is no shared server process.
+ * `takeover`: an older bridge loaded this code into its own process to hand its client over.
  */
-export async function runBridge(): Promise<void> {
+export async function runBridge(options: { takeover?: TakeoverInput } = {}): Promise<void> {
     let _logger = $logger.child({ context: "bridge", pid: process.pid });
     const dataDirectory = resolveDataDirectory();
     _logger = _logger.child({ data_directory: dataDirectory });
     const database = await openDatabase(dataDirectory);
     const store = new RoomStore(database);
 
-    // an older bridge that started this one to take its client over carries its state here
-    const handoff = readHandoff();
+    // an older bridge that loaded this code, or (before 0.1.19) started this process, carries its state
+    const takeover = options.takeover;
+    const handoff = takeover?.state ?? readHandoff();
+    // A client reads the instructions once, at its initialize; after a hand-over that went to an
+    // older bridge, and only bridges from 0.1.19 on say what they were. Changed or unknown ones go
+    // with the next tool result, once (2026-10-29 user decision; the class is X:CONCOS02's).
+    let seenInstructions: string | null = SERVER_INSTRUCTIONS;
+    if(handoff != null) {
+        seenInstructions = handoff.clientInstructions ?? null;
+    }
+    const instructionsUpdate = new InstructionsUpdate({
+        current: SERVER_INSTRUCTIONS, version: CONCOS_VERSION, seen: seenInstructions, fromVersion: handoff?.fromVersion ?? null,
+    });
     let lastHandle: string | null = handoff?.lastHandle ?? null;
     let toolAgentId: string | null = null;
     const joinedAgentIds = new Set<string>(handoff?.joinedAgentIds ?? []);
@@ -142,7 +155,12 @@ export async function runBridge(): Promise<void> {
                 store.markDelivered(toolAgentId, delivered);
             }
             const inbox = toolAgentId == null ? undefined : store.getInbox(toolAgentId, delivered);
-            return { content: [{ type: "text", text: JSON.stringify(inbox == null ? result : { ...result as object, inbox }) }] };
+            let answer = inbox == null ? result : { ...result as object, inbox };
+            const updated = instructionsUpdate.take();
+            if(updated != null) {
+                answer = { ...answer as object, concos_updated: updated };
+            }
+            return { content: [{ type: "text", text: JSON.stringify(answer) }] };
         }
         catch(ex) {
             if(ex instanceof RoomError) {
@@ -371,16 +389,31 @@ export async function runBridge(): Promise<void> {
     }
 
     // A newer concos installed under this running bridge takes its client over, so agents run the
-    // installed version without their sessions restarting (2026-10-28 user request).
+    // installed version without their sessions restarting (2026-10-28 user request). From 0.1.19 it
+    // is loaded into this process rather than started as another (2026-10-29 user decision).
     const installed = new InstalledVersion(process.argv[1]);
     let server: StdioServer | null = null;
-    let successor: Successor | null = null;
-    let handingOver = false;
-    // the version this bridge was handed, and one whose bridge failed: neither is tried again
+    let takingOver = false;
+    /** Newer code answers the client in this process now; this bridge does nothing more. */
+    let retired = false;
+    // the version this bridge was handed, and one that failed to take over: neither is tried again
     const skippedVersions = new Set<string>(handoff == null ? [] : [handoff.version]);
     let shuttingDown = false;
-    const maybeHandOver = (): void => {
-        if(server == null || successor != null || handingOver == true || shuttingDown == true) {
+    // process listeners, named so a bridge handing over can take them off
+    const onStdinEnd = (): void => shutdown("stdin ended");
+    const onStdinClose = (): void => shutdown("stdin closed");
+    const onInterrupt = (): void => shutdown("SIGINT");
+    const onTerminate = (): void => shutdown("SIGTERM");
+    /**
+     * Flow:
+     *  1) Hold the client's lines; load the installed version's takeover entry into this process
+     *  2) The newer bridge gets ready, then asks this one to let go: stdin, timers, process
+     *     listeners, the held lines and an unfinished line all pass to it at once
+     *  3) Done: this bridge closes its database and retires. Failed before letting go: it answers
+     *     the held lines itself and goes on. Failed after: neither can answer, so the process ends
+     */
+    const maybeTakeOver = (): void => {
+        if(server == null || takingOver == true || retired == true || shuttingDown == true) {
             return;
         }
         const version = installed.read();
@@ -388,38 +421,61 @@ export async function runBridge(): Promise<void> {
         if(version == null || initializeParams == null || skippedVersions.has(version) == true || compareVersions(version, CONCOS_VERSION) <= 0) {
             return;
         }
-        handingOver = true;
-        startSuccessor({
-            server: server,
+        // (1) Hold and load
+        takingOver = true;
+        const current = server;
+        const held: string[] = [];
+        current.handOver((line) => held.push(line));
+        let released = false;
+        const state: HandoffState = {
+            lastHandle, joinedAgentIds: [...joinedAgentIds], toldToRecord: [...agentsToldToRecord], clientPid, version,
+            fromVersion: CONCOS_VERSION, clientInstructions: instructionsUpdate.seen(),
+        };
+        loadTakeover(process.argv[1], version).then((takeOver) => takeOver({
+            protocol: 1,
+            state: state,
             initializeParams: initializeParams,
-            state: { lastHandle, joinedAgentIds: [...joinedAgentIds], toldToRecord: [...agentsToldToRecord], clientPid, version },
-            logger: _logger,
-            onHandedOver: (child) => {
-                successor = child;
-                handingOver = false;
-                // the successor heartbeats with its version now; this one would put the old one back
+            // (2) Let go
+            release: () => {
+                released = true;
                 clearInterval(heartbeatTimer);
+                process.stdin.off("end", onStdinEnd);
+                process.stdin.off("close", onStdinClose);
+                process.off("SIGINT", onInterrupt);
+                process.off("SIGTERM", onTerminate);
+                return { held: held.splice(0), partial: current.release() };
             },
-            onReturned: (reason) => {
-                const wasHandedOver = successor != null;
-                successor = null;
-                handingOver = false;
-                skippedVersions.add(version);
-                if(shuttingDown == true) {
-                    process.exit(0);
-                }
-                if(wasHandedOver == true) {
-                    _logger.warn(`answering the client again: ${reason}`);
-                    heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
-                    heartbeatTimer.unref();
-                }
-            },
+        })).then(() => {
+            // newer code that returned without taking the client would leave its lines held for good
+            if(released == false) {
+                throw new Error("it returned without taking the client");
+            }
+            // (3) Retire
+            retired = true;
+            try {
+                database.close();
+            }
+            catch(ex) {
+                _logger.error(ex, "closing the database after the takeover failed");
+            }
+        }).catch((ex: unknown) => {
+            takingOver = false;
+            skippedVersions.add(version);
+            if(released == true) {
+                _logger.error(ex, `concos ${version} failed after taking the client over; ending the bridge`);
+                process.exit(1);
+            }
+            _logger.warn(`kept the client: concos ${version} could not take over: ${ex instanceof Error ? ex.message : String(ex)}`);
+            current.takeBack();
+            for(const line of held.splice(0)) {
+                current.receive(line);
+            }
         });
     };
 
     const beat = (): void => {
-        maybeHandOver();
-        if(successor != null) {
+        maybeTakeOver();
+        if(takingOver == true || retired == true) {
             return;
         }
         try {
@@ -468,11 +524,20 @@ export async function runBridge(): Promise<void> {
             }
         }
     };
+    // from here on this bridge takes stdin, timers and process listeners; code taking over in this
+    // process gets them from the older bridge only now, when nothing above can fail any more
+    const fromOlder = takeover?.release() ?? { held: [], partial: "" };
     let heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
     heartbeatTimer.unref();
-    // the board shows the version this bridge runs at once, not a minute after it took a client over
+    // the board shows the version this bridge runs at once, not a minute after it took a client over;
+    // nothing here may fail once an older bridge let go, so a busy database waits for the next beat
     if(handoff != null) {
-        store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
+        try {
+            store.heartbeat([...joinedAgentIds], CONCOS_VERSION);
+        }
+        catch(ex) {
+            _logger.error(ex, "first heartbeat after the takeover failed");
+        }
     }
 
     const shutdown = (reason: string): void => {
@@ -484,12 +549,6 @@ export async function runBridge(): Promise<void> {
         setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS).unref();
         _logger.info(`shutting down: ${reason}`);
         clearInterval(heartbeatTimer);
-        // the successor holds the client: its own shutdown releases the cards, then this one exits
-        if(successor != null) {
-            successor.once("exit", () => process.exit(0));
-            successor.stdin.end();
-            return;
-        }
         try {
             store.disconnect([...joinedAgentIds]);
             database.close();
@@ -500,10 +559,10 @@ export async function runBridge(): Promise<void> {
         process.exit(0);
     };
     // stdin ending is the one exit signal every client sends, by dying if not deliberately
-    process.stdin.on("end", () => shutdown("stdin ended"));
-    process.stdin.on("close", () => shutdown("stdin closed"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.stdin.on("end", onStdinEnd);
+    process.stdin.on("close", onStdinClose);
+    process.on("SIGINT", onInterrupt);
+    process.on("SIGTERM", onTerminate);
 
     server = serveStdio({
         name: "concos",
@@ -519,7 +578,23 @@ export async function runBridge(): Promise<void> {
         },
         logger: _logger,
         // a request is the moment a newer install matters; idle bridges check on their heartbeat
-        beforeLine: maybeHandOver,
+        beforeLine: maybeTakeOver,
+        initialized: takeover?.initializeParams,
+        partial: fromOlder.partial,
     });
-    _logger.info(`concos ${CONCOS_VERSION} bridge ready${handoff == null ? "" : " (took over from an older bridge)"}`);
+    let origin = "";
+    if(takeover != null) {
+        origin = ` (took over from concos ${takeover.state.fromVersion ?? "an older version"} in this process)`;
+    }
+    else if(handoff != null) {
+        origin = " (took over from an older bridge)";
+    }
+    _logger.info(`concos ${CONCOS_VERSION} bridge ready${origin}`);
+    if(takeover != null) {
+        // what the client sent while this code got ready, then: the tools may read differently now
+        for(const line of fromOlder.held) {
+            server.receive(line);
+        }
+        server.writeLine(JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }));
+    }
 }

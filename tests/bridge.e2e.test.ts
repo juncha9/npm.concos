@@ -646,9 +646,9 @@ describe("taking over from an older bridge", () => {
         fs.utimesSync(packageFile, later, later);
     }
 
-    async function connect(cli: string): Promise<{ client: Client; log: () => string; listChanged: () => number }> {
+    async function connect(cli: string, environment: Record<string, string> = {}): Promise<{ client: Client; log: () => string; listChanged: () => number; pid: number }> {
         const transport = new StdioClientTransport({
-            command: process.execPath, args: [cli, "mcp"], env: { ...childEnvironment(), CONCOS_LOG_LEVEL: "info" }, cwd: workDirectory, stderr: "pipe",
+            command: process.execPath, args: [cli, "mcp"], env: { ...childEnvironment(), CONCOS_LOG_LEVEL: "info", ...environment }, cwd: workDirectory, stderr: "pipe",
         });
         let log = "";
         transport.stderr?.on("data", (chunk: Buffer) => {
@@ -661,52 +661,91 @@ describe("taking over from an older bridge", () => {
         });
         await client.connect(transport);
         openClients.push(client);
-        return { client, log: () => log, listChanged: () => listChanged };
+        return { client, log: () => log, listChanged: () => listChanged, pid: transport.pid! };
     }
 
-    it("moves the client to a newer installed concos at its next call, keeping its join", async () => {
+    const running = (pid: number) => {
+        try {
+            process.kill(pid, 0);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    };
+
+    it("loads a newer installed concos into the same process at its next call, keeping its join, update after update", async () => {
         const { cli, packageFile } = installCopy();
-        const { client, log, listChanged } = await connect(cli);
+        const { client, log, listChanged, pid } = await connect(cli);
         const joined = await callTool(client, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
         installVersion(packageFile, "99.0.0");
-        // no handle: the newer bridge carries the one joined through the older bridge
+        // no handle: the newer code carries the one joined through the older one
         const answered = await callTool(client, "check_in", { status: "working", task: "after the update" });
         expect(answered.you.revision).toBeGreaterThan(1);
+        // the client holds these very instructions, so nothing is repeated to it
+        expect(answered.concos_updated).toBeUndefined();
         await expect.poll(() => listChanged()).toBe(1);
-        expect(log()).toContain("handed the client to concos 99.0.0");
-        expect(log()).toContain("took over from an older bridge");
+        expect(log()).toMatch(/bridge ready \(took over from concos [\d.]+ in this process\)/);
         const tools = await client.listTools();
         expect(tools.tools.map((tool) => tool.name)).toContain("check_in");
-        // the same card, still working, and the version is not handed to again
+        // the same card, still working, and the version is not taken over again
         const card = await callTool(client, "inspect_agent", { agent_id: joined.agent_id });
         expect(card.card).toMatchObject({ agent_id: joined.agent_id, task: "after the update" });
-        expect(log().match(/handed the client to concos/g)).toHaveLength(1);
-        // closing the client ends both bridges
-        const successorPid = Number(/handed the client to concos 99\.0\.0 \(pid (\d+)\)/.exec(log())?.[1]);
+        expect(log().match(/in this process\)/g)).toHaveLength(1);
+
+        // a second update goes the same way: still one process, and every call answered once
+        installVersion(packageFile, "99.1.0");
+        await callTool(client, "check_in", { task: "after the second update" });
+        await expect.poll(() => listChanged()).toBe(2);
+        expect(log().match(/in this process\)/g)).toHaveLength(2);
+        expect((await callTool(client, "inspect_agent", { agent_id: joined.agent_id })).card).toMatchObject({ task: "after the second update" });
+        expect(running(pid)).toBe(true);
+
+        // closing the client ends the one process
         await client.close();
         openClients.splice(openClients.indexOf(client), 1);
-        await expect.poll(() => {
-            try {
-                process.kill(successorPid, 0);
-                return true;
-            }
-            catch {
-                return false;
-            }
-        }, { timeout: 10000 }).toBe(false);
+        await expect.poll(() => running(pid), { timeout: 10000 }).toBe(false);
     }, E2E_TIMEOUT_MS);
 
-    it("keeps the client when the newer install does not start, and does not try that version again", async () => {
+    it("keeps the client when the newer install cannot take over, and does not try that version again", async () => {
         const { cli, packageFile } = installCopy();
         const { client, log } = await connect(cli);
         await callTool(client, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
-        // a broken install: the running bridge has its code loaded already, a new one would not start
-        fs.writeFileSync(cli, "process.exit(3);\n");
+        // a broken install: the running bridge has its own code loaded already
+        fs.writeFileSync(path.join(path.dirname(cli), "takeover.js"), "throw new Error(\"broken install\");\n");
         installVersion(packageFile, "99.0.0");
         const answered = await callTool(client, "check_in", { task: "still here" });
         expect(answered.you.revision).toBeGreaterThan(1);
-        expect(log()).toContain("kept the client: the newer bridge stopped (exit 3)");
+        expect(log()).toContain("kept the client: concos 99.0.0 could not take over: broken install");
         await callTool(client, "check_in", { task: "again" });
         expect(log().match(/kept the client/g)).toHaveLength(1);
+    }, E2E_TIMEOUT_MS);
+
+    it("keeps the client when the newer code returns without taking it", async () => {
+        const { cli, packageFile } = installCopy();
+        const { client, log } = await connect(cli);
+        await callTool(client, "join", { display_name: "Server", client: "Codex", working_directory: workDirectory });
+        fs.writeFileSync(path.join(path.dirname(cli), "takeover.js"), "export async function takeOver() {}\n");
+        installVersion(packageFile, "99.0.0");
+        // the call that was held while it loaded is answered by the older code
+        const answered = await callTool(client, "check_in", { task: "still answered" });
+        expect(answered.you.revision).toBeGreaterThan(1);
+        expect(log()).toContain("kept the client: concos 99.0.0 could not take over: it returned without taking the client");
+        expect((await callTool(client, "check_in", { task: "and again" })).you.revision).toBeGreaterThan(answered.you.revision);
+    }, E2E_TIMEOUT_MS);
+
+    it("still takes a client over from a bridge before 0.1.19, which starts it with its state", async () => {
+        const first = await connectBridge();
+        const joined = await callTool(first, "join", { display_name: "Older", client: "Codex", working_directory: workDirectory });
+        const { cli } = installCopy();
+        const state = { lastHandle: joined.handle, joinedAgentIds: [joined.agent_id], toldToRecord: [], clientPid: process.pid, version: "0.1.19" };
+        const { client, log } = await connect(cli, { CONCOS_HANDOFF: JSON.stringify(state) });
+        // no handle: the state carried it
+        const answered = await callTool(client, "check_in", { task: "carried over" });
+        expect(answered.you.revision).toBeGreaterThan(1);
+        expect(log()).toContain("(took over from an older bridge)");
+        // that bridge did not say which instructions its client holds: they come once, in full
+        expect(answered.concos_updated).toMatch(/^concos updated to [\d.]+ during this session and its instructions changed; follow the instructions below\.\n\nconcos is one local room/);
+        expect((await callTool(client, "check_in", { task: "again" })).concos_updated).toBeUndefined();
     }, E2E_TIMEOUT_MS);
 });

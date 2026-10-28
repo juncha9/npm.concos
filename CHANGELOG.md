@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.19] - 2026-10-29
+
+### Changed
+
+- **An update no longer adds a process.** When 0.1.18 was installed, each of the
+  22 running MCP servers on one machine started a second node process for the new
+  version and kept relaying to it: 44 processes, about 1 GB more. From 0.1.19 a
+  running server loads the installed version into its own process instead. The
+  newer code gets ready first, then takes over stdin, the requests that arrived
+  meanwhile and who joined, while the older code lets go of everything at once;
+  if it cannot load, the older code keeps answering. Sessions started on 0.1.17
+  or 0.1.18 keep their relay once more and stop growing after that.
+
+### Added
+
+- **Changed instructions reach running sessions.** A client reads the MCP
+  instructions only when it connects, so sessions updated to 0.1.18 kept the old
+  ones, without the rule against confirmations and progress notes or the
+  `wake: false` advice. After an update with changed instructions, the first
+  tool result carries the new ones in full as `concos_updated`, once.
+
 ## [0.1.18] - 2026-10-29
 
 ### Added

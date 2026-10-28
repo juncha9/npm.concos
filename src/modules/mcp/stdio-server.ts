@@ -19,18 +19,20 @@ export interface ToolResult {
     isError?: boolean;
 }
 
-/** Lets a bridge pass its client to a newer bridge it starts, and take it back if that one fails. */
+/** Lets a bridge pass its client to newer code, and keep it if that fails. */
 export interface StdioServer {
-    /** The params of the client's initialize request, kept to introduce a successor; null before it. */
+    /** The params of the client's initialize request, kept for newer code; null before it. */
     initializeParams(): Record<string, unknown> | null;
     /** From now on every line from the client goes to `forward`, unanswered here. */
     handOver(forward: (line: string) => void): void;
     /** Lines from the client are answered here again. */
     takeBack(): void;
-    /** Answers `line` here as if it had just arrived, for lines held during a hand-over that failed. */
+    /** Answers `line` here as if it had just arrived, for lines held while newer code got ready. */
     receive(line: string): void;
     /** Writes one JSON-RPC line to the client as it is. */
     writeLine(line: string): void;
+    /** Stops reading stdin for good; returns the start of a line not yet ended, for newer code to go on from. */
+    release(): string;
 }
 
 /**
@@ -48,10 +50,14 @@ export function serveStdio(options: {
     callTool: (name: string, values: Record<string, unknown>) => ToolResult;
     logger: Logger;
     beforeLine?: () => void;
+    /** Code that took a client over in this process: the client's initialize, already answered. */
+    initialized?: Record<string, unknown>;
+    /** The start of a line the code before this one read but did not end. */
+    partial?: string;
 }): StdioServer {
     const { logger } = options;
     let stdoutBroken = false;
-    let initializeParams: Record<string, unknown> | null = null;
+    let initializeParams: Record<string, unknown> | null = options.initialized ?? null;
     let forward: ((line: string) => void) | null = null;
     // the client is gone; stdin's end shuts the bridge down, so later answers are dropped
     process.stdout.on("error", () => {
@@ -157,9 +163,8 @@ export function serveStdio(options: {
         }
     };
 
-    let buffer = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk: string) => {
+    let buffer = options.partial ?? "";
+    const onData = (chunk: string): void => {
         buffer += chunk;
         for(let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
             const line = buffer.slice(0, end).replace(/\r$/, "");
@@ -176,7 +181,9 @@ export function serveStdio(options: {
             }
             receive(line);
         }
-    });
+    };
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", onData);
 
     return {
         initializeParams: () => initializeParams,
@@ -188,5 +195,11 @@ export function serveStdio(options: {
         },
         receive: receive,
         writeLine: writeLine,
+        release: () => {
+            process.stdin.off("data", onData);
+            const rest = buffer;
+            buffer = "";
+            return rest;
+        },
     };
 }

@@ -59,15 +59,24 @@ be found, concos shows the manual command instead.
 After success, concos closes the menu; open it again for the new board. A failed
 installation keeps the menu available to retry.
 
-Agent sessions need no restart. From 0.1.17 on, a running MCP server notices the
-newer installation at its next tool call, or within a minute while idle. It
-starts the installed version, introduces it to the client with the client's own
-handshake, carries over who joined, and from then on only relays between the
-two. The agent keeps its card and handle, and the client is told its tools may
-have changed. If the newer server does not answer within 10 seconds or stops, the
-older one keeps answering and does not try that version again. A session running
-0.1.16 or older needs one restart to get this; hooks always run the installed
-version. The server's first instructions stay as the client received them.
+Agent sessions need no restart. A running MCP server notices the newer
+installation at its next tool call, or within a minute while idle, and the agent
+keeps its card and handle. From 0.1.19 on the server loads the installed version
+into its own process: the newer code gets ready, then takes over stdin, the
+client's pending requests and who joined, and the older code lets go of
+everything at once. An update adds no process. The client is told its tools may
+have changed. If the newer code cannot load or get ready, the older one keeps
+answering and does not try that version again.
+
+A client reads the server's instructions only once, when it connects. When they
+changed, the first tool result after an update carries the new ones in full, as
+`concos_updated`, once per session.
+
+Servers from 0.1.17 and 0.1.18 started the installed version as a second process
+and relayed to it, so a session started on one of those versions runs one more
+node process per update until the first server of 0.1.19 or later takes over in
+its own process. A session running 0.1.16 or older needs one restart. Hooks
+always run the installed version.
 
 ## Register MCP
 

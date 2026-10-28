@@ -3,7 +3,8 @@ import { defineConfig } from "tsup";
 const COPYRIGHT_COMMENT = "/*! concos | Copyright (C) 2026 juncha9 | AGPL-3.0-or-later | https://github.com/juncha9/npm.concos */";
 
 export default defineConfig({
-    entry: ["src/cli.ts"],
+    // takeover.js: what an older running bridge loads to hand its client to this version
+    entry: ["src/cli.ts", "src/takeover.ts"],
     format: ["esm"],
     splitting: true,
     platform: "node",
