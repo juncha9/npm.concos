@@ -10,7 +10,7 @@ import { HOST_ADAPTERS } from "../hooks/adapters";
 import { describeWake } from "../hooks/notices";
 import { displayWidth, padToWidth, PromptBackError } from "./prompter";
 import type { LinePart, Prompter, SelectChoice, SelectInput, SelectItem, SelectOptions, SelectTabs, Style } from "./prompter";
-import { age, blockerAge, issueText, plain, renderAgentDetailHeader, renderAgentDetailBody, recentFolderLines, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, agentLocation, shortenPath, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
+import { age, blockerAge, contextWarning, issueText, plain, renderAgentDetailHeader, renderAgentDetailBody, recentFolderLines, renderMessageDetail, pendingMessageLines, stateLabel, stateOf, agentLocation, shortenPath, wrap, wrapMessageText, participantName, messageRecipientNames, previewText } from "./status-renderer";
 import type { State, StatusRenderOptions } from "./status-renderer";
 import { showMessageSearch } from "./message-search";
 import { RoomActivity } from "./room-activity";
@@ -206,7 +206,9 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                     { text: padToWidth(activity.indicator(`agent:${agent.agent_id}`, state == "working") + stateLabel(state, english).toLowerCase(), stateWidth), paint: statePaint(style, state) },
                 ];
                 const name = participantName(agent.name, agent.client, agent.human);
-                // Identity, pulse, folder, age: no name-column padding or empty badge slot.
+                const context = contextWarning(agent, english);
+                const contextWidth = context == "" ? 0 : displayWidth(context) + 3;
+                // Identity, context warning, pulse, folder, age: no name-column padding or empty badge slot.
                 const badges = activity.badge(`agent:${agent.agent_id}`, style).map((part) => ({ ...part, text: part.text.trim() }));
                 const badgeWidth = badges.reduce((total, part) => total + displayWidth(part.text), 0) + (badges.length > 0 ? 3 : 0);
                 const showBlocker = compact && active && agent.blocker.trim() != "";
@@ -218,10 +220,11 @@ function buildAgentItems(allAgents: RoomOverviewAgent[], style: Style, english: 
                     const minimum = fullLocation.reported ? displayWidth(english ? " (reported)" : " (보고됨)") + 4 : 4;
                     locationReserve = Math.min(displayWidth(fullLocation.paths[0]), minimum) + 3;
                 }
-                const nameWidth = Math.max(4, width - stateWidth - displayWidth(unread) - badgeWidth - locationReserve - taskReserve);
+                const nameWidth = Math.max(4, width - stateWidth - displayWidth(unread) - contextWidth - badgeWidth - locationReserve - taskReserve);
                 const shownName = compactText(name, nameWidth, unicode);
                 first.push({ text: shownName, paint: paintName });
                 if(unread != "") first.push({ text: unread, paint: style.warning });
+                if(context != "") first.push({ text: " · ", paint: style.dim }, { text: context, paint: style.warning });
                 if(badges.length > 0) first.push({ text: " · ", paint: style.dim }, ...badges);
                 const used = first.reduce((total, part) => total + displayWidth(part.text), 0);
                 const elapsed = { text: ` · ${age(agent.updated_at, nowMs, english)}`, paint: style.dim };
@@ -1040,7 +1043,13 @@ async function wakeAllSessions(prompter: Prompter, store: RoomStore, options: Ro
         if(adapter?.deliverWake != null && target.session_id != null) {
             queueTargets.add(target.agent_id);
             const wake = store.fallbackWake(target.agent_id, hosts, Date.now(), { force: true });
-            await adapter.deliverWake(target.session_id, wake == null ? MANUAL_WAKE : describeWake(wake.notices, wake.unread));
+            if(wake == null) {
+                await adapter.deliverWake(target.session_id, MANUAL_WAKE);
+                return "queue";
+            }
+            const line = describeWake(wake.notices, wake.unread, adapter.wakeCarries);
+            await adapter.deliverWake(target.session_id, line.text);
+            store.markDelivered(target.agent_id, line.delivered);
             return "queue";
         }
         person ??= store.ensureHumanParticipant(SHARED_ROOM, os.userInfo().username);

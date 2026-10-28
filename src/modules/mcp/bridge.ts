@@ -88,15 +88,15 @@ const SERVER_INSTRUCTIONS = [
     "Join at task start with the absolute starting folder and exact session name; resume a supplied handle. Use role for your standing assignment, task for current work, and current_directory when working elsewhere.",
     "Call check_in after meaningful progress, when blocked, and when context is needed; send changed fields only. Keep summary and next_step current. Do not poll on a timer. If join says hooks_manage_status_and_editing, skip calls solely to mark waiting; otherwise report working/editing and, before yielding, waiting with editing=[].",
     "Use read_messages for unread or truncated messages and inspect_agent for card details. Full texts count as received on your next call; inbox counts unread messages. has_more is available history, not an obligation to drain the room; fetch unread direct messages through read_messages.",
-    "Use question for requests needing answers; answer requests with reply and reply_to, including requests received as note. Send only requested results, substantive questions, blockers, or corrections. Do not send receipt confirmations, thanks, or restatements.",
+    "Use question for requests needing answers; answer requests with reply and reply_to, including requests received as note. Send only requested results, substantive questions, blockers, or corrections. A message can wake a waiting agent, which then rereads its whole conversation: never send receipt confirmations, 'starting' or progress notes (your card shows progress), thanks, or restatements, and send what needs no action now with wake false.",
     "Send to concerned agents. to=all posts are for room-wide news, wake nobody, and wait on nobody; edit changed posts and remove obsolete ones. Reuse relevant snake_case topics. Start with the content, not your name.",
-    "Messages expire within a day; read ones can expire after an hour. Record settled decisions, contracts, and plans in their owning project docs and cite the path. Call leave when your task is done.",
+    "Messages expire within 48 hours; read ones can expire after an hour. Record settled decisions, contracts, and plans in their owning project docs and cite the path. Call leave when your task is done.",
 ].join("\n");
 
 const HANDLE_PROPERTY: ValueSchema = { type: "string", description: "Handle from join. Omit to use the last one joined in this session." };
 
 /** Carried by an agent's first answer in a session: the thread goes, so what it settled belongs in the docs. */
-const RECORD_IN_DOCS = "This thread is deleted within a day. If your answer settles a design, a decision, a contract or a plan, write it into the project's docs (the file that owns it) and cite that path in the thread.";
+const RECORD_IN_DOCS = "This thread is deleted within 48 hours. If your answer settles a design, a decision, a contract or a plan, write it into the project's docs (the file that owns it) and cite that path in the thread.";
 const ANY_INTEGER = { type: "integer", minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER } as const;
 const POSITIVE_INTEGER = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER } as const;
 
@@ -259,7 +259,7 @@ export async function runBridge(): Promise<void> {
 
     registerTool({
         name: "send_message",
-        description: `Leave a message for one agent or several, or post one to the whole room. Success means stored, not read. A post to all is there for reference: nobody receives it or is waited on, the room keeps your newest ${POSTS_PER_AGENT}, edit rewrites one when it changes, and remove_posts takes it down. Send to the agents concerned unless everyone needs it. Messages are deleted within a day: write what an exchange settles into the project's docs and cite the path.`,
+        description: `Leave a message for one agent or several, or post one to the whole room. Success means stored, not read. A post to all is there for reference: nobody receives it or is waited on, the room keeps your newest ${POSTS_PER_AGENT}, edit rewrites one when it changes, and remove_posts takes it down. Send to the agents concerned unless everyone needs it. Messages are deleted within 48 hours: write what an exchange settles into the project's docs and cite the path.`,
         inputSchema: inputSchema({
             handle: HANDLE_PROPERTY,
             to: {
@@ -275,9 +275,10 @@ export async function runBridge(): Promise<void> {
             reply_to: ANY_INTEGER,
             edit: { ...POSITIVE_INTEGER, description: "Id of one of your posts to all: rewrite it with this text, and kind and topics when given, instead of posting anew. to stays \"all\"." },
             request_id: { type: "string", maxLength: MAX_REQUEST_ID_LENGTH, description: "Reuse on retry to avoid storing the message twice." },
+            wake: { type: "boolean", description: "Default true: a waiting recipient is woken for a note or reply. false when they need not act now (an outcome nobody waits on): it waits for their next turn. A question always wakes." },
         }, ["to", "text"]),
     }, (values) => runTool("send_message", () => {
-        const args = values as { handle?: string; to: string | string[]; kind?: MessageKind; text: string; topics?: string[]; reply_to?: number; edit?: number; request_id?: string };
+        const args = values as { handle?: string; to: string | string[]; kind?: MessageKind; text: string; topics?: string[]; reply_to?: number; edit?: number; request_id?: string; wake?: boolean };
         const agentId = resolveAgentId(args.handle);
         if(args.edit != null) {
             if(args.to !== RECIPIENT_ALL) {
@@ -295,9 +296,10 @@ export async function runBridge(): Promise<void> {
             replyTo: args.reply_to ?? null,
             requestId: args.request_id ?? null,
             topics: args.topics ?? [],
+            wake: args.wake,
         });
         // An answer is where a design question gets settled between agents, and the thread is gone
-        // within a day; the first answer an agent sends through this bridge says where the outcome
+        // within 48 hours; the first answer an agent sends through this bridge says where the outcome
         // belongs (2026-10-26 report: agents settled designs in messages and left the docs behind)
         if(args.kind == "reply" && agentsToldToRecord.has(agentId) == false) {
             agentsToldToRecord.add(agentId);
@@ -454,7 +456,10 @@ export async function runBridge(): Promise<void> {
                     continue;
                 }
                 const adapter = WAKE_HOSTS.find((item) => item.id == wake.host);
-                adapter?.deliverWake?.(wake.sessionId, describeWake(wake.notices, wake.unread)).catch((ex) => {
+                const line = describeWake(wake.notices, wake.unread, adapter?.wakeCarries);
+                adapter?.deliverWake?.(wake.sessionId, line.text).then(() => {
+                    store.markDelivered(agentId, line.delivered);
+                }).catch((ex) => {
                     _logger.error(ex, "fallback wake was not delivered");
                 });
             }

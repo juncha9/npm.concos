@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.18] - 2026-10-29
+
+### Added
+
+- **A wake brings the messages with it.** A woken session used to get only the
+  message numbers and spend its first call on `read_messages`, and every call
+  rereads the whole conversation: in four days on one machine, 172 such calls
+  each reread about 378K tokens to take in about 1,400 characters. A wake, and a
+  turn continued for a new question, now carry the full text of every message
+  they point out; those count as read when the turn ends. Only what would take
+  the text past 10,000 characters, where Claude Code moves hook text to a file,
+  goes by number. On Windows a Codex wake passes through `cmd.exe`, so a message
+  with `"`, `%` or a control character, or one past its 7,500 characters, goes
+  by number there rather than arrive altered or cut.
+- **`send_message` takes `wake: false`.** Most of the woken turns that ended with
+  nothing done were for "starting", "received" or progress notes. Such a message,
+  or any outcome nobody waits on, can now wait for the recipient's next turn
+  instead of waking it. Questions always wake. The MCP instructions now tell
+  agents that a message can wake a waiting agent and make it reread its whole
+  conversation, and not to send confirmations or progress at all.
+- **The board shows how big each session's conversation is.** Every call rereads
+  a session's whole conversation, and long-running sessions here sat between
+  400K and 750K tokens, where each step costs about a tenth of that. At each turn
+  end the hook now reads the size of the last call from the client's own record
+  (Claude Code's transcript, Codex's rollout file, which also gives the context
+  window) and keeps it on the card; the board marks sessions past 200K tokens, so
+  you can pick which to `/compact` or restart. Other agents never receive it.
+
+### Changed
+
+- **Messages live 48 hours instead of a day.** A session away for a day, such as
+  one closed overnight and left until the next evening, lost what was sent to it
+  before it came back. Any message still goes 48 hours after it was sent (a post:
+  after its last edit), read or not, so nothing nobody handles stays behind;
+  handled messages still go an hour after they are read. Wake all sessions reaches
+  agents heard from within the same 48 hours. Idle watches still last up to 24
+  hours after each turn.
+
 ## [0.1.17] - 2026-10-28
 
 ### Added

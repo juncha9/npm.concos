@@ -26,6 +26,7 @@ beforeEach(async () => {
     vi.stubEnv("CODEX_HOME", path.join(directory, "user", ".codex"));
     vi.stubEnv("CONCOS_REDUCED_MOTION", "1");
     vi.stubEnv("CONCOS_LOG_LEVEL", "none");
+    vi.spyOn(os, "userInfo").mockReturnValue({ username: "Board reviewer", uid: -1, gid: -1, shell: null, homedir: directory });
     vi.spyOn(codex, "deliverWake").mockResolvedValue(undefined);
     database = await openDatabase(directory);
     store = new RoomStore(database);
@@ -50,14 +51,14 @@ function send(from: string, to: string | string[], text = "First preview\nFull s
     return store.sendMessage(from, { to, text, topics, kind: "question", replyTo: null, requestId: null }).message_id;
 }
 
-async function board(answers: string, sendMessage: RoomBoardOptions["send"] = async () => undefined): Promise<string> {
+async function board(answers: string, sendMessage: RoomBoardOptions["send"] = async () => undefined, options: Partial<Omit<RoomBoardOptions, "send">> = {}): Promise<string> {
     const input = Readable.from([answers]);
     const output = new PassThrough();
     let text = "";
     output.on("data", (chunk) => { text += chunk.toString(); });
     const prompter = new Prompter(input, output);
     try {
-        await showRoomBoard(prompter, { language: "en", columns: 80, send: sendMessage });
+        await showRoomBoard(prompter, { language: "en", columns: 80, ...options, send: sendMessage });
         expect(prompter.transient).toBe(false);
         return text;
     }
@@ -91,6 +92,120 @@ function terminal(columns = 80, rows = 24) {
         },
     };
 }
+
+describe("session context on the board", () => {
+    function measured(id: string, tokens: number, window: number | null = null): string {
+        const at = new Date(Date.now() - 3 * 60_000).toISOString();
+        database.prepare("UPDATE agent SET context_tokens = ?, context_window = ?, context_at = ? WHERE id = ?").run(tokens, window, at, id);
+        return at;
+    }
+
+    function detail(id: string, options: Parameters<typeof renderAgentDetailBody>[2] = {}): string {
+        const card = store.getRoomOverview("main", 0).agents.find((entry) => entry.agent_id == id)!;
+        const inspected = store.inspectAgent(id, { agentId: id, checkpointLimit: 0, beforeCheckpointId: null });
+        return renderAgentDetailBody(card, inspected, { language: "en", columns: 80, ...options });
+    }
+
+    it.each([
+        [562_000, null, "562K tokens"],
+        [205_000, 475_000, "205K of 475K tokens"],
+        [12_000, null, "12K tokens"],
+        [0, null, "0 tokens"],
+        [1, null, "1 token"],
+        [999, null, "999 tokens"],
+        [199_999, 475_000, "199K of 475K tokens"],
+    ] as const)("shows the measured size and its own age (%s tokens, window=%s)", (tokens, window, expected) => {
+        const reader = agent("Reader");
+        measured(reader, tokens, window);
+        const row = detail(reader).split("\n").find((line) => line.startsWith("Context"));
+        expect(row).toBeDefined();
+        expect(row).toContain(`${expected} · 3m ago`);
+    });
+
+    it.each([199_999, 200_000, 200_001])("warns in both list modes and the detail at the exact threshold (%s tokens)", async (tokens) => {
+        const reader = agent("Reader");
+        const at = measured(reader, tokens);
+        const row = detail(reader, { color: true }).split("\n").find((line) => line.includes("Context"))!;
+        const output = await board("compact\nback\n");
+        if(tokens >= 200_000) {
+            expect(row).toContain("\u001b[33m");
+            expect(output.match(/ctx 200K/g)).toHaveLength(2);
+        }
+        else {
+            expect(row).not.toContain("\u001b[33m");
+            expect(output).not.toContain("ctx ");
+        }
+        expect(database.prepare("SELECT context_tokens, context_window, context_at FROM agent WHERE id = ?").get(reader))
+            .toEqual({ context_tokens: tokens, context_window: null, context_at: at });
+    });
+
+    it("shows the context row when opening the actual agent card", async () => {
+        const reader = agent("Reader");
+        measured(reader, 205_000, 475_000);
+        const output = await board("Reader\nback\nback\n");
+        expect(output).toMatch(/Context +205K of 475K tokens · 3m ago/);
+    });
+
+    it("omits missing and incomplete measurements, and never shows context on a human card", async () => {
+        const reader = agent("Reader");
+        expect(detail(reader)).not.toContain("Context");
+        database.prepare("UPDATE agent SET context_tokens = 562000, context_at = NULL WHERE id = ?").run(reader);
+        expect(detail(reader)).not.toContain("Context");
+        const person = store.ensureHumanParticipant("main", "Person");
+        measured(person, 700_000, 475_000);
+        expect(detail(person)).not.toContain("Context");
+        const output = await board("compact\nback\n");
+        expect(output).not.toContain("ctx ");
+    });
+
+    it("uses Korean labels and the client window when provided", async () => {
+        const reader = agent("Reader");
+        measured(reader, 205_000, 475_000);
+        expect(detail(reader, { language: "ko" })).toMatch(/문맥 +475K 중 205K 토큰 · 3분 전/);
+        const output = await board("compact\nback\n", undefined, { language: "ko" });
+        expect(output.match(/문맥 205K/g)).toHaveLength(2);
+        expect(output).not.toContain("ctx ");
+    });
+
+    it.each([[false, true], [true, true], [false, false], [true, false]])("keeps the warning and unread count visible at 54 columns (compact=%s, color=%s)", async (compact, color) => {
+        vi.stubEnv("NO_COLOR", color ? undefined : "1");
+        const reader = agent("A fairly long agent name");
+        send(agent("Reporter"), reader);
+        measured(reader, 562_000);
+        const tty = terminal(54, 20);
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("ctx 562K"));
+            if(compact) {
+                await tty.key("1");
+                await tty.key("\r");
+                await vi.waitFor(() => expect(tty.visible()).toMatch(/Compact view +on/));
+            }
+            const row = tty.screen.visible().find((line) => line.includes("ctx 562K"))!;
+            expect(row).toContain("(1 unread)");
+            expect(displayWidth(row)).toBeLessThanOrEqual(53);
+            if(color) expect(tty.written()).toMatch(/\u001b\[33mctx 562K\u001b\[39m/);
+            else expect(tty.written()).not.toMatch(/\u001b\[33mctx 562K/);
+        }
+        finally { await tty.close(); }
+    });
+
+    it("refreshes the warning without moving the selected agent when its measured size changes", async () => {
+        const reader = agent("Reader");
+        measured(reader, 150_000);
+        const tty = terminal();
+        try {
+            await vi.waitFor(() => expect(tty.visible()).toContain("Reader (Codex)"));
+            expect(tty.visible()).not.toContain("ctx ");
+            measured(reader, 250_000);
+            await vi.waitFor(() => expect(tty.visible()).toContain("ctx 250K"), { timeout: 2000 });
+            expect(tty.screen.visible().find((line) => /^[❯>]/.test(line))).toContain("Reader (Codex)");
+            measured(reader, 199_999);
+            await vi.waitFor(() => expect(tty.visible()).not.toContain("ctx "), { timeout: 2000 });
+            expect(tty.screen.visible().find((line) => /^[❯>]/.test(line))).toContain("Reader (Codex)");
+        }
+        finally { await tty.close(); }
+    });
+});
 
 describe("wake all sessions", () => {
     function hooked(name: string, host: "codex" | "claude", sessionId = name): string {
@@ -138,7 +253,7 @@ describe("wake all sessions", () => {
         const ended = hooked("Closed", "claude");
         store.applyHookEvent({ host: "claude", sessionId: "Closed", cwd: directory, kind: "session-end", files: [] });
         const expired = agent("Expired");
-        database.prepare("UPDATE agent SET last_seen_at = ? WHERE id = ?").run(new Date(Date.now() - 25 * 60 * 60_000).toISOString(), expired);
+        database.prepare("UPDATE agent SET last_seen_at = ? WHERE id = ?").run(new Date(Date.now() - 49 * 60 * 60_000).toISOString(), expired);
         store.ensureHumanParticipant("main", os.userInfo().username);
         const overview = store.getRoomOverview("main", 0);
         expect(overview.agents.find((card) => card.agent_id == codexSilent)).toMatchObject({ ended: true, online: false });
@@ -160,7 +275,7 @@ describe("wake all sessions", () => {
         expect(notes.some((note) => [left, ended, expired].includes(String(note.id)))).toBe(false);
     });
 
-    it("forces a recent working Codex session's unread wake and keeps its receipt unread", async () => {
+    it("forces a recent working Codex session's unread wake, carrying its text, and keeps its receipt unread", async () => {
         const reader = hooked("Codex", "codex");
         update(reader, { status: "working" });
         const person = store.ensureHumanParticipant("main", os.userInfo().username);
@@ -172,9 +287,11 @@ describe("wake all sessions", () => {
         expect(codex.deliverWake).toHaveBeenCalledExactlyOnceWith("Codex", expect.stringContaining(`question #${id}`));
         const text = vi.mocked(codex.deliverWake!).mock.calls[0][1];
         expect(text).toContain("[concos_dev]");
-        expect(text).toContain("Read them with read_messages, and answer questions with kind reply if they need one.");
+        expect(text).toContain(`#${id} question from ${os.userInfo().username}:\nFirst preview\nFull second line`);
+        expect(text).toContain("The texts above count as read. Answer questions with kind reply if they need one.");
         expect(store.pendingFor(reader)).toMatchObject([{ id, notified: true }]);
-        expect(database.prepare("SELECT delivered_at, received_at FROM message_receipt WHERE message_id = ? AND agent_id = ?").get(id, reader)).toEqual({ delivered_at: null, received_at: null });
+        // delivered with the wake, received only when the woken turn ends
+        expect(database.prepare("SELECT delivered_at IS NOT NULL AS delivered, received_at FROM message_receipt WHERE message_id = ? AND agent_id = ?").get(id, reader)).toEqual({ delivered: 1, received_at: null });
         expect(database.prepare("SELECT count(*) AS n FROM message").get()).toEqual({ n: 1 });
     });
 

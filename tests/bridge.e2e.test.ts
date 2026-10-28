@@ -106,7 +106,7 @@ describe("concos mcp over stdio", () => {
         expect(recovered.room.agents[0]).not.toHaveProperty("detail");
 
         expect(viewer.getInstructions()).toContain("has_more is available history, not an obligation to drain");
-        expect(viewer.getInstructions()).toContain("Do not send receipt confirmations");
+        expect(viewer.getInstructions()).toContain("never send receipt confirmations");
         const tools = await viewer.listTools();
         expect(tools.tools.find((tool) => tool.name == "check_in")!.description).toContain("detail=status");
         hook("session-end", "peer");
@@ -148,6 +148,26 @@ describe("concos mcp over stdio", () => {
         expect(overview[0].room).toBe("main");
         expect(overview[0].agents.filter((agent: any) => !agent.human)).toHaveLength(2);
         expect(overview[0].agents.find((agent: any) => agent.agent_id == peer.agent_id).pending_count).toBe(2);
+    }, E2E_TIMEOUT_MS);
+
+    it("stores a message sent with wake false to wait for the next turn, and checks the flag's type", async () => {
+        const first = await connectBridge();
+        const second = await connectBridge();
+        await callTool(first, "join", { display_name: "Sender", client: "Claude Code", working_directory: workDirectory });
+        const reader = await callTool(second, "join", { display_name: "Reader", client: "Codex", working_directory: workDirectory });
+        await expect(callTool(first, "send_message", { to: reader.agent_id, text: "done", wake: "no" })).rejects.toThrow(/wake must be true or false/);
+        const quiet = await callTool(first, "send_message", { to: reader.agent_id, text: "done", wake: false });
+        const loud = await callTool(first, "send_message", { to: reader.agent_id, text: "look" });
+        const check = new DatabaseSync(path.join(dataDirectory, "concos.db"), { readOnly: true });
+        try {
+            expect(check.prepare("SELECT id, wake FROM message ORDER BY id").all()).toEqual([
+                { id: quiet.message_id, wake: 0 }, { id: loud.message_id, wake: 1 },
+            ]);
+        }
+        finally { check.close(); }
+        // it still arrives, on the reader's next call
+        const seen = await callTool(second, "read_messages", {});
+        expect(seen.messages.map((message: any) => message.id)).toEqual([quiet.message_id, loud.message_id]);
     }, E2E_TIMEOUT_MS);
 
     it("posts to the room and lets only its sender rewrite or remove the post", async () => {

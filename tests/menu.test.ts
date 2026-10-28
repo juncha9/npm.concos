@@ -725,7 +725,7 @@ describe("ended sessions on the board", () => {
         const other = store.join({ room: "main", displayName: "Other", client: "Codex", workingDirectory: directory, workspaceRoot: null, resumeHandle: null });
         const done = store.sendMessage(live.agent_id, { to: other.agent_id, kind: "note", text: "handled", replyTo: null, requestId: null });
         store.acknowledge(other.agent_id, [done.message_id]);
-        const pastLifetime = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+        const pastLifetime = new Date(Date.now() - 49 * 60 * 60_000).toISOString();
         database.prepare("UPDATE message SET created_at = :at WHERE id = :id").run({ at: pastLifetime, id: done.message_id });
         database.close();
 

@@ -14,6 +14,17 @@ export interface HookEvent {
     canContinue?: boolean;
     /** The client process the hook ran under, when known; MCP servers under it keep the card online. */
     clientPid?: number;
+    /** The client's record of the session, as the hook was told (`transcript_path`). */
+    transcriptPath?: string;
+    /** At a turn end: the conversation size the client recorded for its last call. */
+    context?: ContextSize;
+}
+
+/** A session's conversation as its client recorded it for its last call: every call rereads it. */
+export interface ContextSize {
+    tokens: number;
+    /** The model's context window, when the client records it (Codex). */
+    window: number | null;
 }
 
 export interface HookRegistration {
@@ -32,6 +43,8 @@ export interface HookRegistration {
 export interface HookResult {
     context?: string;
     continueReason?: string;
+    /** Messages `continueReason` carries in full, for the agent `agentId`: delivered once it went out. */
+    delivered?: { agentId: string; messageIds: number[] };
 }
 
 export interface HostAdapter {
@@ -46,12 +59,19 @@ export interface HostAdapter {
      * with code 2 and the line on stderr, which Claude Code's asyncRewake turns into a turn.
      */
     deliverWake?(sessionId: string, message: string): Promise<void>;
+    /**
+     * Whether `deliverWake` hands `whole`, a wake text carrying the message `body`, over unchanged
+     * and in full; a message it would alter or cut goes by number only. Absent: anything within HOOK_TEXT_LIMIT.
+     */
+    wakeCarries?(body: string, whole: string): boolean;
     /** The environment variable in which the client names its own process id to the hooks and MCP servers it starts. */
     clientPidVariable?: string;
     normalize(kind: HookEventKind, payload: unknown): HookEvent | null;
     output(kind: HookEventKind, context?: string): Record<string, unknown>;
     /** Output that continues the turn at its end; a host without one never continues a turn. */
     continueTurn?(reason: string): Record<string, unknown>;
+    /** Reads the session's conversation size from the client's own record; null when it cannot tell. */
+    contextSize?(event: HookEvent): ContextSize | null;
     setup: {
         userHooks: string;
         userMcp: string;

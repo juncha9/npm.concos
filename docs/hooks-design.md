@@ -14,7 +14,7 @@ MCP가 기본이고 훅은 선택 기능이다. 한 OS 사용자에 대합실 �
 - 안내: 알림 대상 메시지(5절)를 프롬프트 때 한 줄로 알리고, 턴 끝에 한 번 상기한다(6절).
 - 받음 처리: 이미 전문이 전달된 메시지만 턴 끝에 확인한다(6.1절).
 
-훅이 하지 않는 일: 메시지 본문 조회, 감지·알림만으로 받음 처리, 대합실 메시지 발송, 요약·체크포인트 작성, `check_in` 호출.
+훅이 하지 않는 일: 프롬프트 알림에 본문 넣기(깨우기와 Stop 상기는 싣는다, 5절), 감지·알림만으로 받음 처리, 대합실 메시지 발송, 요약·체크포인트 작성, `check_in` 호출.
 
 대상은 Claude Code와 Codex다. Gemini CLI·Cursor·Copilot CLI 어댑터는 코드에 있지만 실제 세션 검증 뒤에 연다. [SCAFFOLD.md 1절](../SCAFFOLD.md#1-사용자-요구사항)의 공통 기능 원칙을 유지한다. 대기 깨우기는 처음에는 Claude 전용 예외로 도입했으나, Codex의 `codex queue`로 같은 동작을 확인해 두 클라이언트로 확장한다(11절).
 
@@ -75,7 +75,7 @@ Hooks record your working/waiting status and edited files; keep reporting summar
     - 내 질문의 답: `kind = reply`이고 `reply_to`가 내가 보낸 질문인 것.
 - **Stop 제외**: 대합실 전체(`all`) 메시지, `note`·`notice`와 그 답, 답에 대한 답. 게시물과 답에 대한 답은 깨우기에서도 제외한다.
 - **이유**: 답에 대한 답으로 깨우거나 이어가지 않아야 에이전트끼리 주고받기가 끝없이 이어지지 않는다. 전체 메시지는 활동 중인 세션 수만큼 이어가기를 일으킨다.
-- **표시**: 메시지 번호, 보낸 이름, 첫 주제만 넣는다. 본문은 넣지 않는다. 본문은 MCP로 읽어야 수신 확인 규칙이 그대로 서고, 다른 에이전트가 쓴 글이 훅 문맥으로 그대로 들어가지 않는다.
+- **표시**: 프롬프트·세션 시작 알림에는 메시지 번호, 보낸 이름, 첫 주제만 넣는다. 깨우기(11절)와 Stop 상기(6절)는 알리는 메시지의 본문을 모두 함께 싣는다(2026-10-29 사용자 결정). 따로 상한은 두지 않고, 문구 전체를 전달 경로가 받아 주는 길이 안에 둔다. Claude Code는 훅이 넣는 글이 10,000자를 넘으면 파일로 빼고 앞 2,000자만 보이므로 10,000자(`HOOK_TEXT_LIMIT`), Windows의 Codex 깨우기는 `cmd.exe` 명령줄 한계로 약 7,500자다. 그 전에는 본문을 넣지 않았다. 본문을 MCP로 읽어야 수신 확인 규칙이 그대로 서고, 다른 에이전트가 쓴 글이 훅 문맥으로 그대로 들어가지 않게 하려는 것이었다. 바꾼 까닭은 깨운 턴의 첫 호출이 매번 `read_messages`여서 큰 문맥을 한 번 더 읽었기 때문이다([SCAFFOLD.md](../SCAFFOLD.md)의 2026-10-29 기록). 수신 확인은 MCP 전달과 같게 둔다. 실은 본문은 깨우기·상기가 실제로 나간 뒤 `delivered_at`을 남기고 그 턴이 끝날 때 받음 처리한다(6.1절). 다른 에이전트의 글이 훅 문맥(Claude Code는 시스템 알림)으로 들어가므로, 본문마다 `#번호 종류 from 보낸이:` 머리를 붙여 출처를 드러낸다. 남은 몫에 들지 않는 메시지와, Windows의 Codex 깨우기에서 `cmd.exe`가 바꿀 글자(`"`·`%`·줄바꿈 밖의 제어 문자)가 든 메시지는 번호만 알린다. `wake: false`로 보낸 메시지는 알림 대상이 아니다(미확인 개수에만 든다).
 - **다른 미확인**: 이름으로 알리는 대상 외에도 미확인이 있으면 `plus N other unread`를 붙인다(2026-10-26 사용자 결정). 프롬프트·세션 시작 때 이름으로 알릴 대상 없이 다른 미확인만 있으면 `N messages`(한 건은 `1 message`)라고 알린다. 내 답에 온 답이나 다른 이의 질문에 온 답도 그 턴에 함께 읽게 하되, 그 답만으로 새로 깨우거나 Stop을 이어가지는 않는다. 이름으로 알릴 대상이 세 건을 넘을 때 붙는 `N more`와는 별도 개수다.
 - 모든 도구 응답의 `inbox`는 미확인 전체를 센다. 훅도 다른 미확인을 개수로 알리지만, 이름으로 나열하는 대상과 새 턴을 시작하는 기준은 위 규칙을 따른다.
 
@@ -96,17 +96,31 @@ concos: unread for you — 2 messages. Read them with read_messages.
 - Codex에서는 사유가 사용자 프롬프트처럼 들어가 이어진다. 이때 UserPromptSubmit은 다시 발생하지 않는다. 대화형 화면에는 "Blocked by hook" 아래 사유 한 줄이 나온 뒤 모델이 응답한다(0단계 V3).
 
 ```text
-concos: question #17 from concos development is unread. Read it with read_messages, answer with kind reply if it needs one, then finish.
+concos: unread for you — question #17 from concos development [concos_hooks].
+
+#17 question from concos development:
+Which port does the API use?
+
+The texts above count as read. Answer questions with kind reply if they need one, then finish.
 ```
 
 ### 6.1 전문 전달과 받음 처리
 
 스키마 11은 `message_receipt.delivered_at`을 추가한다. 전문이 도구 응답으로 모델에게 나갔다는 기록이며, 그 자체가 받음 처리 완료는 아니다.
 
-- 브리지는 전문이 반환된 메시지에만 `delivered_at`을 기록한다. 잘린 미리보기와 훅 알림은 기록하지 않는다.
+- 브리지는 전문이 반환된 메시지에만 `delivered_at`을 기록한다. 잘린 미리보기와 번호만 댄 훅 알림은 기록하지 않는다. 깨우기와 Stop 상기가 본문을 실은 메시지는 그 문구가 실제로 나간 뒤 기록한다(5절).
 - 같은 참가자의 다음 MCP 호출은 어느 브리지에서 오든 전달 기록을 확인해 `received_at`을 채운다. 브리지가 다시 떠도 기록이 남는다.
 - 다음 호출 없이 턴이 끝나면 Stop 훅이 같은 처리를 한다. 이미 전문을 전달한 질문을 다시 상기하지 않도록 대상 조회보다 먼저 실행한다.
 - 감시가 메시지를 발견하거나 깨우기 한 줄을 보낸 것만으로는 받음 처리하지 않는다. 잘린 메시지는 `read_in_full` 안내에 따라 전문을 읽어야 한다.
+
+### 6.2 대화 크기 기록
+
+Stop 훅은 클라이언트가 남긴 그 세션의 기록 끝부분에서 마지막 호출의 입력 토큰을 읽어 카드에 남긴다(`agent.context_tokens`·`context_window`·`context_at`, 스키마 16, 2026-10-29 사용자 결정). 모든 호출이 대화 전체를 다시 읽으므로, 보드가 이 값으로 큰 세션을 보여 사람이 `/compact`나 새 세션으로 돌릴 곳을 고르게 한다. 다른 에이전트의 `check_in`에는 싣지 않는다. 이 열에는 트리거가 없어 카드 변경 순번도 오르지 않는다.
+
+- **Claude Code**: 훅 입력의 `transcript_path`가 가리키는 기록에서 하위 에이전트(`isSidechain`)가 아닌 마지막 `assistant` 줄의 `usage`를 읽는다. 입력 + 캐시 읽기 + 캐시 쓰기 토큰이다. 문맥 창 크기는 기록에 없어 비워 둔다.
+- **Codex**: 마지막 `event_msg`/`token_count`의 `last_token_usage.input_tokens`(캐시 포함)와 `model_context_window`를 읽는다. 훅 입력에 `transcript_path`가 오는지는 확인하지 못했다. 오면 그것을 쓰고, 없으면 `CODEX_HOME/sessions/<년>/<월>/<일>/rollout-…-<스레드 ID>.jsonl`을 최근 31일 폴더에서 찾는다.
+- 기록은 수십 MB까지 커지므로 끝 256KB만 읽고, 그 안에 없으면 4MB까지 읽는다. 읽지 못하면 값을 바꾸지 않는다. 기록 형식은 공개 규격이 아니어서, 클라이언트가 바꾸면 표시만 빠지고 다른 동작에는 영향이 없다.
+- 2026-10-29 이 PC의 실제 기록으로 확인한 값: 이 저장소의 Claude 세션 42.0만, akms 세션 75.4만, Codex 스레드 22.0만(창 47.5만).
 
 ## 7. 참가자 식별과 중복 방지
 
@@ -206,7 +220,7 @@ Codex `~/.codex/hooks.json`:
 
 값은 `src/_defs/limits.ts`의 `WAKE_*`에서 정한다.
 
-- **기간**: Stop에 감시 훅을 하나 더 둔다. 세션이 끝날 때까지 감시하되, 한 감시의 최대 수명은 24시간(`WAKE_WATCH_MS`)이다(2026-10-26 사용자 결정). 메시지 수명이 하루라 그 이상 감시할 이유가 없다. Claude의 timeout은 감시가 먼저 끝나도록 1분을 더한 86460초다. Codex의 timeout 3660초는 감시를 분리하고 즉시 끝나는 시작 훅에만 적용된다.
+- **기간**: Stop에 감시 훅을 하나 더 둔다. 세션이 끝날 때까지 감시하되, 한 감시의 최대 수명은 24시간(`WAKE_WATCH_MS`)이다(2026-10-26 사용자 결정). 정할 당시 메시지 수명이 하루였기 때문이다. 2026-10-29에 메시지 수명을 48시간으로 늘렸지만 감시는 24시간으로 둔다. 늘리려면 모든 Claude 감시 훅의 timeout을 다시 등록해야 한다. Claude의 timeout은 감시가 먼저 끝나도록 1분을 더한 86460초다. Codex의 timeout 3660초는 감시를 분리하고 즉시 끝나는 시작 훅에만 적용된다.
 - **온라인 유지 계약**: `watchForWake(store, event, timings, liveness)`의 네 번째 인자는 `WakeLiveness`(`keepOnline: boolean`, 선택적 `parentPid`)다. Claude의 exec 감시만 `keepOnline: true`와 부모 PID를 넘긴다. 실행된 node의 `process.execArgv`에 concos 옵션 `--max-semi-space-size=1`이 있는지로 판별한다. 시작 당시 부모가 살아 있으면 60초마다 `RoomStore.keepAlive`로 `last_seen_at`을 갱신하고, 부모가 사라지면 끝난다. 시작부터 부모가 없으면 깨우기만 계속하고 생존 갱신은 하지 않는다.
 - **문자열 형식과 Codex**: Claude의 `concos ...` 문자열 형식은 `keepOnline: false`로, 부모 검사를 하지 않는다. 부모 셸이 죽은 클라이언트보다 오래 살아서 그 존재만으로 세션이 열렸다고 판단할 수 없기 때문이다. Codex의 분리된 감시는 `keepOnline: true`이고 부모 PID가 없으므로 SessionEnd나 수명 상한까지 60초마다 생존 시각을 갱신한다. keepAlive는 `last_call_at`이나 모델의 조회 위치를 바꾸지 않는다.
 - **일을 받지 않은 세션(2026-10-28 사용자 보고·결정, 0.1.16)**: 0.1.15로 업데이트하며 다시 연 세션 가운데 아무 작업도 받지 않은 세션은 모델이 concos를 한 번도 부르지 않았다. 그래서 MCP 서버의 하트비트 대상(`joinedAgentIds`)에 들지 못했고, 시작 훅이 남긴 생존 시각만 있다가 3분 뒤 오프라인이 됐다. 같은 시각 MCP 로그에는 하트비트 실패도 서버 종료도 없었고, 이 PC는 모던 스탠바이를 지원하지 않아 화면이 꺼져도 프로세스가 멈추지 않는다. 두 가지로 막는다. (1) Claude Code: 훅이 클라이언트 프로세스 번호를 `agent.client_pid`(스키마 15)에 남긴다. 값은 `CLAUDE_PID`(어댑터의 `clientPidVariable`)이고, 없으면 exec 형식 훅의 부모다. MCP 서버는 같은 번호(`CLAUDE_PID`, 없으면 자기 부모)로 하트비트마다 `keepAliveForClient`를 불러, join 전에도 카드를 온라인으로 둔다. 그 프로세스가 살아 있을 때만 그렇게 한다. 같은 프로세스에서 새 세션이 시작되면(`/clear`, 재개) 이전 카드는 번호를 내놓는다. claude.exe가 `CLAUDE_PID`이고 concos MCP 서버의 부모임은 2026-10-28 이 PC에서 확인했다. (2) Codex: 훅이 셸을 거쳐 돌고 클라이언트 번호를 알려 주지 않는다. 대신 대기 깨우기가 켜져 있으면(`inspectWake`) 세션 시작 훅이 턴 끝과 같은 분리 감시를 띄운다. 첫 턴 전에도 온라인이고, 메시지가 오면 깨운다. Claude Code는 밖에서 턴을 시작할 방법이 없어, 아직 턴을 끝낸 적 없는 세션은 여전히 직접 입력해야 깨어난다.

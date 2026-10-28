@@ -23,12 +23,21 @@ export const MIN_TOPIC_KEY_LENGTH = 3;
 export const MAX_SIMILAR_TOPICS = 5;
 /** Unread messages a hook names in its one line; the rest are counted. */
 export const HOOK_NOTICES_SHOWN = 3;
+/**
+ * The longest text a wake or a continued turn may be. It carries every message it names in full,
+ * with no budget of its own (2026-10-29 user decision): a woken session then answers without a
+ * read_messages call, and in four days each such call reread about 378K tokens of conversation to
+ * take in about 1,400 characters. Claude Code moves hook text past 10,000 characters to a file and
+ * shows only its first 2,000, so a message that would not fit goes by number instead.
+ */
+export const HOOK_TEXT_LIMIT = 10_000;
 /** Idle wake: a session wakes only after this long without a prompt since its turn ended. */
 export const WAKE_IDLE_MS = 60 * 1000;
 export const WAKE_POLL_MS = 3 * 1000;
 /**
- * One watch's life after a turn ends: until the session ends, at most a day, the longest a message
- * lives (2026-10-26 user decision; with an hour, messages that came later waited for the user).
+ * One watch's life after a turn ends: until the session ends, at most a day (2026-10-26 user
+ * decision; with an hour, messages that came later waited for the user). Shorter than a message's
+ * life since 2026-10-29 (`MESSAGE_LIFETIME_MS`): a longer watch would need every hook re-registered.
  * Claude Code's registered hook timeout adds a minute so the watch ends on its own first.
  */
 export const WAKE_WATCH_MS = 24 * 60 * 60 * 1000;
@@ -63,9 +72,10 @@ export const ENDED_AFTER_MS = 30 * 60 * 1000;
 /**
  * A message stays at most this long after it was sent (a post: after its last edit), read or not,
  * so a session that closed for the night and comes back still gets it. A day was where returning
- * sessions stopped losing messages in a simulation.
+ * sessions stopped losing messages in a simulation; two days leave a session away for a day room
+ * to come back (2026-10-29 user decision). Still a fixed bound: what nobody handles goes.
  */
-export const MESSAGE_LIFETIME_MS = 24 * 60 * 60 * 1000;
+export const MESSAGE_LIFETIME_MS = 48 * 60 * 60 * 1000;
 /** A message to agents goes this long after its last recipient read it; a question waits for its answer to be read too. */
 export const READ_MESSAGE_GRACE_MS = 60 * 60 * 1000;
 /** Posts to the whole room kept per sender: the newest ones. */
@@ -80,6 +90,12 @@ export const AWAIT_AFTER_MS = 30 * 60 * 1000;
  * summary stays available for handoff that long, then it is residue.
  */
 export const AGENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * A session conversation this long is shown as costly on the board: every call rereads it, so a
+ * wake or a step costs about a tenth of it in input tokens (2026-10-29: woken sessions averaged
+ * 378K, a fresh one starts near 50K).
+ */
+export const CONTEXT_WARN_TOKENS = 200_000;
 /** Checkpoints kept per agent; older ones are deleted, so one long session cannot grow without bound. */
 export const CHECKPOINT_KEEP_PER_AGENT = 50;
 /**

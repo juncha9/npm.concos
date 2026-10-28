@@ -1045,13 +1045,13 @@ describe("clean-up", () => {
         expect(store.purgeMessages()).toBe(2);
     });
 
-    it("keeps a post a day from its last edit", () => {
+    it("keeps a post 48 hours from its last edit", () => {
         const sender = joinAgent("sender");
         const id = store.sendMessage(sender.agent_id, { to: "all", kind: "notice", text: "v1", replyTo: null, requestId: null }).message_id;
-        ageMessage(id, 25 * 60);
+        ageMessage(id, 49 * 60);
         store.editPost(sender.agent_id, { messageId: id, text: "v2" });
         expect(store.purgeMessages()).toBe(0);
-        database.prepare("UPDATE message SET edited_at = :at WHERE id = :id").run({ at: minutesAgo(25 * 60), id: id });
+        database.prepare("UPDATE message SET edited_at = :at WHERE id = :id").run({ at: minutesAgo(49 * 60), id: id });
         expect(store.purgeMessages()).toBe(1);
     });
 
@@ -1060,7 +1060,7 @@ describe("clean-up", () => {
         const reader = joinAgent("reader");
         const id = store.sendMessage(sender.agent_id, { to: reader.agent_id, kind: "note", text: "hello", replyTo: null, requestId: null, topics: ["concos_board"] }).message_id;
         store.acknowledge(reader.agent_id, [id]);
-        ageMessage(id, 25 * 60);
+        ageMessage(id, 49 * 60);
         expect(store.purgeMessages()).toBe(1);
         expect(database.prepare("SELECT COUNT(*) AS n FROM message_topic").get()).toMatchObject({ n: 0 });
     });
@@ -1069,23 +1069,23 @@ describe("clean-up", () => {
         const sender = joinAgent("sender");
         const reader = joinAgent("reader");
         const id = send(sender.agent_id, reader.agent_id);
-        ageMessage(id, 25 * 60);
+        ageMessage(id, 49 * 60);
         expect(store.purgeMessages()).toBe(1);
         expect(messageExists(id)).toBe(false);
     });
 
-    it("keeps a message owed only by an ended session or a person for a day, then deletes it", () => {
+    it("keeps a message owed only by an ended session or a person for 48 hours, then deletes it", () => {
         const sender = joinAgent("sender");
         const away = joinAgent("away");
         const person = store.ensureHumanParticipant("main", "Reviewer");
         const toAway = send(sender.agent_id, away.agent_id);
         const toPerson = send(sender.agent_id, person);
         store.disconnect([away.agent_id]);
-        ageMessage(toAway, 23 * 60);
-        ageMessage(toPerson, 23 * 60);
+        ageMessage(toAway, 47 * 60);
+        ageMessage(toPerson, 47 * 60);
         expect(store.purgeMessages()).toBe(0);
-        ageMessage(toAway, 25 * 60);
-        ageMessage(toPerson, 25 * 60);
+        ageMessage(toAway, 49 * 60);
+        ageMessage(toPerson, 49 * 60);
         expect(store.purgeMessages()).toBe(2);
     });
 
@@ -1095,12 +1095,12 @@ describe("clean-up", () => {
         const question = send(asker.agent_id, answerer.agent_id, "which port?");
         store.acknowledge(answerer.agent_id, [question]);
         const answer = send(answerer.agent_id, asker.agent_id, "18201", question);
-        ageMessage(question, 25 * 60);
+        ageMessage(question, 49 * 60);
         expect(store.purgeMessages()).toBe(0);
         expect(messageExists(question)).toBe(true);
 
         store.acknowledge(asker.agent_id, [answer]);
-        ageMessage(answer, 25 * 60);
+        ageMessage(answer, 49 * 60);
         expect(store.purgeMessages()).toBe(2);
     });
 
@@ -1109,7 +1109,7 @@ describe("clean-up", () => {
         const answerer = joinAgent("answerer");
         const question = send(asker.agent_id, answerer.agent_id, "which port?");
         store.acknowledge(answerer.agent_id, [question]);
-        ageMessage(question, 25 * 60);
+        ageMessage(question, 49 * 60);
         expect(store.purgeMessages()).toBe(1);
         const late = store.sendMessage(answerer.agent_id, { to: asker.agent_id, kind: "reply", text: "18201", replyTo: question, requestId: null });
         expect(late.reply_target_removed).toBe(true);

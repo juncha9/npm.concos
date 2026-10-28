@@ -25,7 +25,12 @@ export function normalizeEvent(host: string, kind: HookEventKind, raw: unknown, 
     const directory = payload.cwd ?? (host == "cursor" && Array.isArray(roots) && roots.length == 1 ? roots[0] : undefined);
     const cwd = requiredText(directory, "cwd (a single explicit workspace is required)", MAX_PATH_LENGTH);
     if(!path.isAbsolute(cwd)) throw new RoomError("hook cwd must be absolute");
-    return { host, kind, sessionId, cwd, files: files.map((file) => requiredText(file, "file path", MAX_PATH_LENGTH)) };
+    const event: HookEvent = { host, kind, sessionId, cwd, files: files.map((file) => requiredText(file, "file path", MAX_PATH_LENGTH)) };
+    // only read, and only where the client says its record is
+    if(typeof payload.transcript_path == "string" && path.isAbsolute(payload.transcript_path)) {
+        event.transcriptPath = payload.transcript_path;
+    }
+    return event;
 }
 
 /**

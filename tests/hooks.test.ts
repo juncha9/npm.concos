@@ -5,13 +5,14 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WAKE_FALLBACK_MS } from "../src/_defs";
+import { WAKE_FALLBACK_MS, HOOK_TEXT_LIMIT } from "../src/_defs";
 import { openDatabase } from "../src/modules/store/database";
 import { SCHEMA_STEPS } from "../src/modules/store/schema";
 import { RoomStore } from "../src/modules/store/room-store";
 import { hookClientPid, processHook } from "../src/modules/hooks/handler";
 import { getHostAdapter, HOST_ADAPTERS } from "../src/modules/hooks/adapters";
 import { watchForWake } from "../src/modules/hooks/watch";
+import { describeWake } from "../src/modules/hooks/notices";
 import type { HookEvent, HookEventKind } from "../src/modules/hooks/types";
 
 let directory: string;
@@ -447,17 +448,57 @@ describe("turn end", () => {
         expect(turnEnd(true)?.continueFor?.map((notice) => notice.id)).toEqual([direct, group, answer]);
     });
 
-    it("names up to three messages with sender and first topic, counts the rest, and leaves the text out", () => {
+    it("names up to three messages with sender and first topic, counts the rest, and carries all their texts", () => {
         const joined = start();
         const asker = joinOther("Asker");
-        const ids = [1, 2, 3, 4].map(() => store.sendMessage(asker.agent_id, {
-            to: joined.agent_id, kind: "question", text: "secret body", replyTo: null, requestId: null, topics: ["concos_hooks"],
+        const ids = [1, 2, 3, 4].map((n) => store.sendMessage(asker.agent_id, {
+            to: joined.agent_id, kind: "question", text: `body ${n}`, replyTo: null, requestId: null, topics: ["concos_hooks"],
         }).message_id);
-        const reason = processHook(store, event("turn-end", { canContinue: true }), "dev")?.continueReason ?? "";
+        const result = processHook(store, event("turn-end", { canContinue: true }), "dev");
+        const reason = result?.continueReason ?? "";
         expect(reason).toContain(`question #${ids[0]} from Asker [concos_hooks]; question #${ids[1]}`);
         expect(reason).toContain("; 1 more.");
-        expect(reason).toContain("then finish.");
-        expect(reason).not.toContain("secret body");
+        expect(reason).toContain(`#${ids[0]} question from Asker:\nbody 1\n\n#${ids[1]} question from Asker:\nbody 2`);
+        // the fourth goes unnamed in the line, but its text comes too, so nothing is left to read
+        expect(reason).toContain(`#${ids[3]} question from Asker:\nbody 4`);
+        expect(reason).toMatch(/\n\nThe texts above count as read\. Answer questions with kind reply if they need one, then finish\.$/);
+        expect(result?.delivered).toEqual({ agentId: joined.agent_id, messageIds: ids });
+        // a prompt only names them
+        expect(processHook(store, event("prompt"), "dev")?.context).not.toContain("body 1");
+    });
+
+    it("carries every text that fits the hook limit, and none a host would alter or cut", () => {
+        const joined = start();
+        const asker = joinOther("Asker");
+        const ask = (text: string) => store.sendMessage(asker.agent_id, { to: joined.agent_id, kind: "question", text: text, replyTo: null, requestId: null }).message_id;
+        const first = ask("a".repeat(4000));
+        const second = ask("b".repeat(4000));
+        ask("c".repeat(4000));
+        const small = ask("50% done");
+        const notices = store.hookNotices(joined.agent_id, 0, true);
+        const wake = describeWake(notices, 4);
+        // the third would take the text past the limit; the small one after it still fits
+        expect(wake.delivered).toEqual([first, second, small]);
+        expect(wake.text.length).toBeLessThanOrEqual(HOOK_TEXT_LIMIT);
+        expect(wake.text).toContain(`#${small} question from Asker:\n50% done`);
+        expect(wake.text).toContain("Read the rest with read_messages.");
+        // cmd.exe takes one 4,000-character text and would drop the %, so the rest go by number there
+        const codexWake = describeWake(notices, 4, getHostAdapter("codex").wakeCarries);
+        expect(codexWake.delivered).toEqual(process.platform == "win32" ? [first] : [first, second, small]);
+    });
+
+    it("never points out a message sent with wake false, and tells the board why", () => {
+        const joined = start();
+        const asker = joinOther("Asker");
+        const quiet = store.sendMessage(asker.agent_id, { to: joined.agent_id, kind: "note", text: "fyi", replyTo: null, requestId: null, wake: false }).message_id;
+        // a question always wakes
+        const question = store.sendMessage(asker.agent_id, { to: joined.agent_id, kind: "question", text: "which?", replyTo: null, requestId: null, wake: false }).message_id;
+        expect(store.hookNotices(joined.agent_id, 0, true).map((notice) => notice.id)).toEqual([question]);
+        expect(store.pendingFor(joined.agent_id)).toMatchObject([
+            { id: quiet, wake_target: false, wake_reason: "sent_without_wake" },
+            { id: question, wake_target: true, wake_reason: null },
+        ]);
+        expect(processHook(store, event("prompt"), "dev")?.context).toMatch(/question #\d+ from Asker; plus 1 other unread\./);
     });
 
     it("never continues a turn on a host without a way to continue it", () => {
@@ -624,7 +665,7 @@ describe("idle wake", () => {
         store.sendMessage(from, { to: joined.agent_id, kind: "reply", text: "noted", replyTo: thanks, requestId: null });
         const waking = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000 });
         setTimeout(() => ask(from, joined.agent_id), 30);
-        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker; plus 1 other unread\. Read them with read_messages/);
+        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker; plus 1 other unread\.\n\n#\d+ question from Asker:\nbody\n\nThe texts above count as read\. Read the rest with read_messages\./);
         expect(processHook(store, event("prompt"), "dev")?.context).toMatch(/question #\d+ from Asker; plus 1 other unread\./);
     });
 
@@ -659,9 +700,26 @@ describe("idle wake", () => {
         const joined = start();
         const from = asker();
         const waking = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000 });
-        setTimeout(() => ask(from, joined.agent_id), 30);
-        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker\. Read them with read_messages/);
+        let id = 0;
+        setTimeout(() => { id = ask(from, joined.agent_id); }, 30);
+        expect(await waking).toMatch(/^concos: unread for you — question #\d+ from Asker\.\n\n#\d+ question from Asker:\nbody\n\nThe texts above count as read\. Answer questions with kind reply if they need one\.$/);
+        // carried in full: delivered now, received when the woken turn ends
+        const receipt = () => database.prepare("SELECT delivered_at IS NOT NULL AS delivered, received_at IS NOT NULL AS received FROM message_receipt WHERE message_id = ?").get(id);
+        expect(receipt()).toEqual({ delivered: 1, received: 0 });
+        store.applyHookEvent(event("turn-end", { canContinue: true }), "dev");
+        expect(receipt()).toEqual({ delivered: 1, received: 1 });
         expect(await watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 40 })).toBeNull();
+    });
+
+    it("counts a carried text as delivered only once the host took the wake", async () => {
+        const joined = start();
+        const from = asker();
+        const id = ask(from, joined.agent_id);
+        const failing = watchForWake(store, event("watch"), { idleMs: 0, pollMs: 5, watchMs: 2000 }, { keepOnline: true }, {
+            deliver: () => Promise.reject(new Error("codex queue failed")),
+        });
+        await expect(failing).rejects.toThrow("codex queue failed");
+        expect(database.prepare("SELECT delivered_at FROM message_receipt WHERE message_id = ?").get(id)).toEqual({ delivered_at: null });
     });
 });
 
@@ -684,7 +742,10 @@ describe("Codex idle wake", () => {
         }
         const line = `concos: unread for you — question #7 from A&B "Ops" 100% [ops_deploy]. Read them with read_messages.`;
         vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
+        let carried: string[] = [];
         try {
+            await codex.deliverWake!(THREAD_ID, "#7 question from A:\nfirst line\r\nsecond line");
+            carried = JSON.parse(fs.readFileSync(record, "utf8"));
             await codex.deliverWake!(THREAD_ID, line);
         }
         finally { vi.unstubAllEnvs(); }
@@ -693,6 +754,8 @@ describe("Codex idle wake", () => {
             ? `concos: unread for you — question #7 from A&B 'Ops' 100 [ops_deploy]. Read them with read_messages.`
             : line;
         expect(JSON.parse(fs.readFileSync(record, "utf8"))).toEqual(["queue", "--thread", THREAD_ID, "--message", delivered]);
+        // a carried message keeps its lines: cmd.exe ends the command at a line break, so they show as a mark
+        expect(carried[4]).toBe(process.platform == "win32" ? "#7 question from A: ⏎ first line ⏎ second line" : "#7 question from A:\nfirst line\r\nsecond line");
     });
 
     it("refuses a session id that is not a Codex thread id, before running anything", async () => {
@@ -802,7 +865,73 @@ describe("Codex idle wake", () => {
         expect(targets.find((target) => target.agent_id == idle.agent_id)).toMatchObject({ host: "claude", online: false });
         expect(targets.find((target) => target.agent_id == mcpOnly)).toMatchObject({ host: null, session_id: null });
         expect(targets.some((target) => target.agent_id == ended.agent_id)).toBe(false);
-        expect(store.wakeTargets(nowMs + 25 * 60 * 60 * 1000).map((target) => target.agent_id)).toEqual([]);
+        expect(store.wakeTargets(nowMs + 49 * 60 * 60 * 1000).map((target) => target.agent_id)).toEqual([]);
+    });
+});
+
+describe("conversation size", () => {
+    const write = (name: string, records: unknown[]) => {
+        const file = path.join(directory, name);
+        fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+        return file;
+    };
+    const assistant = (input: number, read: number, created: number, extra: Record<string, unknown> = {}) => ({
+        type: "assistant", message: { usage: { input_tokens: input, cache_read_input_tokens: read, cache_creation_input_tokens: created, output_tokens: 9 } }, ...extra,
+    });
+    const tokenCount = (input: number, window?: number) => ({
+        type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input, cached_input_tokens: input - 10 }, model_context_window: window } },
+    });
+
+    it("takes the client's record path from the hook payload, only when absolute", () => {
+        const payload = { session_id: "s", cwd: directory, stop_hook_active: false };
+        expect(getHostAdapter("claude").normalize("turn-end", { ...payload, transcript_path: path.join(directory, "s.jsonl") })?.transcriptPath).toBe(path.join(directory, "s.jsonl"));
+        expect(getHostAdapter("claude").normalize("turn-end", { ...payload, transcript_path: "s.jsonl" })?.transcriptPath).toBeUndefined();
+    });
+
+    it("reads Claude Code's last main call, past later records and a subagent's calls", () => {
+        const file = write("claude.jsonl", [
+            assistant(10, 1000, 50),
+            assistant(3, 400_000, 2000),
+            assistant(1, 5, 5, { isSidechain: true }),
+            { type: "system", subtype: "stop_hook_summary" },
+        ]);
+        expect(getHostAdapter("claude").contextSize!(event("turn-end", { transcriptPath: file }))).toEqual({ tokens: 402_003, window: null });
+        expect(getHostAdapter("claude").contextSize!(event("turn-end"))).toBeNull();
+        expect(getHostAdapter("claude").contextSize!(event("turn-end", { transcriptPath: path.join(directory, "missing.jsonl") }))).toBeNull();
+    });
+
+    it("reads further back when a long record follows the last call", () => {
+        const file = write("long.jsonl", [assistant(7, 70_000, 0), { type: "user", message: { content: "x".repeat(600 * 1024) } }]);
+        expect(getHostAdapter("claude").contextSize!(event("turn-end", { transcriptPath: file }))).toEqual({ tokens: 70_007, window: null });
+    });
+
+    it("reads Codex's last token count with its window, finding the thread's record under CODEX_HOME", () => {
+        const thread = "01a16d85-083e-7373-9dd6-6ae1676b6d7c";
+        const day = path.join(directory, "codex-home", "sessions", "2026", "10", "24");
+        fs.mkdirSync(day, { recursive: true });
+        fs.writeFileSync(path.join(day, `rollout-2026-10-24T19-46-37-${thread}.jsonl`), [tokenCount(100_000, 475_000), tokenCount(205_493, 475_000), { type: "event_msg", payload: { type: "task_complete" } }].map((record) => JSON.stringify(record)).join("\n"));
+        vi.stubEnv("CODEX_HOME", path.join(directory, "codex-home"));
+        try {
+            const codexEvent = (extra: Partial<HookEvent> = {}) => event("turn-end", { host: "codex", sessionId: thread, ...extra });
+            expect(getHostAdapter("codex").contextSize!(codexEvent())).toEqual({ tokens: 205_493, window: 475_000 });
+            expect(getHostAdapter("codex").contextSize!(codexEvent({ sessionId: "00000000-0000-0000-0000-000000000000" }))).toBeNull();
+            // a path the hook was given wins
+            const given = write("given.jsonl", [tokenCount(1234)]);
+            expect(getHostAdapter("codex").contextSize!(codexEvent({ transcriptPath: given }))).toEqual({ tokens: 1234, window: null });
+        }
+        finally { vi.unstubAllEnvs(); }
+    });
+
+    it("keeps the size on the card at a turn end for the board, without telling other agents of a card change", () => {
+        const joined = start();
+        store.applyHookEvent(event("turn-end", { context: { tokens: 562_000, window: null } }), "dev");
+        const agent = store.getRoomOverview("dev", 0).agents.find((item) => item.agent_id == joined.agent_id)!;
+        expect(agent.context).toEqual({ tokens: 562_000, window: null, at: expect.any(String) });
+        // the turn end itself may move the card; the size adds nothing to that
+        const after = database.prepare("SELECT revision, changed_seq, content_changed_seq FROM agent WHERE id = ?").get(joined.agent_id);
+        store.applyHookEvent(event("turn-end", { context: { tokens: 600_000, window: 1_000_000 } }), "dev");
+        expect(database.prepare("SELECT revision, changed_seq, content_changed_seq FROM agent WHERE id = ?").get(joined.agent_id)).toEqual(after);
+        expect(store.getRoomOverview("dev", 0).agents.find((item) => item.agent_id == joined.agent_id)!.context).toMatchObject({ tokens: 600_000, window: 1_000_000 });
     });
 });
 
@@ -829,7 +958,9 @@ describe("schema migration", () => {
         const upgraded = await openDatabase(oldDirectory);
         try {
             expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: SCHEMA_STEPS.length });
-            expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({ ...before, recent_folder_list: "[]", client_pid: null, blocker_since: null });
+            expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({
+                ...before, recent_folder_list: "[]", client_pid: null, blocker_since: null, context_tokens: null, context_window: null, context_at: null,
+            });
             expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual(delivery);
             const folders = JSON.stringify([{ path: "src", at: now }]);
             const setFolders = upgraded.prepare("UPDATE agent SET recent_folder_list = ? WHERE id = 'legacy'");
@@ -885,7 +1016,8 @@ describe("schema migration", () => {
             expect(upgraded.prepare("SELECT id, changed_seq, content_changed_seq FROM agent ORDER BY changed_seq").all()).toEqual([
                 { id: "legacy", changed_seq: 1, content_changed_seq: 1 }, { id: "reader", changed_seq: 2, content_changed_seq: 2 },
             ]);
-            expect(upgraded.prepare("SELECT * FROM message").all()).toEqual(messageBefore);
+            // messages written before schema 16 wake, as they always did
+            expect(upgraded.prepare("SELECT * FROM message").all()).toEqual(messageBefore.map((row) => ({ ...row, wake: 1 })));
             expect(upgraded.prepare("SELECT * FROM message_receipt").all()).toEqual(receiptsBefore);
             expect(upgraded.prepare("SELECT * FROM checkpoint").all()).toEqual(checkpointsBefore);
             expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual([]);

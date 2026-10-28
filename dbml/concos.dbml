@@ -38,6 +38,9 @@ Table agent {
   reference_list varchar [not null, default: '[]', note: 'JSON string array']
   editing_list varchar [not null, default: '[]', note: 'JSON string array of paths from workspace_id; recalculated from the new project root when an explicit join moves the project. Cleared on leave and bridge shutdown']
   recent_folder_list varchar [not null, default: '[]', note: 'schema 14: JSON array of {path, at} from file-edited hooks; only folders inside the workspace, relative paths, root is ., ISO UTC times, newest first, distinct, at most 3. Kept across turns; an end/leave trigger clears it for older writers too. Delivered only to board and inspect_agent; changes alone do not raise revision or either change sequence']
+  context_tokens integer [note: 'schema 16: the input tokens of the session\'s last call as its client recorded it, read by the turn-end hook; every call rereads that much. For the board only: no trigger, no card change for other agents. Null until a hook of this version read it']
+  context_window integer [note: 'schema 16: the model context window when the client records one (Codex), else null']
+  context_at varchar [note: 'schema 16: when the turn-end hook read context_tokens (ISO UTC)']
   client_pid integer [note: 'schema 15: the client process (claude.exe) a hook of this session ran under, from CLAUDE_PID or an exec-form hook parent; the MCP server under that process keeps the card online before the model joins (2026-10-28). A later session of the same process takes it over; null for Codex and older writers']
   revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']
@@ -101,6 +104,7 @@ Table message {
   request_id varchar [note: 'sender retry key']
   created_at varchar [not null]
   edited_at varchar [note: 'a post its sender rewrote: when; the edit also takes the next seq']
+  wake integer [not null, default: 1, note: '0: the sender said no action is needed now; it neither wakes the recipients nor continues their turn (schema 16)']
 
   indexes {
     (sender_agent_id, request_id) [unique, name: 'uk_message_sender_agent_id_request_id']
@@ -110,7 +114,7 @@ Table message {
     workspace_id [name: 'idx_message_workspace_id']
   }
 
-  Note: 'Deleted 24 hours after created_at (a post: after edited_at), read or not; a post beyond the newest 3 of its sender; a message to agents an hour after its last recipient read it, a question only once an answer to it was read an hour ago. A kept reply keeps what it answers.'
+  Note: 'Deleted 48 hours after created_at (a post: after edited_at), read or not; a post beyond the newest 3 of its sender; a message to agents an hour after its last recipient read it, a question only once an answer to it was read an hour ago. A kept reply keeps what it answers.'
 }
 
 Table message_receipt {

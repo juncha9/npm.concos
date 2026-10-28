@@ -113,16 +113,25 @@ describe("hook CLI", () => {
         expect(parseToml(before).mcp_servers).toEqual({ concos: { command: process.execPath, args: ["--max-semi-space-size=1", CLI, "mcp"], env: { CONCOS_HOME: environment.CONCOS_HOME } } });
     });
 
-    it.each(["claude", "codex"])("continues a %s turn once for a question sent to it, and points at it on the next prompt", (host) => {
+    it.each(["claude", "codex"])("continues a %s turn once with the questions sent to it, and points at the one it could not carry on the next prompt", (host) => {
         const payload = { session_id: "s", cwd: directory };
         const agentId = /agent_id=(agt_\w+);/.exec(JSON.stringify(invoke("session-start", host, payload)))?.[1] ?? "";
         execFileSync(process.execPath, [CLI, "say", agentId, "Which port?", "--kind", "question", "--as", "Reviewer"], { env: environment, stdio: "pipe" });
+        // three of the longest messages: the third would take the text past what a hook may hand over
+        for(const letter of ["x", "y", "z"]) {
+            execFileSync(process.execPath, [CLI, "say", agentId, letter.repeat(4000), "--kind", "question", "--as", "Reviewer"], { env: environment, stdio: "pipe" });
+        }
         const first = invoke("turn-end", host, { ...payload, stop_hook_active: false });
         expect(first.decision).toBe("block");
-        expect(first.reason).toMatch(/^concos: unread for you — question #\d+ from Reviewer\. Read them with read_messages/);
+        expect(first.reason).toMatch(/^concos: unread for you — question #(\d+) from Reviewer; question #\d+ from Reviewer; question #\d+ from Reviewer; 1 more\.\n\n#\1 question from Reviewer:\nWhich port\?\n\n/);
+        expect(first.reason.match(/ question from Reviewer:\n/g)).toHaveLength(3);
+        expect(first.reason).not.toContain("zzz");
+        expect(first.reason).toMatch(/The texts above count as read\. Read the rest with read_messages\. Answer questions with kind reply if they need one, then finish\.$/);
         expect(invoke("turn-end", host, { ...payload, stop_hook_active: true })).toEqual({});
         expect(invoke("turn-end", host, { ...payload, stop_hook_active: false })).toEqual({});
-        expect(JSON.stringify(invoke("prompt", host, payload))).toContain("question #");
+        // the carried one was received when the continued turn ended; the long one is still pointed at
+        const prompt = JSON.stringify(invoke("prompt", host, payload));
+        expect(prompt).toMatch(/unread for you — question #\d+ from Reviewer\. Read them with read_messages/);
     });
 
     it("ends the idle-wake hook at once and quietly when there is nothing to watch", () => {

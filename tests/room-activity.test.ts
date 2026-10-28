@@ -8,7 +8,7 @@ const agent: RoomOverviewAgent = {
     agent_id: "one", name: "Server", client: "Codex", human: false, status: "waiting", role: "",
     task: "storage", next_step: "review", blocker: "", blocker_since: null, editing: [], recent_folders: [], workspace_path: "/project", working_directory: "/project", current_directory: null,
     updated_at: "2026-10-25T00:00:00Z", online: true, stale: false, left: false, ended: false, pending_count: 0,
-    concos_version: null, issues: [],
+    concos_version: null, context: null, issues: [],
 };
 const message: RoomOverviewMessage = {
     id: 1, at: agent.updated_at, from_name: "Server", from_client: "Codex", from_human: false,

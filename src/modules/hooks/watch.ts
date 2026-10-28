@@ -38,15 +38,27 @@ export interface WakeLiveness {
 }
 
 /**
+ * How the wake reaches the session. `deliver` hands it over from outside (Codex); without it the
+ * caller does, as Claude Code's asyncRewake does with the returned line. `carries`: the
+ * host's `wakeCarries`.
+ */
+export interface WakeDelivery {
+    carries?(body: string, whole: string): boolean;
+    deliver?(text: string): Promise<void>;
+}
+
+/**
  * Idle wake: watches a session that just ended its turn. Resolves with the wake
  * message once a message for it is waiting after the quiet time, or with null when a newer
- * watch or a prompt replaces this one, the session ends, or the watch's time runs out.
+ * watch or a prompt replaces this one, the session ends, or the watch's time runs out. The
+ * messages the wake carries in full count as delivered once it went out.
  */
 export async function watchForWake(
     store: RoomStore,
     event: HookEvent,
     timings: WakeTimings = WAKE_TIMINGS,
     liveness: WakeLiveness = { keepOnline: true },
+    delivery: WakeDelivery = {},
 ): Promise<string | null> {
     const watch = store.startWakeWatch(event);
     if(watch == null) {
@@ -86,7 +98,15 @@ export async function watchForWake(
             return null;
         }
         if(check.state == "wake") {
-            return describeWake(check.notices, check.unread);
+            const wake = describeWake(check.notices, check.unread, delivery.carries);
+            await delivery.deliver?.(wake.text);
+            try {
+                store.markDelivered(watch.agentId, wake.delivered);
+            }
+            catch {
+                // the database stayed busy: the woken turn reads them with read_messages instead
+            }
+            return wake.text;
         }
     }
 }

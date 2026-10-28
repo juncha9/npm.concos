@@ -2,6 +2,7 @@
 export type ValueSchema =
     | { type: "string"; minLength?: number; maxLength?: number; enum?: readonly string[]; description?: string }
     | { type: "integer"; minimum?: number; maximum?: number; description?: string }
+    | { type: "boolean"; description?: string }
     | { type: "array"; items: ValueSchema; minItems?: number; maxItems?: number; description?: string }
     | { anyOf: ValueSchema[]; description?: string };
 
@@ -36,6 +37,9 @@ function kindName(schema: ValueSchema): string {
     if(schema.type == "integer") {
         return "an integer";
     }
+    if(schema.type == "boolean") {
+        return "true or false";
+    }
     return "a list";
 }
 
@@ -48,6 +52,9 @@ function matchesKind(schema: ValueSchema, value: unknown): boolean {
     }
     if(schema.type == "integer") {
         return typeof value == "number";
+    }
+    if(schema.type == "boolean") {
+        return typeof value == "boolean";
     }
     return Array.isArray(value);
 }
@@ -96,6 +103,13 @@ function checkValue(schema: ValueSchema, value: unknown, path: string, problems:
         }
         if(schema.maximum != null && value > schema.maximum) {
             problems.push(`${path} must be at most ${schema.maximum}`);
+        }
+        return;
+    }
+
+    if(schema.type == "boolean") {
+        if(typeof value != "boolean") {
+            problems.push(`${path} must be true or false`);
         }
         return;
     }

@@ -7,7 +7,7 @@ import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
 import { clientPidFromEnvironment, getHostAdapter } from "./adapters";
-import { describeNotices } from "./notices";
+import { describeContinue, describeNotices } from "./notices";
 import { HOOK_EVENTS } from "./types";
 import type { HookEvent, HookEventKind, HookResult, HostAdapter } from "./types";
 import { WAKE_TIMINGS, watchForWake } from "./watch";
@@ -17,9 +17,8 @@ export function processHook(store: RoomStore, event: HookEvent, room = SHARED_RO
     const outcome = store.applyHookEvent(event, room);
     if(outcome == null) return;
     if(outcome.continueFor != null) {
-        return {
-            continueReason: `${describeNotices(outcome.continueFor, outcome.unread)} Read them with read_messages, answer questions with kind reply if they need one, then finish.`,
-        };
+        const continued = describeContinue(outcome.continueFor, outcome.unread ?? outcome.continueFor.length);
+        return { continueReason: continued.text, delivered: { agentId: outcome.agentId, messageIds: continued.delivered } };
     }
     const notices = outcome.notices ?? [];
     const unread = outcome.unread ?? notices.length;
@@ -178,11 +177,14 @@ async function runWatch(adapter: HostAdapter, event: HookEvent | null): Promise<
                     liveness = { keepOnline: false };
                 }
             }
-            reason = await watchForWake(new RoomStore(database), event, WAKE_TIMINGS, liveness);
+            const deliverWake = adapter.deliverWake;
+            reason = await watchForWake(new RoomStore(database), event, WAKE_TIMINGS, liveness, {
+                carries: adapter.wakeCarries,
+                deliver: deliverWake == null ? undefined : (text) => deliverWake(event.sessionId, text),
+            });
         }
         finally { database.close(); }
         if(reason != null && adapter.deliverWake != null) {
-            await adapter.deliverWake(event.sessionId, reason);
             process.stdout.write("{}\n");
             return;
         }
@@ -222,11 +224,22 @@ export async function runHook(args: string[]): Promise<void> {
             if(clientPid != null) {
                 hookEvent.clientPid = clientPid;
             }
+            // the board shows how much each call of the session rereads (2026-10-29 user decision)
+            if(kind == "turn-end" && adapter.contextSize != null) {
+                const size = adapter.contextSize(hookEvent);
+                if(size != null) {
+                    hookEvent.context = size;
+                }
+            }
             const database = await openDatabase(resolveDataDirectory(), { busyTimeoutMs: 100 });
             try {
-                const result = processHook(new RoomStore(database), hookEvent);
+                const store = new RoomStore(database);
+                const result = processHook(store, hookEvent);
                 if(result?.continueReason != null && adapter.continueTurn != null) {
                     output = adapter.continueTurn(result.continueReason);
+                    if(result.delivered != null) {
+                        store.markDelivered(result.delivered.agentId, result.delivered.messageIds);
+                    }
                 }
                 else {
                     output = adapter.output(kind, result?.context);

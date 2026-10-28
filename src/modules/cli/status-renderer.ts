@@ -1,5 +1,6 @@
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { CONTEXT_WARN_TOKENS } from "../../_defs";
 import type { AgentIssue, InspectResult, PendingMessage, PendingWakeExclusion, RoomOverviewAgent, RoomOverviewMessage } from "../store/room-store";
 import { displayWidth } from "./prompter";
 
@@ -24,6 +25,17 @@ export function stateLabel(state: State, english: boolean): string {
         return STATE_LABELS.en[state];
     }
     return STATE_LABELS.ko[state];
+}
+
+/** Whole thousands, rounded down so a context below the warning threshold never reads as 200K. */
+function contextTokenCount(tokens: number): string {
+    return tokens < 1000 ? String(tokens) : `${Math.floor(tokens / 1000)}K`;
+}
+
+/** List rows stay quiet until an agent's measured context reaches the warning threshold. */
+export function contextWarning(agent: RoomOverviewAgent, english: boolean): string {
+    if(agent.human || agent.context == null || agent.context.tokens < CONTEXT_WARN_TOKENS) return "";
+    return `${english ? "ctx" : "문맥"} ${contextTokenCount(agent.context.tokens)}`;
 }
 
 /** Keep stored text from changing the terminal layout or its colors. */
@@ -484,6 +496,16 @@ function agentDetailSections(agent: RoomOverviewAgent, detail: InspectResult, op
     for(const issue of agent.issues) {
         field(english ? "Check" : "확인", issueText(issue, nowMs, english), 33);
     }
+    if(!agent.human && agent.context != null) {
+        const context = agent.context;
+        const tokens = contextTokenCount(context.tokens);
+        let size = english ? `${tokens} token${context.tokens == 1 ? "" : "s"}` : `${tokens} 토큰`;
+        if(context.window != null) {
+            const window = contextTokenCount(context.window);
+            size = english ? `${tokens} of ${window} tokens` : `${window} 중 ${tokens} 토큰`;
+        }
+        field(english ? "Context" : "문맥", `${size} · ${age(context.at, nowMs, english)}`, context.tokens >= CONTEXT_WARN_TOKENS ? 33 : null);
+    }
     field(english ? "Task" : "작업", card.task);
     field(english ? "Next" : "다음", card.next_step);
     field(english ? "Blocker" : "막힘", [blockedFor, card.blocker].filter((text) => text != "").join(" · "), 31);
@@ -564,6 +586,7 @@ function pendingWakeText(message: PendingMessage, english: boolean): string {
         reply_to_your_notice: ["Reply to this agent's notice", "이 에이전트의 notice에 온 답"],
         reply_to_other_notice: ["Reply to someone else's notice", "다른 이의 notice에 온 답"],
         reply_target_missing: ["Reply target no longer available", "답 대상 원문 없음"],
+        sent_without_wake: ["Sent to wait for the next turn", "다음 턴까지 기다리게 보냄"],
     };
     const reason = message.wake_reason == null ? (english ? "Not a wake target" : "깨우기 대상 아님") : reasons[message.wake_reason][english ? 0 : 1];
     return `${reason} · ${english ? "does not wake" : "깨우지 않음"}`;

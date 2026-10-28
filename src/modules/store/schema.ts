@@ -317,4 +317,16 @@ export const SCHEMA_STEPS: readonly string[] = [
         WHERE id = NEW.id;
     END;
     `,
+    `
+    -- 0: the sender said the recipients need not act now, so the message neither wakes them nor
+    -- continues their turn; it waits for their next one. Older writers never name it and wake.
+    ALTER TABLE message ADD COLUMN wake INTEGER NOT NULL DEFAULT 1 CHECK (wake IN (0, 1));
+
+    -- The session's conversation as of its last turn end, in tokens, read from the client's own
+    -- record by the turn-end hook; every call rereads it. The window when the client records one
+    -- (Codex). Null until a hook of this version read it.
+    ALTER TABLE agent ADD COLUMN context_tokens INTEGER;
+    ALTER TABLE agent ADD COLUMN context_window INTEGER;
+    ALTER TABLE agent ADD COLUMN context_at TEXT;
+    `,
 ];

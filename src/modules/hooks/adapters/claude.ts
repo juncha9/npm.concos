@@ -1,6 +1,7 @@
 import { WAKE_WATCH_MS } from "../../../_defs";
 import type { HostAdapter } from "../types";
 import { contextOutput, continueOutput, failed, fileArgument, normalizeEvent, object, withContinue } from "./shared";
+import { newestContextSize, tokenCount } from "./transcript";
 
 export const claude: HostAdapter = {
     id: "claude",
@@ -29,6 +30,24 @@ export const claude: HostAdapter = {
     },
     output: (kind, context) => contextOutput(kind == "session-start" ? "SessionStart" : "UserPromptSubmit", context),
     continueTurn: continueOutput,
+    // the input of the main conversation's last call; a subagent's calls are a conversation of their own
+    contextSize(event) {
+        if(event.transcriptPath == null) {
+            return null;
+        }
+        return newestContextSize(event.transcriptPath, (record) => {
+            if(record.type != "assistant" || record.isSidechain == true) {
+                return null;
+            }
+            const usage = object(object(record.message).usage);
+            const input = tokenCount(usage.input_tokens);
+            if(input == null) {
+                return null;
+            }
+            const tokens = input + (tokenCount(usage.cache_read_input_tokens) ?? 0) + (tokenCount(usage.cache_creation_input_tokens) ?? 0);
+            return tokens > 0 ? { tokens: tokens, window: null } : null;
+        });
+    },
     setup: {
         userHooks: ".claude/settings.json", userMcp: ".claude.json", hookFormat: "grouped",
     },

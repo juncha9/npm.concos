@@ -60,6 +60,9 @@ interface AgentRow {
     next_step: string;
     blocker: string;
     blocker_since: string | null;
+    context_tokens: number | null;
+    context_window: number | null;
+    context_at: string | null;
     reference_list: string;
     editing_list: string;
     recent_folder_list: string;
@@ -128,7 +131,8 @@ const MAX_RECENT_FOLDERS = 3;
 
 const AGENT_COLUMNS = `
     id, room, host_session_id, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
-    status, role, task, summary, next_step, blocker, blocker_since, reference_list, editing_list, recent_folder_list,
+    status, role, task, summary, next_step, blocker, blocker_since, context_tokens, context_window, context_at,
+    reference_list, editing_list, recent_folder_list,
     revision, changed_seq, content_changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, last_call_at, disconnected_at, left_at
 `;
@@ -181,6 +185,7 @@ export interface HookNotice {
     from_name: string;
     /** The message's first topic key. */
     topic: string | null;
+    body: string;
 }
 
 export interface HookOutcome {
@@ -340,7 +345,7 @@ export interface FullMessage {
 export type PendingWakeExclusion =
     | "reply_to_your_reply" | "reply_to_other_reply" | "reply_to_other_question"
     | "reply_to_your_note" | "reply_to_other_note"
-    | "reply_to_your_notice" | "reply_to_other_notice" | "reply_target_missing";
+    | "reply_to_your_notice" | "reply_to_other_notice" | "reply_target_missing" | "sent_without_wake";
 
 /** Unreceived messages on a card, for diagnosis; querying them never acknowledges a message. */
 export interface PendingMessage {
@@ -388,6 +393,11 @@ export interface RoomOverviewAgent {
     pending_count: number;
     /** The concos version of its MCP bridge, when one from 0.1.11 on has touched the card. */
     concos_version: string | null;
+    /**
+     * The session's conversation in tokens as of its last turn end, which every call rereads, and
+     * the client's context window when it records one (Codex); null until a hook read them.
+     */
+    context: { tokens: number; window: number | null; at: string } | null;
     /** Why a live card needs attention; empty when there is no issue to report. */
     issues: AgentIssue[];
 }
@@ -1202,7 +1212,8 @@ export class RoomStore {
      * every session in the room, and answers to answers would bounce between agents, so neither
      * counts. `includeNotes` adds notes and notices named to it and answers to its own notes and
      * notices, for the line a prompt or session start shows and for idle wake; they never continue
-     * a turn. Reading this list acknowledges nothing.
+     * a turn. A message sent with wake false is never pointed out: it waits for the next turn,
+     * counted among the unread. Reading this list acknowledges nothing.
      */
     hookNotices(agentId: string, afterSeq = 0, includeNotes = false): HookNotice[] {
         return this.prepare(`
@@ -1217,7 +1228,8 @@ export class RoomStore {
                     WHERE MT.message_id = M.id
                     ORDER BY MT.position
                     LIMIT 1
-                ) AS topic
+                ) AS topic,
+                M.body
             FROM message_receipt AS R
             JOIN message AS M
                 ON M.id = R.message_id
@@ -1226,6 +1238,7 @@ export class RoomStore {
             WHERE R.agent_id = :agent_id
                 AND R.received_at IS NULL
                 AND M.seq > :after_seq
+                AND M.wake = 1
                 -- a direct row without a recipient is a room-wide message from an older bridge
                 AND (M.recipient_scope = 'group' OR (M.recipient_scope = 'direct' AND M.recipient_agent_id IS NOT NULL))
                 AND (
@@ -1254,7 +1267,7 @@ export class RoomStore {
             SELECT M.id, M.kind, M.sender_agent_id AS from_id,
                 S.display_name AS from_name, S.client AS from_client, S.is_human AS from_human,
                 M.created_at, R.delivered_at, M.seq <= A.hook_nudged_seq AS notified,
-                SUBSTR(M.body, 1, :preview_length) AS preview,
+                SUBSTR(M.body, 1, :preview_length) AS preview, M.wake,
                 Q.kind AS reply_kind, Q.sender_agent_id AS reply_author
             FROM message_receipt AS R
             JOIN message AS M ON M.id = R.message_id
@@ -1266,7 +1279,7 @@ export class RoomStore {
             ORDER BY M.created_at, M.id
         `).all({ agent_id: agentId, preview_length: MESSAGE_PREVIEW_LENGTH }) as unknown as {
             id: number; kind: MessageKind; from_id: string; from_name: string; from_client: string; from_human: number;
-            created_at: string; delivered_at: string | null; notified: number; preview: string;
+            created_at: string; delivered_at: string | null; notified: number; preview: string; wake: number;
             reply_kind: MessageKind | null; reply_author: string | null;
         }[];
         if(rows.length == 0) return [];
@@ -1276,7 +1289,8 @@ export class RoomStore {
             const own = row.reply_author == agentId;
             let reason: PendingWakeExclusion | null = null;
             if(target == false) {
-                if(row.reply_kind == "reply") reason = own ? "reply_to_your_reply" : "reply_to_other_reply";
+                if(row.wake == 0) reason = "sent_without_wake";
+                else if(row.reply_kind == "reply") reason = own ? "reply_to_your_reply" : "reply_to_other_reply";
                 else if(row.reply_kind == "question") reason = "reply_to_other_question";
                 else if(row.reply_kind == "note") reason = own ? "reply_to_your_note" : "reply_to_other_note";
                 else if(row.reply_kind == "notice") reason = own ? "reply_to_your_notice" : "reply_to_other_notice";
@@ -1349,6 +1363,12 @@ export class RoomStore {
             // (3) The turn is over, so what went out in full was read; then continue it once per message
             if(event.kind == "turn-end") {
                 this.acknowledgeDelivered(row.id);
+                // for the board only: no trigger watches these columns, so no card change goes to other agents
+                if(event.context != null) {
+                    this.prepare(`
+                        UPDATE agent SET context_tokens = :tokens, context_window = :window, context_at = :now WHERE id = :id
+                    `).run({ tokens: event.context.tokens, window: event.context.window, now: now, id: row.id });
+                }
             }
             if(event.kind == "turn-end" && event.canContinue == true) {
                 const continueFor = this.hookNotices(row.id, row.hook_nudged_seq);
@@ -1500,7 +1520,7 @@ export class RoomStore {
 
     /**
      * The sessions the person at the board can try to wake: agents that have not left and whose
-     * session has not ended through its end hook, heard from within a day (the longest a message
+     * session has not ended through its end hook, heard from within 48 hours (the longest a message
      * lives). Offline and silent cards are included: an open session that was never given work
      * goes offline, and the board's Wake all sessions is for exactly those (2026-10-28).
      */
@@ -2076,6 +2096,8 @@ export class RoomStore {
         replyTo: number | null;
         requestId: string | null;
         topics?: string[];
+        /** false: the recipients need not act now; it waits for their next turn. A question always wakes. */
+        wake?: boolean;
     }): SendResult {
         // (1) Input
         const text = input.text.trim();
@@ -2201,11 +2223,11 @@ export class RoomStore {
             const inserted = this.prepare(`
                 INSERT INTO message (
                     id, seq, room, sender_agent_id, recipient_agent_id, recipient_scope, kind, reply_to_message_id,
-                    body, workspace_id, request_id, created_at
+                    body, workspace_id, request_id, created_at, wake
                 )
                 VALUES (
                     :id, :seq, :room, :sender_agent_id, :recipient_agent_id, :recipient_scope, :kind, :reply_to_message_id,
-                    :body, :workspace_id, :request_id, :created_at
+                    :body, :workspace_id, :request_id, :created_at, :wake
                 )
                 RETURNING id
             `).get({
@@ -2221,6 +2243,7 @@ export class RoomStore {
                 workspace_id: sender.workspace_id,
                 request_id: input.requestId,
                 created_at: new Date(nowMs).toISOString(),
+                wake: input.wake == false && input.kind != "question" ? 0 : 1,
             }) as { id: number };
 
             const insertTopic = this.prepare(`
@@ -2674,7 +2697,7 @@ export class RoomStore {
             WHERE M.id = :id
         `).get({ id: messageId }) as { recipients: string } | undefined;
         if(row == null) {
-            return "not found: deleted (an hour after it was read, after a day, or taken down) or never sent";
+            return "not found: deleted (an hour after it was read, after 48 hours, or taken down) or never sent";
         }
         return `sent to ${parseList(row.recipients).join(", ")}, not to you`;
     }
@@ -2846,7 +2869,7 @@ export class RoomStore {
 
     /**
      * Deletes messages, with their receipts and topics, that are no longer current: the store
-     * holds at most the last day of messages.
+     * holds at most the last 48 hours of messages.
      *
      * Flow:
      *  1) Candidates:
@@ -3259,6 +3282,9 @@ export class RoomStore {
                 ended: isEnded(row, nowMs),
                 pending_count: this.countPending(row.id),
                 concos_version: row.concos_version,
+                context: row.context_tokens == null || row.context_at == null
+                    ? null
+                    : { tokens: row.context_tokens, window: row.context_window, at: row.context_at },
                 issues: [],
             };
         });
