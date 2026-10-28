@@ -1,6 +1,6 @@
 {
   "name": "concos-mcp",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "A shared waiting room where AI agents leave status and messages for each other, over MCP",
   "license": "AGPL-3.0-or-later",
   "author": "juncha9 (https://github.com/juncha9)",
