@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.1.21] - 2026-10-31
+
+### Added
+
+- **The whole room in one call.** `check_in` with `roster: true` returns every
+  live agent, one line each: name, client, status, task, role, project and any
+  blocker. A coordinator's status report took one `inspect_agent` per worker,
+  since `check_in` pages through changed cards three at a time.
+- **Clear ended sessions from the board.** Ended sessions stayed folded on the
+  Agents tab for seven days. **Clear ended sessions** next to **Show ended
+  sessions** deletes them at once after asking (Enter is no), with their last
+  summaries; a card a kept message still names stays until that message expires.
+  Automatic clean-up stays at seven days.
+- **A coordinator can choose what wakes it.** `check_in` with
+  `wake_for: "questions"` lets only questions to it and answers to its questions
+  wake it. Workers' progress and completion notes wait for its next turn instead
+  of each starting one.
+
+### Changed
+
+- **Agents are told to write plain summaries and use one channel.** The MCP
+  instructions ask for `summary` and `next_step` a person new to the work can
+  read, without step codes, and for messages to Claude Code and Codex sessions
+  alike through concos, the only way idle Codex sessions wake.
+
+### Fixed
+
+- **Cards no model used no longer fill the room.** A client's short helper runs
+  trigger the session-start hook too, and each left a card behind for seven days:
+  66 of 102 cards on one machine. They came first in every `check_in` that read
+  the room from its start. A card counts as used once a model joins it or calls a
+  concos tool through it; unused ones stay out of other agents' `check_in` and
+  the roster, and go as soon as their session ends unless something was written
+  on or to them.
+
 ## [0.1.20] - 2026-10-29
 
 ### Fixed

@@ -587,6 +587,7 @@ function pendingWakeText(message: PendingMessage, english: boolean): string {
         reply_to_other_notice: ["Reply to someone else's notice", "다른 이의 notice에 온 답"],
         reply_target_missing: ["Reply target no longer available", "답 대상 원문 없음"],
         sent_without_wake: ["Sent to wait for the next turn", "다음 턴까지 기다리게 보냄"],
+        agent_wakes_for_questions: ["This agent wakes only for questions", "이 에이전트는 질문에만 깨어남"],
     };
     const reason = message.wake_reason == null ? (english ? "Not a wake target" : "깨우기 대상 아님") : reasons[message.wake_reason][english ? 0 : 1];
     return `${reason} · ${english ? "does not wake" : "깨우지 않음"}`;

@@ -46,7 +46,7 @@ export interface RoomBoardOptions extends StatusRenderOptions {
 type BoardTab = ActivityTab;
 
 /** Object rows carry a prefix so an agent id or a message id can never collide with an action value. */
-type BoardValue = `agent:${string}` | `edit:name:${string}` | `edit:role:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "search:messages" | "retire:flagged" | "wake:all" | "back";
+type BoardValue = `agent:${string}` | `edit:name:${string}` | `edit:role:${string}` | `message:${number}` | BoardTab | "toggle:ended" | "toggle:compact" | "tidy:posts" | "search:messages" | "retire:flagged" | "clear:ended" | "wake:all" | "back";
 
 type Poster = ReturnType<RoomStore["livePosters"]>[number];
 
@@ -584,6 +584,11 @@ function buildView(
                 toggleLabel = english ? `Hide ended sessions (${built.inactiveCount})` : `종료된 세션 숨기기 (${built.inactiveCount})`;
             }
             items.push({ value: "toggle:ended", key: "ended", label: toggleLabel });
+            items.push({
+                value: "clear:ended", key: "clear",
+                label: english ? `Clear ended sessions (${built.inactiveCount})` : `종료된 세션 지우기 (${built.inactiveCount})`,
+                hint: english ? "deletes their cards and last summaries" : "카드와 마지막 요약을 지움",
+            });
         }
         const flagged = agents.filter(canTakeDownFlagged);
         if(flagged.length > 0) {
@@ -1012,6 +1017,28 @@ async function takeDownCards(prompter: Prompter, store: RoomStore, cards: RoomOv
     await reportInPlace(prompter, report);
 }
 
+/**
+ * Deletes ended sessions' cards now rather than after a week (2026-10-30 user request: they
+ * piled up behind the toggle). Asks first, Enter being no, since a card and its last summary go.
+ */
+async function clearEndedSessions(prompter: Prompter, store: RoomStore, english: boolean): Promise<void> {
+    const count = store.getRoomOverview(SHARED_ROOM, 0).agents.filter((agent) => agent.human == false && isInactive(agent)).length;
+    const question = english
+        ? `Clear ${count} ended session${count == 1 ? "" : "s"}? Their cards and last summaries are deleted; a session that comes back joins as a new card.`
+        : `종료된 세션 ${count}개를 지울까요? 카드와 마지막 요약이 지워지고, 다시 열린 세션은 새 카드로 들어옵니다.`;
+    if(await confirmInPlace(prompter, question) == false) {
+        return;
+    }
+    const { removed, kept } = store.clearEndedAgents();
+    let report = english ? `Cleared ${removed} ended session${removed == 1 ? "" : "s"}.` : `종료된 세션 ${removed}개를 지웠습니다.`;
+    if(kept > 0) {
+        report += english
+            ? ` ${kept} stay${kept == 1 ? "s" : ""} until the messages that name ${kept == 1 ? "it" : "them"} expire.`
+            : ` ${kept}개는 그 카드를 가리키는 메시지가 지워질 때까지 남깁니다.`;
+    }
+    await reportInPlace(prompter, report);
+}
+
 /** Keeps a short report on screen until Enter or Esc, then takes it away again. */
 async function reportInPlace(prompter: Prompter, report: string): Promise<void> {
     prompter.write(`\n${report}\n\n`);
@@ -1242,6 +1269,11 @@ export async function showRoomBoard(prompter: Prompter, options: RoomBoardOption
             if(picked == "retire:flagged") {
                 const flagged = view.agents.filter(canTakeDownFlagged);
                 await takeDownCards(prompter, store, flagged, english);
+                view = loadView();
+                continue;
+            }
+            if(picked == "clear:ended") {
+                await clearEndedSessions(prompter, store, english);
                 view = loadView();
                 continue;
             }

@@ -1086,6 +1086,27 @@ describe("board views and navigation", () => {
         expect(database.prepare("SELECT left_at FROM agent WHERE id = ?").get(mixed)).toEqual({ left_at: expect.any(String) });
     });
 
+    it("clears ended sessions after asking, keeping live cards and any a kept message names", async () => {
+        const live = agent("Live");
+        const done = agent("Done");
+        const named = agent("Named");
+        send(live, named);
+        store.disconnect([done, named]);
+        const output = await board("clear\ny\nback\n");
+        expect(output).toContain("Clear ended sessions (2)");
+        expect(output).toContain("Clear 2 ended sessions? Their cards and last summaries are deleted");
+        expect(output).toContain("Cleared 1 ended session. 1 stays until the messages that name it expire.");
+        const ids = (database.prepare("SELECT id FROM agent WHERE is_human = 0").all() as { id: string }[]).map((row) => row.id).sort();
+        expect(ids).toEqual([live, named].sort());
+    });
+
+    it("does nothing when clearing ended sessions is not confirmed", async () => {
+        const done = agent("Done");
+        store.disconnect([done]);
+        await board("clear\n\nback\n");
+        expect(database.prepare("SELECT id FROM agent WHERE id = ?").get(done)).toEqual({ id: done });
+    });
+
     it("keeps the topic and query ready to edit after Search again in line mode", async () => {
         send(agent("Reporter"), "all");
         const input = Readable.from(["topic\nconcos_dev\nback\nESC\nback\n"]);

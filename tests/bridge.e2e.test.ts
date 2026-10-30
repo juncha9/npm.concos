@@ -170,6 +170,20 @@ describe("concos mcp over stdio", () => {
         expect(seen.messages.map((message: any) => message.id)).toEqual([quiet.message_id, loud.message_id]);
     }, E2E_TIMEOUT_MS);
 
+    it("returns the roster on request and keeps a coordinator's wake preference", async () => {
+        const first = await connectBridge();
+        const second = await connectBridge();
+        await callTool(first, "join", { display_name: "Coordinator", client: "Claude Code", working_directory: workDirectory });
+        const worker = await callTool(second, "join", { display_name: "Worker", client: "Codex", working_directory: workDirectory });
+        await callTool(second, "check_in", { status: "working", task: "Console server" });
+        const seen = await callTool(first, "check_in", { roster: true, wake_for: "questions" });
+        expect(seen.roster).toEqual([expect.objectContaining({ agent_id: worker.agent_id, name: "Worker", status: "working", task: "Console server" })]);
+        expect(seen.you.wake_for).toBe("questions");
+        // without asking, no roster
+        expect((await callTool(first, "check_in", {})).roster).toBeUndefined();
+        await expect(callTool(first, "check_in", { wake_for: "sometimes" })).rejects.toThrow(/wake_for must be one of all, questions/);
+    }, E2E_TIMEOUT_MS);
+
     it("posts to the room and lets only its sender rewrite or remove the post", async () => {
         const first = await connectBridge();
         const second = await connectBridge();

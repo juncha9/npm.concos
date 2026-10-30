@@ -1045,6 +1045,25 @@ describe("clean-up", () => {
         expect(store.purgeMessages()).toBe(2);
     });
 
+    it("clears ended and left cards at once, keeping live ones, people and any a kept message names", () => {
+        const live = joinAgent("live");
+        const closed = joinAgent("closed");
+        const gone = joinAgent("gone");
+        const silent = joinAgent("silent");
+        const named = joinAgent("named");
+        const person = store.ensureHumanParticipant("main", "Reviewer");
+        store.checkIn(closed.agent_id, { update: {}, receivedMessageIds: [], checkpoint: "what was done", cursor: null, expectedRevision: null });
+        store.disconnect([closed.agent_id, named.agent_id]);
+        store.leave(gone.agent_id, { summary: null, nextStep: null, checkpoint: null });
+        database.prepare("UPDATE agent SET last_seen_at = :at WHERE id = :id").run({ at: minutesAgo(31), id: silent.agent_id });
+        send(live.agent_id, named.agent_id);
+        database.prepare("UPDATE agent SET last_seen_at = :at WHERE id = :id").run({ at: minutesAgo(31), id: person });
+        expect(store.clearEndedAgents()).toEqual({ removed: 3, kept: 1 });
+        const left = (database.prepare("SELECT id FROM agent").all() as { id: string }[]).map((row) => row.id).sort();
+        expect(left).toEqual([live.agent_id, named.agent_id, person].sort());
+        expect(database.prepare("SELECT COUNT(*) AS n FROM checkpoint WHERE agent_id = ?").get(closed.agent_id)).toEqual({ n: 0 });
+    });
+
     it("keeps a post 48 hours from its last edit", () => {
         const sender = joinAgent("sender");
         const id = store.sendMessage(sender.agent_id, { to: "all", kind: "notice", text: "v1", replyTo: null, requestId: null }).message_id;

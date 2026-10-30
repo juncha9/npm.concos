@@ -329,4 +329,17 @@ export const SCHEMA_STEPS: readonly string[] = [
     ALTER TABLE agent ADD COLUMN context_window INTEGER;
     ALTER TABLE agent ADD COLUMN context_at TEXT;
     `,
+    `
+    -- When a model first used the card through an MCP server: a join or any tool call. Null for a
+    -- card only a session-start hook made, such as one for a client's short helper run; other agents
+    -- never receive those, and they go once their session ends. Older cards with content or a name
+    -- of their own count as used.
+    ALTER TABLE agent ADD COLUMN model_joined_at TEXT;
+    UPDATE agent SET model_joined_at = joined_at
+    WHERE is_human = 1
+        OR NOT (display_name LIKE client || ' · %' AND role = '' AND task = '' AND summary = '' AND next_step = '');
+
+    -- 'questions': the agent chose to be woken only by questions to it and answers to its questions
+    ALTER TABLE agent ADD COLUMN wake_for TEXT NOT NULL DEFAULT 'all' CHECK (wake_for IN ('all', 'questions'));
+    `,
 ];

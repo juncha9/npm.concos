@@ -41,6 +41,8 @@ Table agent {
   context_tokens integer [note: 'schema 16: the input tokens of the session\'s last call as its client recorded it, read by the turn-end hook; every call rereads that much. For the board only: no trigger, no card change for other agents. Null until a hook of this version read it']
   context_window integer [note: 'schema 16: the model context window when the client records one (Codex), else null']
   context_at varchar [note: 'schema 16: when the turn-end hook read context_tokens (ISO UTC)']
+  model_joined_at varchar [note: 'schema 17: when a model first joined the card or called a tool through it; null for a card only a session-start hook made, which other agents never receive and which goes once its session ends']
+  wake_for varchar [not null, default: 'all', note: 'schema 17: all, or questions: only questions to the agent and answers to its questions wake it (the agent sets it with check_in)']
   client_pid integer [note: 'schema 15: the client process (claude.exe) a hook of this session ran under, from CLAUDE_PID or an exec-form hook parent; the MCP server under that process keeps the card online before the model joins (2026-10-28). A later session of the same process takes it over; null for Codex and older writers']
   revision integer [not null, default: 1, note: 'card revision for expected_revision checks']
   changed_seq integer [not null, note: 'meta.last_seq value at the last visible change']

@@ -63,6 +63,8 @@ interface AgentRow {
     context_tokens: number | null;
     context_window: number | null;
     context_at: string | null;
+    model_joined_at: string | null;
+    wake_for: WakeFor;
     reference_list: string;
     editing_list: string;
     recent_folder_list: string;
@@ -132,10 +134,30 @@ const MAX_RECENT_FOLDERS = 3;
 const AGENT_COLUMNS = `
     id, room, host_session_id, display_name, client, is_human, workspace_id, working_directory, current_directory, concos_version,
     status, role, task, summary, next_step, blocker, blocker_since, context_tokens, context_window, context_at,
-    reference_list, editing_list, recent_folder_list,
+    model_joined_at, wake_for, reference_list, editing_list, recent_folder_list,
     revision, changed_seq, content_changed_seq, delivered_seq, joined_at, updated_at, editing_updated_at,
     last_seen_at, last_call_at, disconnected_at, left_at
 `;
+
+/**
+ * What wakes an agent: `all` (the default) the questions, notes and notices named to it and the
+ * answers to its own; `questions` only questions named to it and answers to its questions, for a
+ * coordinator whose workers' progress can wait for its next turn (2026-10-30 user decision).
+ */
+export type WakeFor = "all" | "questions";
+
+/** An agent in the room at a glance, for a coordinator: one line each, live cards only. */
+export interface RosterEntry {
+    agent_id: string;
+    name: string;
+    client: string;
+    status: AgentStatus;
+    task: string;
+    role: string;
+    /** The project folder name of the workspace the card belongs to. */
+    project: string | null;
+    blocker?: string;
+}
 
 export interface CardUpdate {
     status?: AgentStatus;
@@ -151,6 +173,8 @@ export interface CardUpdate {
     displayName?: string;
     /** Absolute folder the agent works in now; empty, or the folder its session started in, clears it. */
     currentDirectory?: string;
+    /** The agent's own wake preference; it changes nothing other agents see. */
+    wakeFor?: WakeFor;
 }
 
 /** `left: false`: the session's hooks hold the card, so it stays, finished, until the session ends. */
@@ -281,6 +305,8 @@ export interface CheckInResult {
     revision: number;
     /** The caller's own blocker, while one is set. */
     blocker?: string;
+    /** The caller's wake preference, when it is not the default. */
+    wake_for?: WakeFor;
 }
 
 /** A folder actually edited by a hook, newest first; paths are workspace-relative, with "." for its root. */
@@ -345,7 +371,7 @@ export interface FullMessage {
 export type PendingWakeExclusion =
     | "reply_to_your_reply" | "reply_to_other_reply" | "reply_to_other_question"
     | "reply_to_your_note" | "reply_to_other_note"
-    | "reply_to_your_notice" | "reply_to_other_notice" | "reply_target_missing" | "sent_without_wake";
+    | "reply_to_your_notice" | "reply_to_other_notice" | "reply_target_missing" | "sent_without_wake" | "agent_wakes_for_questions";
 
 /** Unreceived messages on a card, for diagnosis; querying them never acknowledges a message. */
 export interface PendingMessage {
@@ -933,7 +959,7 @@ export class RoomStore {
         const nowMs = Date.now();
         const nowText = new Date(nowMs).toISOString();
 
-        return runInTransaction(this.database, () => {
+        const joined = runInTransaction(this.database, (): JoinResult => {
             const session = input.hookSession;
             const existingSession = session == null ? undefined : this.prepare(`
                 SELECT id, room FROM agent WHERE host = :host AND host_session_id = :session_id
@@ -1111,6 +1137,17 @@ export class RoomStore {
             }
             return result;
         });
+        // a model joined; a session-start hook leaves the card unmarked until its model uses it
+        if(input.hookSession == null) {
+            this.markModelJoined(joined.agent_id, nowText);
+        }
+        return joined;
+    }
+
+    private markModelJoined(agentId: string, nowText: string): void {
+        this.prepare(`
+            UPDATE agent SET model_joined_at = COALESCE(model_joined_at, :now) WHERE id = :id
+        `).run({ now: nowText, id: agentId });
     }
 
     /**
@@ -1287,13 +1324,17 @@ export class RoomStore {
             reply_kind: MessageKind | null; reply_author: string | null;
         }[];
         if(rows.length == 0) return [];
-        const targets = new Set(this.hookNotices(agentId, 0, true).map((notice) => notice.id));
+        const wakeFor = this.requireAgent(agentId).wake_for;
+        const targets = new Set(this.hookNotices(agentId, 0, wakeFor == "all").map((notice) => notice.id));
+        // what would wake an agent that takes everything, for saying why its own preference held it back
+        const allTargets = wakeFor == "all" ? targets : new Set(this.hookNotices(agentId, 0, true).map((notice) => notice.id));
         return rows.map((row) => {
             const target = targets.has(row.id);
             const own = row.reply_author == agentId;
             let reason: PendingWakeExclusion | null = null;
             if(target == false) {
                 if(row.wake == 0) reason = "sent_without_wake";
+                else if(allTargets.has(row.id)) reason = "agent_wakes_for_questions";
                 else if(row.reply_kind == "reply") reason = own ? "reply_to_your_reply" : "reply_to_other_reply";
                 else if(row.reply_kind == "question") reason = "reply_to_other_question";
                 else if(row.reply_kind == "note") reason = own ? "reply_to_your_note" : "reply_to_other_note";
@@ -1475,11 +1516,12 @@ export class RoomStore {
         // the check, and for a wake the wake times within the last hour
         const look = (): { check: WakeCheck; woken: string[] } => {
             const row = this.prepare(`
-                SELECT wake_generation, hook_nudged_seq, woken_at_list, left_at, disconnected_at
+                SELECT wake_generation, hook_nudged_seq, woken_at_list, left_at, disconnected_at, wake_for
                 FROM agent
                 WHERE id = :id
             `).get({ id: watch.agentId }) as {
                 wake_generation: number; hook_nudged_seq: number; woken_at_list: string; left_at: string | null; disconnected_at: string | null;
+                wake_for: WakeFor;
             } | undefined;
             // (1) Replaced or ended
             if(row == null || row.wake_generation != watch.generation || row.left_at != null || row.disconnected_at != null) {
@@ -1492,7 +1534,7 @@ export class RoomStore {
             // a note or notice named to the session wakes it too (2026-10-25 user decision). No hourly
             // limit (2026-10-26 user decision): with one, a busy agent spent its wakes within minutes
             // and then slept through its messages for the rest of the hour.
-            const notices = this.hookNotices(watch.agentId, row.hook_nudged_seq, true);
+            const notices = this.hookNotices(watch.agentId, row.hook_nudged_seq, row.wake_for == "all");
             if(notices.length == 0) {
                 return { check: { state: "wait" }, woken: [] };
             }
@@ -1591,12 +1633,12 @@ export class RoomStore {
         // the wake, and the wake times within the last hour
         const look = (): { wake: FallbackWake; woken: string[] } | null => {
             const row = this.prepare(`
-                SELECT host, host_session_id, hook_nudged_seq, woken_at_list, last_call_at, last_seen_at
+                SELECT host, host_session_id, hook_nudged_seq, woken_at_list, last_call_at, last_seen_at, wake_for
                 FROM agent
                 WHERE id = :id AND left_at IS NULL AND disconnected_at IS NULL
             `).get({ id: agentId }) as {
                 host: string | null; host_session_id: string | null; hook_nudged_seq: number; woken_at_list: string;
-                last_call_at: string | null; last_seen_at: string;
+                last_call_at: string | null; last_seen_at: string; wake_for: WakeFor;
             } | undefined;
             if(row == null || row.host == null || row.host_session_id == null || hosts.includes(row.host) == false) {
                 return null;
@@ -1607,7 +1649,7 @@ export class RoomStore {
             if(force == false && row.last_call_at != null && nowMs - Date.parse(row.last_call_at) < WAKE_FALLBACK_MS) {
                 return null;
             }
-            const notices = this.hookNotices(agentId, row.hook_nudged_seq, true);
+            const notices = this.hookNotices(agentId, row.hook_nudged_seq, row.wake_for == "all");
             if(notices.length == 0) {
                 return null;
             }
@@ -1681,6 +1723,11 @@ export class RoomStore {
                 acknowledge.run({ now: nowText, message_id: messageId, agent_id: agentId });
             }
 
+            // only a model checks in
+            this.markModelJoined(agentId, nowText);
+            if(input.update.wakeFor != null && input.update.wakeFor != current.wake_for) {
+                this.prepare(`UPDATE agent SET wake_for = :wake_for WHERE id = :id`).run({ wake_for: input.update.wakeFor, id: agentId });
+            }
             const checkpoint = input.checkpoint?.trim() ?? "";
             // finished work is blocked by nothing: agents left a resolved blocker on the card (2026-10-28 report)
             let update = input.update;
@@ -1762,6 +1809,9 @@ export class RoomStore {
                 AND A.id <> :agent_id
                 AND A.changed_seq > :start_seq
                 AND A.changed_seq <= :bound_seq
+                -- a card no model used is a session-start hook's: 66 of 102 cards on one machine were
+                -- such, left by clients' short helper runs, and filled every check_in (2026-10-30)
+                AND (A.model_joined_at IS NOT NULL OR A.is_human = 1)
                 AND (${ACTIVE_AGENT_CONDITION} OR COALESCE(A.left_at, A.disconnected_at, A.last_seen_at) >= :viewer_joined_at)
             ORDER BY A.changed_seq
             LIMIT :limit
@@ -1923,7 +1973,48 @@ export class RoomStore {
         if(agent.blocker != "") {
             result.blocker = agent.blocker;
         }
+        if(agent.wake_for != "all") {
+            result.wake_for = agent.wake_for;
+        }
         return result;
+    }
+
+    /**
+     * Every live agent but the caller, one line each, for a coordinator who asks for the whole
+     * room: check_in pages through changes three cards at a time, so a status report took one
+     * inspect_agent per worker (2026-10-30 report). People, a session-start hook's card no model
+     * used, and ended or left sessions stay out. By project, then name.
+     */
+    roster(agentId: string, nowMs: number = Date.now()): RosterEntry[] {
+        const rows = this.prepare(`
+            SELECT A.id, A.display_name, A.client, A.status, A.task, A.role, A.blocker, W.display_path
+            FROM agent AS A
+            LEFT JOIN workspace AS W
+                ON W.id = A.workspace_id
+            WHERE A.room = :room
+                AND A.id <> :agent_id
+                AND A.is_human = 0
+                AND A.model_joined_at IS NOT NULL
+                AND ${ACTIVE_AGENT_CONDITION}
+            ORDER BY W.display_path, A.display_name
+        `).all({ room: SHARED_ROOM, agent_id: agentId, active_since: activeSince(nowMs) }) as {
+            id: string; display_name: string; client: string; status: AgentStatus; task: string; role: string; blocker: string; display_path: string | null;
+        }[];
+        return rows.map((row) => {
+            const entry: RosterEntry = {
+                agent_id: row.id,
+                name: row.display_name,
+                client: row.client,
+                status: row.status,
+                task: preview(row.task, CARD_FIELD_PREVIEW_LENGTH),
+                role: preview(row.role, CARD_FIELD_PREVIEW_LENGTH),
+                project: row.display_path == null ? null : path.basename(row.display_path),
+            };
+            if(row.blocker != "") {
+                entry.blocker = preview(row.blocker, CARD_FIELD_PREVIEW_LENGTH);
+            }
+            return entry;
+        });
     }
 
     private toCompactCard({ row, nowMs, statusOnly }: { row: AgentRow; nowMs: number; statusOnly: boolean }): CompactCard {
@@ -2963,6 +3054,45 @@ export class RoomStore {
         });
     }
 
+    /** Deletes agent cards with their receipts, checkpoints and card deliveries; returns how many checkpoints went. */
+    private deleteAgents(agentIds: string[]): number {
+        if(agentIds.length == 0) {
+            return 0;
+        }
+        const ids = JSON.stringify(agentIds);
+        this.prepare(`DELETE FROM message_receipt WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+        const removedCheckpoints = this.prepare(`DELETE FROM checkpoint WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+        this.prepare(`
+            DELETE FROM card_delivery
+            WHERE viewer_agent_id IN (SELECT value FROM json_each(:ids))
+                OR agent_id IN (SELECT value FROM json_each(:ids))
+        `).run({ ids: ids });
+        this.prepare(`DELETE FROM agent WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
+        return Number(removedCheckpoints.changes);
+    }
+
+    /**
+     * The board's "Clear ended sessions": deletes the cards of sessions that left or ended, with
+     * their checkpoints, now instead of after AGENT_RETENTION_MS (2026-10-30 user request: ended
+     * sessions piled up on the board). A card a kept message still names, as sender or recipient
+     * or by an unread receipt, stays until that message goes, so no message loses an end. People
+     * stay. Returns how many went and how many stayed for their messages.
+     */
+    clearEndedAgents(nowMs: number = Date.now()): { removed: number; kept: number } {
+        return runInTransaction(this.database, () => {
+            const ended = this.prepare(`
+                SELECT A.id,
+                    EXISTS (SELECT 1 FROM message AS M WHERE M.sender_agent_id = A.id OR M.recipient_agent_id = A.id)
+                    OR EXISTS (SELECT 1 FROM message_receipt AS R WHERE R.agent_id = A.id AND R.received_at IS NULL) AS named
+                FROM agent AS A
+                WHERE A.is_human = 0 AND NOT ${ACTIVE_AGENT_CONDITION}
+            `).all({ active_since: activeSince(nowMs) }) as { id: string; named: number }[];
+            const removable = ended.filter((row) => row.named == 0).map((row) => row.id);
+            this.deleteAgents(removable);
+            return { removed: removable.length, kept: ended.length - removable.length };
+        });
+    }
+
     /**
      * Removes everything that would otherwise pile up, so the database stays the size of what is
      * still in use. Safe to call often: each step only touches rows past its retention.
@@ -2992,29 +3122,31 @@ export class RoomStore {
 
         return runInTransaction(this.database, () => {
             // (2) Agents
+            // silent past retention, or a session-start hook's card no model used, once its session
+            // ended and with nothing written on or to it (2026-10-30: they made up 66 of 102 cards)
             const retired = this.prepare(`
                 SELECT A.id
                 FROM agent AS A
                 WHERE A.is_human = 0
-                    AND A.last_seen_at < :retire_before
                     AND NOT EXISTS (
                         SELECT 1 FROM message AS M
                         WHERE M.sender_agent_id = A.id OR M.recipient_agent_id = A.id
                     )
-            `).all({ retire_before: new Date(nowMs - AGENT_RETENTION_MS).toISOString() }) as { id: string }[];
-            let checkpoints = 0;
-            if(retired.length > 0) {
-                const ids = JSON.stringify(retired.map((row) => row.id));
-                this.prepare(`DELETE FROM message_receipt WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
-                const removedCheckpoints = this.prepare(`DELETE FROM checkpoint WHERE agent_id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
-                checkpoints += Number(removedCheckpoints.changes);
-                this.prepare(`
-                    DELETE FROM card_delivery
-                    WHERE viewer_agent_id IN (SELECT value FROM json_each(:ids))
-                        OR agent_id IN (SELECT value FROM json_each(:ids))
-                `).run({ ids: ids });
-                this.prepare(`DELETE FROM agent WHERE id IN (SELECT value FROM json_each(:ids))`).run({ ids: ids });
-            }
+                    AND (
+                        A.last_seen_at < :retire_before
+                        OR (
+                            A.model_joined_at IS NULL
+                            AND A.role = '' AND A.task = '' AND A.summary = '' AND A.next_step = '' AND A.blocker = ''
+                            AND (A.left_at IS NOT NULL OR A.disconnected_at IS NOT NULL OR A.last_seen_at < :ended_before)
+                            AND NOT EXISTS (SELECT 1 FROM message_receipt AS R WHERE R.agent_id = A.id)
+                            AND NOT EXISTS (SELECT 1 FROM checkpoint AS C WHERE C.agent_id = A.id)
+                        )
+                    )
+            `).all({
+                retire_before: new Date(nowMs - AGENT_RETENTION_MS).toISOString(),
+                ended_before: new Date(nowMs - ENDED_AFTER_MS).toISOString(),
+            }) as { id: string }[];
+            let checkpoints = this.deleteAgents(retired.map((row) => row.id));
 
             // (3) Checkpoints over the per-agent cap
             const capped = this.prepare(`
@@ -3081,7 +3213,8 @@ export class RoomStore {
     recordCall(agentId: string): void {
         runInTransaction(this.database, () => {
             this.prepare(`
-                UPDATE agent SET last_seen_at = :now, last_call_at = :now, disconnected_at = NULL
+                UPDATE agent
+                SET last_seen_at = :now, last_call_at = :now, disconnected_at = NULL, model_joined_at = COALESCE(model_joined_at, :now)
                 WHERE id = :id AND left_at IS NULL
             `).run({ now: new Date().toISOString(), id: agentId });
             this.acknowledgeDelivered(agentId);

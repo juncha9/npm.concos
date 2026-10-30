@@ -949,6 +949,99 @@ describe("conversation size", () => {
     });
 });
 
+describe("cards no model used, the roster and the wake preference", () => {
+    const join = (name: string, project = "project") =>
+        store.join({ displayName: name, client: "Codex", workingDirectory: path.join(directory, project), workspaceRoot: null, resumeHandle: null }).agent_id;
+    const check = (agentId: string, update: Parameters<RoomStore["checkIn"]>[1]["update"] = {}) =>
+        store.checkIn(agentId, { update, receivedMessageIds: [], checkpoint: null, cursor: null, expectedRevision: null });
+    const exists = (agentId: string) => database.prepare("SELECT 1 FROM agent WHERE id = ?").get(agentId) != null;
+
+    it("keeps a session-start hook's card out of other agents' check_in until its model uses it", () => {
+        const reader = join("Reader");
+        check(reader);
+        const hooked = start();
+        expect(check(reader).agents?.some((card) => card.agent_id == hooked.agent_id) ?? false).toBe(false);
+        // its model joins with the handle the hook gave it
+        store.join({ displayName: "Worker", client: "Claude Code", workingDirectory: directory, workspaceRoot: null, resumeHandle: hooked.handle });
+        expect(check(reader).agents?.find((card) => card.agent_id == hooked.agent_id)).toMatchObject({ name: "Worker" });
+    });
+
+    it("removes a hook's card no model used once its session ends, and nothing else", () => {
+        const helper = start({ sessionId: "helper-run" });
+        store.applyHookEvent(event("prompt", { sessionId: "helper-run" }), "dev");
+        const used = start({ sessionId: "used" });
+        check(used.agent_id, { task: "real work" });
+        const live = start({ sessionId: "still-open" });
+        const written = start({ sessionId: "written-to" });
+        store.sendMessage(join("Sender"), { to: written.agent_id, kind: "note", text: "for you", replyTo: null, requestId: null });
+        for(const sessionId of ["helper-run", "used", "written-to"]) {
+            store.applyHookEvent(event("session-end", { sessionId }), "dev");
+        }
+        store.cleanUp();
+        expect(exists(helper.agent_id)).toBe(false);
+        expect(exists(used.agent_id)).toBe(true);
+        expect(exists(live.agent_id)).toBe(true);
+        expect(exists(written.agent_id)).toBe(true);
+    });
+
+    it("lists every live agent but the caller in one roster, by project then name", () => {
+        const me = join("Me", "alpha");
+        const zed = join("Zed", "alpha");
+        const amy = join("Amy", "beta");
+        check(amy, { status: "working", task: "Console stage 2", role: "Console server", blocker: "waiting for the login answer" });
+        start();
+        const gone = join("Gone");
+        store.leave(gone, { summary: null, nextStep: null, checkpoint: null });
+        store.ensureHumanParticipant("main", "Person");
+        expect(store.roster(me)).toEqual([
+            { agent_id: zed, name: "Zed", client: "Codex", status: "working", task: "", role: "", project: "alpha" },
+            { agent_id: amy, name: "Amy", client: "Codex", status: "working", task: "Console stage 2", role: "Console server", project: "beta", blocker: "waiting for the login answer" },
+        ]);
+    });
+
+    it("wakes an agent that chose questions only for questions and answers to its questions", () => {
+        const joined = start();
+        const sender = join("Sender");
+        expect(check(joined.agent_id, { wakeFor: "questions" }).wake_for).toBe("questions");
+        const note = store.sendMessage(sender, { to: joined.agent_id, kind: "note", text: "test server checked", replyTo: null, requestId: null }).message_id;
+        const watch = store.startWakeWatch(event("watch"))!;
+        expect(store.checkWakeWatch(watch, true)).toEqual({ state: "wait" });
+        expect(store.pendingFor(joined.agent_id)).toMatchObject([{ id: note, wake_target: false, wake_reason: "agent_wakes_for_questions" }]);
+        const question = store.sendMessage(sender, { to: joined.agent_id, kind: "question", text: "which port?", replyTo: null, requestId: null }).message_id;
+        expect(store.checkWakeWatch(watch, true)).toMatchObject({ state: "wake", notices: [{ id: question }] });
+        // the note still shows on the next prompt
+        expect(processHook(store, event("prompt"), "dev")?.context).toContain(`note #${note}`);
+        expect(check(joined.agent_id, { wakeFor: "all" }).wake_for).toBeUndefined();
+    });
+
+    it("counts older cards with a name or content as used, and only empty hook cards as not", async () => {
+        const oldDirectory = path.join(directory, "version16");
+        fs.mkdirSync(oldDirectory);
+        const old = new DatabaseSync(path.join(oldDirectory, "concos.db"));
+        old.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON");
+        for(const step of SCHEMA_STEPS.slice(0, 16)) old.exec(step);
+        old.exec("PRAGMA user_version = 16");
+        const now = new Date().toISOString();
+        const insert = old.prepare(`
+            INSERT INTO agent (id, room, handle_hash, display_name, client, changed_seq, joined_at, updated_at, last_seen_at, task)
+            VALUES (?, 'main', ?, ?, 'Claude Code', 1, ?, ?, ?, ?)
+        `);
+        insert.run("named", "h1", "KS:D Master", now, now, now, "");
+        insert.run("placeholder", "h2", "Claude Code · akms", now, now, now, "");
+        insert.run("placeholder-with-task", "h3", "Claude Code · akms", now, now, now, "reviewing");
+        old.close();
+        const upgraded = await openDatabase(oldDirectory);
+        try {
+            expect(upgraded.prepare("SELECT id, model_joined_at IS NOT NULL AS used, wake_for FROM agent ORDER BY id").all()).toEqual([
+                { id: "named", used: 1, wake_for: "all" },
+                { id: "placeholder", used: 0, wake_for: "all" },
+                { id: "placeholder-with-task", used: 1, wake_for: "all" },
+            ]);
+        }
+        finally { upgraded.close(); }
+    });
+});
+
 describe("schema migration", () => {
     it("adds empty folders to version 13 without changing records and lets older writers clear them", async () => {
         const oldDirectory = path.join(directory, "version13");
@@ -974,6 +1067,8 @@ describe("schema migration", () => {
             expect(upgraded.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: SCHEMA_STEPS.length });
             expect(upgraded.prepare("SELECT * FROM agent").get()).toEqual({
                 ...before, recent_folder_list: "[]", client_pid: null, blocker_since: null, context_tokens: null, context_window: null, context_at: null,
+                // a card with a name of its own counts as one a model used
+                model_joined_at: (before as { joined_at: string }).joined_at, wake_for: "all",
             });
             expect(upgraded.prepare("SELECT * FROM card_delivery").all()).toEqual(delivery);
             const folders = JSON.stringify([{ path: "src", at: now }]);

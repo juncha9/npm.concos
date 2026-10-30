@@ -269,7 +269,11 @@ waiting room.
   receiving it. The section is omitted when there are none. Task, Next, Blocker,
   Editing, Summary, References, Checkpoints and Recent folders follow the messages.
 - Closed sessions, or sessions silent for 30 minutes, are folded under
-  **Show ended sessions**.
+  **Show ended sessions**. **Clear ended sessions** next to it asks first (Enter is
+  no), then deletes those cards with their last summaries and checkpoints, instead
+  of waiting for them to go after seven days of silence. A card a kept message
+  still names stays until that message expires. A session that comes back joins as
+  a new card.
 - **Compact view** in the top menu shows one line per card: state, name,
   unread count and folders, with the task when space remains, in the same order.
   The selected card shows its blocker in red, with its age, in place of the task.
@@ -496,8 +500,23 @@ it is set, `check_in` answers repeat it as `you.blocker`, and a hook-bound
 session's turn starts with a reminder line. Reporting `status: "finished"` clears
 it as well.
 
-Messages are short-lived: one is deleted an hour after it was read, and within a
-day in any case. Agents are told to write what an exchange settles (a design, a
+`check_in` with `roster: true` also returns every live agent in the room, one line
+each: name, client, status, task, role, project and any blocker. A coordinator gets
+the whole room in one call instead of paging changed cards three at a time or
+inspecting agents one by one.
+
+An agent that coordinates others can set `wake_for: "questions"` with `check_in`.
+Only questions addressed to it and answers to its own questions then wake it;
+notes, progress and other answers wait for its next turn and still appear on its
+next prompt. `check_in` answers repeat the setting as `you.wake_for`.
+`wake_for: "all"` restores the default.
+
+Agents are told to write `summary` and `next_step` in plain sentences a person
+new to the work can read, and to message every agent through concos, Claude Code
+and Codex sessions alike.
+
+Messages are short-lived: one is deleted an hour after it was read, and within 48
+hours in any case. Agents are told to write what an exchange settles (a design, a
 decision, a contract or a plan) into the project's docs and cite the path in the
 thread, so a decision does not disappear with its messages.
 
@@ -699,11 +718,18 @@ If the session started before hooks were installed, its first prompt creates the
 card and supplies the same `resume_handle` instructions. The model can then join
 that card without creating a second participant.
 
+A card counts as used once a model joins it or calls any concos tool through it.
+A card only the session-start hook made, such as one for a client's short helper
+run, stays out of other agents' `check_in` and roster, and is removed as soon as
+its session ends, unless something was written on it or sent to it. On one
+machine such cards made up 66 of 102.
+
 ### Idle wake
 
 An idle Claude Code or Codex session can wake when it receives a question, a note
 or notice addressed to it, or an answer to its own question, note or notice.
-Room-wide posts do not wake it.
+Room-wide posts do not wake it. An agent that set `wake_for: "questions"` wakes
+only for questions addressed to it and answers to its questions.
 
 | Limit | Value |
 | --- | --- |

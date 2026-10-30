@@ -33,7 +33,7 @@ import { isRunning } from "../hooks/watch";
 import { openDatabase } from "../store/database";
 import { RoomError } from "../store/room-error";
 import { RoomStore } from "../store/room-store";
-import type { CheckInResult, FullMessage } from "../store/room-store";
+import type { CheckInResult, FullMessage, RosterEntry, WakeFor } from "../store/room-store";
 import { InstalledVersion, loadTakeover, readHandoff } from "./handoff";
 import { InstructionsUpdate } from "./instructions-update";
 import type { HandoffState, TakeoverInput } from "./handoff";
@@ -51,8 +51,10 @@ const WAKE_HOSTS = HOST_ADAPTERS.filter((adapter) => adapter.deliverWake != null
  * news since its cursor. Agents found one flat object hard to read when they only meant to
  * update themselves. Unread counts travel in the `inbox` field every tool adds.
  */
-function shapeCheckIn(result: CheckInResult): { you: { revision: number; blocker?: string }; room: Omit<CheckInResult, "revision" | "pending_count" | "blocker"> } {
-    const room: Omit<CheckInResult, "revision" | "pending_count" | "blocker"> = { changed: result.changed, cursor: result.cursor };
+type CheckInYou = { revision: number; blocker?: string; wake_for?: WakeFor };
+
+function shapeCheckIn(result: CheckInResult): { you: CheckInYou; room: Omit<CheckInResult, "revision" | "pending_count" | "blocker" | "wake_for">; roster?: RosterEntry[] } {
+    const room: Omit<CheckInResult, "revision" | "pending_count" | "blocker" | "wake_for"> = { changed: result.changed, cursor: result.cursor };
     if(result.agents != null) {
         room.agents = result.agents;
     }
@@ -65,9 +67,12 @@ function shapeCheckIn(result: CheckInResult): { you: { revision: number; blocker
     if(result.has_more != null) {
         room.has_more = result.has_more;
     }
-    const you: { revision: number; blocker?: string } = { revision: result.revision };
+    const you: CheckInYou = { revision: result.revision };
     if(result.blocker != null) {
         you.blocker = result.blocker;
+    }
+    if(result.wake_for != null) {
+        you.wake_for = result.wake_for;
     }
     return { you: you, room: room };
 }
@@ -87,10 +92,10 @@ function fullyDeliveredMessageIds(toolName: string, result: unknown): number[] {
 const SERVER_INSTRUCTIONS = [
     "concos is one local room shared across projects. Your card stays in the workspace where this session started.",
     "Join at task start with the absolute starting folder and exact session name; resume a supplied handle. Use role for your standing assignment, task for current work, and current_directory when working elsewhere.",
-    "Call check_in after meaningful progress, when blocked, and when context is needed; send changed fields only. Keep summary and next_step current. Do not poll on a timer. If join says hooks_manage_status_and_editing, skip calls solely to mark waiting; otherwise report working/editing and, before yielding, waiting with editing=[].",
+    "Call check_in after meaningful progress, when blocked, and when context is needed; send changed fields only. Keep summary and next_step current, in plain sentences a person new to the work can read, without step codes or abbreviations. check_in with roster true lists every live agent at once. Do not poll on a timer. If join says hooks_manage_status_and_editing, skip calls solely to mark waiting; otherwise report working/editing and, before yielding, waiting with editing=[].",
     "Use read_messages for unread or truncated messages and inspect_agent for card details. Full texts count as received on your next call; inbox counts unread messages. has_more is available history, not an obligation to drain the room; fetch unread direct messages through read_messages.",
     "Use question for requests needing answers; answer requests with reply and reply_to, including requests received as note. Send only requested results, substantive questions, blockers, or corrections. A message can wake a waiting agent, which then rereads its whole conversation: never send receipt confirmations, 'starting' or progress notes (your card shows progress), thanks, or restatements, and send what needs no action now with wake false.",
-    "Send to concerned agents. to=all posts are for room-wide news, wake nobody, and wait on nobody; edit changed posts and remove obsolete ones. Reuse relevant snake_case topics. Start with the content, not your name.",
+    "Send to concerned agents through concos, Claude and Codex sessions alike: idle Codex sessions wake only through it. A coordinator can set check_in wake_for to questions to be woken only by questions. to=all posts are for room-wide news, wake nobody, and wait on nobody; edit changed posts and remove obsolete ones. Reuse relevant snake_case topics. Start with the content, not your name.",
     "Messages expire within 48 hours; read ones can expire after an hour. Record settled decisions, contracts, and plans in their owning project docs and cite the path. Call leave when your task is done.",
 ].join("\n");
 
@@ -224,11 +229,14 @@ export async function runBridge(options: { takeover?: TakeoverInput } = {}): Pro
             received_message_ids: { type: "array", items: ANY_INTEGER, maxItems: MAX_RECEIVED_IDS, description: `Optional, up to ${MAX_RECEIVED_IDS}: messages you read. Full-text deliveries are acknowledged on your next call anyway.` },
             expected_revision: { ...ANY_INTEGER, description: "Reject the update if your card moved past this revision." },
             cursor: { type: "string", description: "Omit to continue from the last delivered position; set a previous cursor to replay with full cards." },
+            roster: { type: "boolean", description: "true: also return every live agent in the room, one line each (name, status, task, role, project), instead of paging the room or inspecting agents one by one." },
+            wake_for: { type: "string", enum: ["all", "questions"], description: "What wakes you while you wait. all (default): questions, notes and answers to your own. questions: only questions to you and answers to your questions; the rest waits for your next turn. For a coordinator whose workers report progress." },
         }),
     }, (values) => runTool("check_in", () => {
         const args = values as {
             handle?: string; display_name?: string; status?: AgentStatus; role?: string; task?: string; summary?: string; next_step?: string; blocker?: string;
             references?: string[]; editing?: string[]; checkpoint?: string; current_directory?: string; received_message_ids?: number[]; expected_revision?: number; cursor?: string;
+            roster?: boolean; wake_for?: WakeFor;
         };
         const agentId = resolveAgentId(args.handle);
         const result = store.checkIn(agentId, {
@@ -245,11 +253,16 @@ export async function runBridge(options: { takeover?: TakeoverInput } = {}): Pro
                 references: args.references,
                 editing: args.editing,
                 currentDirectory: args.current_directory,
+                wakeFor: args.wake_for,
             },
             checkpoint: args.checkpoint ?? null,
             receivedMessageIds: args.received_message_ids ?? [],
         });
-        return shapeCheckIn(result);
+        const shaped = shapeCheckIn(result);
+        if(args.roster == true) {
+            shaped.roster = store.roster(agentId);
+        }
+        return shaped;
     }));
 
     registerTool({
